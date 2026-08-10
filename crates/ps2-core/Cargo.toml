@@ -1,0 +1,12 @@
+[package]
+name = "ps2-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent PS2 emulator core (wasm-safe)"
+
+[dependencies]
+tracing = "0.1"
+
+[features]
+default = []
