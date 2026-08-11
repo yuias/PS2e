@@ -58,6 +58,100 @@ pub struct IopDmaChannel {
 
 const IOP_CHCR_BUSY: u32 = 1 << 24;
 
+/// Minimal CDVD (MECHACON) model: no disc, instant commands. Enough for
+/// the OSD's NVRAM/RTC configuration reads over the S-command interface.
+#[derive(Default)]
+pub struct Cdvd {
+    n_cmd: u8,
+    /// CDVD-internal interrupt flags (reg 0x08, W1C).
+    pub istat: u8,
+    s_cmd: u8,
+    s_params: Vec<u8>,
+    s_results: Vec<u8>,
+    s_result_pos: usize,
+}
+
+impl Cdvd {
+    /// Execute an S command; fills the result FIFO.
+    fn s_execute(&mut self) {
+        let cmd = self.s_cmd;
+        self.s_results.clear();
+        self.s_result_pos = 0;
+        match cmd {
+            // sceCdReadClock: stat + BCD sec/min/hour/pad/day/month/year.
+            0x08 => self
+                .s_results
+                .extend_from_slice(&[0, 0, 0, 0, 0, 1, 1, 0x25]),
+            // Forbid/permit DVD player: canonical result is 5.
+            0x15 | 0x16 => self.s_results.push(5),
+            // OpenConfig/WriteConfig/CloseConfig: plain OK.
+            0x40 | 0x42 | 0x43 => self.s_results.push(0),
+            // ReadConfig: one 15-byte block of zeroes.
+            0x41 => self.s_results.extend_from_slice(&[0; 15]),
+            // BootCertify: accepted.
+            0x1A => self.s_results.push(1),
+            // Mecacon version: stat + version bytes.
+            0x03 => self.s_results.extend_from_slice(&[0, 3, 0, 6]),
+            _ => {
+                trace!(target: "ps2_core::iop::cdvd", cmd = format_args!("{cmd:#04x}"), "unhandled S command (returning 0)");
+                self.s_results.push(0);
+            }
+        }
+    }
+
+    pub fn read(&mut self, addr: u32) -> u32 {
+        let v = match addr & 0x3F {
+            0x04 => self.n_cmd as u32,
+            // N status: ready, no data.
+            0x05 => 0x40,
+            0x06 => 0, // error
+            0x08 => self.istat as u32,
+            0x0A => 0, // drive status: stopped
+            0x0B => 0,
+            0x0F => 0, // disc type: no disc
+            0x16 => self.s_cmd as u32,
+            // S status: bit 6 set when the result FIFO is empty.
+            0x17 => {
+                if self.s_result_pos >= self.s_results.len() {
+                    0x40
+                } else {
+                    0
+                }
+            }
+            0x18 => {
+                let v = self.s_results.get(self.s_result_pos).copied().unwrap_or(0);
+                self.s_result_pos += 1;
+                v as u32
+            }
+            _ => 0,
+        };
+        trace!(target: "ps2_core::iop::cdvd", addr = format_args!("{addr:#04x}"), value = format_args!("{v:#x}"), "read");
+        v
+    }
+
+    /// Returns true when the write completed an N command (raises the CDVD
+    /// interrupt line).
+    pub fn write(&mut self, addr: u32, v: u32) -> bool {
+        trace!(target: "ps2_core::iop::cdvd", addr = format_args!("{addr:#04x}"), value = format_args!("{v:#x}"), "write");
+        match addr & 0x3F {
+            0x04 => {
+                self.n_cmd = v as u8;
+                self.istat |= 3; // command complete + data ready
+                return true;
+            }
+            0x08 => self.istat &= !(v as u8),
+            0x16 => {
+                self.s_cmd = v as u8;
+                self.s_execute();
+                self.s_params.clear();
+            }
+            0x17 => self.s_params.push(v as u8),
+            _ => {}
+        }
+        false
+    }
+}
+
 /// IOP root counter (0-2: 16-bit PS1-style, 3-5: 32-bit).
 #[derive(Default, Clone, Copy)]
 struct IopTimer {
@@ -129,6 +223,7 @@ pub struct Bus {
     pub iop_dma_sif1: IopDmaChannel,
     pub iop_dicr: u32,
     pub iop_dicr2: u32,
+    pub cdvd: Cdvd,
     /// Current EE cycle count, updated by the system before each step.
     pub now: u64,
     /// Kernel TTY output captured from the EE SIO TXFIFO (observation only).
@@ -183,6 +278,7 @@ impl Bus {
             iop_dma_sif1: IopDmaChannel::default(),
             iop_dicr: 0,
             iop_dicr2: 0,
+            cdvd: Cdvd::default(),
             now: 0,
             tty_buffer: String::new(),
             tty_line: String::new(),
@@ -1100,10 +1196,7 @@ impl Bus {
             }
             0x1F80_1000..=0x1F80_FFFF => self.iop_read_mmio::<N>(addr),
             0x1D00_0000..=0x1D00_00FF => self.sif.iop_read(addr),
-            0x1F40_2000..=0x1F40_203F => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "CDVD read (stub)");
-                0
-            }
+            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr),
             // ROM1 (DVD player ROM): not present; reads like erased flash so
             // presence/version checks fail instead of "succeeding" with zeros.
             0x1E00_0000..=0x1E3F_FFFF => u32::MAX,
@@ -1146,7 +1239,10 @@ impl Bus {
                 }
             }
             0x1F40_2000..=0x1F40_203F => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "CDVD write (stub)");
+                if self.cdvd.write(addr, v) {
+                    // N command completion interrupts the IOP (CDVD line).
+                    self.iop_i_stat |= 1 << 2;
+                }
             }
             0x1F90_0000..=0x1F90_07FF => {
                 trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "SPU2 write (stub)");

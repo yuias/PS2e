@@ -54,7 +54,16 @@ Planned crates:
    modules load, SIF RPC works, EELOAD restarts the kernel into OSDSYS.
    Findings recorded in `docs/hw-notes.md`.
 3. **DMAC + GIF + GS** *(current)* — software rasterizer, boot screen
-   visible, egui UI.
+   visible, egui UI. Done so far: GS core (linear-addressed VRAM,
+   raster pipeline, scanout), GIF, DMA ch2, real EE TLB, EE timer EQUF
+   semantics, CDVD S-command NVRAM/RTC model, SIO2 no-device stub,
+   `--screenshot`. Boot reaches OSDSYS with working RPC and 4 kernel
+   restarts, but OSDSYS does not draw yet. Known blockers: a stale
+   kernel T3-callback dispatch fires with a cleared handler table
+   (crashes via a null exec ~4 s in — needs the debugger to pin down),
+   cdvdman polls N-status 0x1F402005 for a value other than 0x40, and
+   VU0 macro ops are still nops (kernel context save/restore only so
+   far).
 4. **CDVD + ELF loading** — homebrew boot.
 5. **VU/VIF/IPU/SPU2/pads** — commercial game boot.
 6. **Platform reach** — `ps2-debug` (LLDB), wasm front-end.
