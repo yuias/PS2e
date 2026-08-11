@@ -13,6 +13,8 @@ struct Args {
     log: Option<String>,
     /// Directory to dump EE/IOP RAM into after the run (bring-up aid).
     dump: Option<String>,
+    /// Write the final framebuffer as a BMP.
+    screenshot: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -21,6 +23,7 @@ fn parse_args() -> Result<Args, String> {
         cycles: 500_000_000,
         log: None,
         dump: None,
+        screenshot: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -36,6 +39,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
             "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
+            "--screenshot" => args.screenshot = Some(it.next().ok_or("--screenshot needs a path")?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -125,5 +129,41 @@ fn main() -> ExitCode {
         }
         tracing::info!(dir = %dir, "dumped EE and IOP RAM");
     }
+    if let Some(path) = &args.screenshot {
+        let (w, h, rgba) = sys.framebuffer();
+        if let Err(e) = write_bmp(path, w, h, &rgba) {
+            eprintln!("error: screenshot failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        tracing::info!(path = %path, w, h, "screenshot written");
+    }
     ExitCode::SUCCESS
+}
+
+/// Minimal 24-bit bottom-up BMP writer.
+fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let row = ((w * 3 + 3) & !3) as usize;
+    let data_size = row * h as usize;
+    let mut out = Vec::with_capacity(54 + data_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + data_size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in (0..h).rev() {
+        let start = out.len();
+        for x in 0..w {
+            let o = ((y * w + x) * 4) as usize;
+            out.push(rgba[o + 2]);
+            out.push(rgba[o + 1]);
+            out.push(rgba[o]);
+        }
+        out.resize(start + row, 0);
+    }
+    std::fs::write(path, out)
 }

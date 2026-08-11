@@ -4,6 +4,8 @@
 //! mappings are essentially identity, so TLB instructions record entries
 //! without remapping (see ARCHITECTURE.md).
 
+use crate::gif::Gif;
+use crate::gs::Gs;
 use crate::sif::Sif;
 use crate::timers::Timers;
 use std::collections::HashSet;
@@ -14,8 +16,6 @@ pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
 pub const SPAD_SIZE: usize = 16 * 1024;
 /// Shadow register file for 0x1000_0000..0x1001_0000 MMIO.
 const MMIO_SIZE: usize = 0x10000;
-/// Shadow for GS privileged registers at 0x1200_0000.
-const GS_PRIV_SIZE: usize = 0x2000;
 
 /// Number of RDRAM devices reported by the MCH init handshake.
 const RDRAM_DEVICES: u32 = 2;
@@ -49,6 +49,8 @@ pub struct IopDmaChannel {
     /// SIF1 receive side: words remaining for the current IOP tag.
     recv_left: u32,
     recv_addr: u32,
+    /// Destination address the current packet started at.
+    recv_start: u32,
     recv_end: bool,
     /// Padding words to the packet's qword boundary, dropped after the data.
     recv_pad: u32,
@@ -98,7 +100,8 @@ pub struct Bus {
     /// Shadow storage for EE MMIO registers we don't model yet: reads return
     /// the last written value so BIOS read-modify-write sequences behave.
     mmio: Box<[u8]>,
-    gs_priv: Box<[u8]>,
+    pub gs: Gs,
+    pub gif: Gif,
     pub timers: Timers,
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
@@ -115,7 +118,8 @@ pub struct Bus {
     /// EE INTC.
     pub intc_stat: u32,
     pub intc_mask: u32,
-    /// EE DMAC: SIF0 (ch5) and SIF1 (ch6), interrupt status/mask.
+    /// EE DMAC: GIF (ch2), SIF0 (ch5) and SIF1 (ch6), interrupt status/mask.
+    pub dma_gif: EeDmaChannel,
     pub dma_sif0: EeDmaChannel,
     pub dma_sif1: EeDmaChannel,
     pub d_stat: u32,
@@ -135,6 +139,14 @@ pub struct Bus {
     rdram_sdevid: u32,
     /// Unmapped addresses already reported, to keep the log readable.
     warned_unmapped: HashSet<u32>,
+    /// EE TLB entries (raw registers) and a 4 KiB-granular lookup cache.
+    ee_tlb: [(u32, u32, u32, u32); 48],
+    /// (vaddr page | 1) -> phys page; 0 = invalid slot.
+    tlb_cache: Box<[(u32, u32)]>,
+    /// Deferred EE DMAC completion interrupts: (D_STAT bit, due cycle).
+    /// Data moves instantly but completion must not fire inside the very
+    /// instruction that started the transfer.
+    dma_irq_queue: Vec<(u32, u64)>,
 }
 
 impl Bus {
@@ -150,7 +162,8 @@ impl Bus {
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; 2 * 1024 * 1024].into_boxed_slice(),
             mmio,
-            gs_priv: vec![0u8; GS_PRIV_SIZE].into_boxed_slice(),
+            gs: Gs::new(),
+            gif: Gif::new(),
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
@@ -161,6 +174,7 @@ impl Bus {
             iop_timers: [IopTimer::default(); 6],
             intc_stat: 0,
             intc_mask: 0,
+            dma_gif: EeDmaChannel::default(),
             dma_sif0: EeDmaChannel::default(),
             dma_sif1: EeDmaChannel::default(),
             d_stat: 0,
@@ -174,18 +188,75 @@ impl Bus {
             tty_line: String::new(),
             rdram_sdevid: 0,
             warned_unmapped: HashSet::new(),
+            ee_tlb: [(0, 0, 0, 0); 48],
+            tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
+            dma_irq_queue: Vec::new(),
         }
     }
 
-    /// Fold a virtual address to a physical one (no real TLB yet).
+    /// Queue an EE DMAC completion interrupt a little into the future.
+    fn ee_dma_irq(&mut self, ch: u32) {
+        self.dma_irq_queue.push((1 << ch, self.now + 1024));
+    }
+
+    /// Record a TLB entry (from tlbwi) and flush the translation cache.
+    pub fn ee_tlb_write(&mut self, idx: usize, mask: u32, hi: u32, lo0: u32, lo1: u32) {
+        if idx < 48 {
+            self.ee_tlb[idx] = (mask, hi, lo0, lo1);
+            self.tlb_cache.fill((0, 0));
+        }
+    }
+
+    /// Walk the TLB for a mapped-segment address. Returns a physical
+    /// address; scratchpad hits map into a reserved range above VRAM-visible
+    /// physical space (0x7000_0000 window preserved).
+    fn tlb_lookup(&mut self, vaddr: u32) -> u32 {
+        let slot = ((vaddr >> 12) & 1023) as usize;
+        let (tag, base) = self.tlb_cache[slot];
+        if tag == (vaddr >> 12) | 0x8000_0000 {
+            return (base << 12) | (vaddr & 0xFFF);
+        }
+        for &(mask, hi, lo0, lo1) in &self.ee_tlb {
+            if hi == 0 && lo0 == 0 && lo1 == 0 {
+                continue;
+            }
+            let page_size = ((mask >> 13) + 1) << 12;
+            let pair_mask = !(page_size * 2 - 1);
+            if (vaddr & pair_mask) != (hi & pair_mask) {
+                continue;
+            }
+            if lo0 & 0x8000_0000 != 0 {
+                // Scratchpad entry: 16 KiB window.
+                return 0x7000_0000 | (vaddr & 0x3FFF);
+            }
+            let odd = vaddr & page_size != 0;
+            let lo = if odd { lo1 } else { lo0 };
+            if lo & 2 == 0 {
+                continue; // invalid half
+            }
+            let phys = ((lo >> 6) << 12) | (vaddr & (page_size - 1));
+            self.tlb_cache[slot] = ((vaddr >> 12) | 0x8000_0000, phys >> 12);
+            return phys;
+        }
+        // No mapping: fall back to a direct fold so early boot keeps working.
+        if self.warned_unmapped.insert(vaddr & !0xFFF) {
+            warn!(target: "ps2_core::bus", vaddr = format_args!("{vaddr:#010x}"), "EE access with no TLB mapping (direct fold)");
+        }
+        vaddr & 0x1FFF_FFFF
+    }
+
+    /// Translate an EE virtual address: KSEG0/1 fold directly, everything
+    /// else goes through the TLB (with common fixed mappings fast-pathed).
     #[inline]
-    fn translate(vaddr: u32) -> u32 {
+    fn translate(&mut self, vaddr: u32) -> u32 {
         match vaddr {
-            // Scratchpad is only reachable through this fixed virtual window.
+            // KSEG0 / KSEG1: unmapped segments.
+            0x8000_0000..=0xBFFF_FFFF => vaddr & 0x1FFF_FFFF,
+            // Scratchpad window (kernel TLB entry 0, effectively fixed).
             0x7000_0000..=0x7000_3FFF => vaddr,
-            // Kernel's uncached-accelerated mirror of main RAM.
-            0x3010_0000..=0x31FF_FFFF => vaddr & 0x01FF_FFFF,
-            _ => vaddr & 0x1FFF_FFFF,
+            // Identity-mapped low RAM (kuseg): skip the walk.
+            0x0000_0000..=0x01FF_FFFF => vaddr,
+            _ => self.tlb_lookup(vaddr),
         }
     }
 
@@ -238,7 +309,7 @@ impl Bus {
     }
 
     fn read<const N: usize>(&mut self, vaddr: u32) -> u64 {
-        let addr = Self::translate(vaddr);
+        let addr = self.translate(vaddr);
         match addr {
             0x0000_0000..=0x01FF_FFFF => read_le::<N>(&self.ram, addr as usize),
             0x7000_0000..=0x7000_3FFF => read_le::<N>(&self.spad, (addr & 0x3FFF) as usize),
@@ -256,6 +327,8 @@ impl Bus {
                 0
             }
             0x1FC0_0000..=0x1FFF_FFFF => read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize),
+            // ROM1 (DVD player ROM): absent, reads like erased flash.
+            0x1E00_0000..=0x1E3F_FFFF => u64::MAX >> (64 - 8 * N as u32),
             // SBUS CRT-controller command interface used by ROMGSCRT:
             // +0x06 status (bit1 = command done, bit0 = busy), +0x10 data.
             0x1A00_0000..=0x1A00_FFFF => {
@@ -275,7 +348,7 @@ impl Bus {
     }
 
     fn write<const N: usize>(&mut self, vaddr: u32, v: u64) {
-        let addr = Self::translate(vaddr);
+        let addr = self.translate(vaddr);
         match addr {
             0x0000_0000..=0x01FF_FFFF => write_le::<N>(&mut self.ram, addr as usize, v),
             0x7000_0000..=0x7000_3FFF => write_le::<N>(&mut self.spad, (addr & 0x3FFF) as usize, v),
@@ -341,7 +414,11 @@ impl Bus {
                     0
                 }
             }
-            // EE DMAC: SIF0 (ch5) / SIF1 (ch6) and interrupt status.
+            // EE DMAC: GIF (ch2), SIF0 (ch5) / SIF1 (ch6), interrupt status.
+            0x1000_A000 => self.dma_gif.chcr as u64,
+            0x1000_A010 => self.dma_gif.madr as u64,
+            0x1000_A020 => self.dma_gif.qwc as u64,
+            0x1000_A030 => self.dma_gif.tadr as u64,
             0x1000_C000 => self.dma_sif0.chcr as u64,
             0x1000_C010 => self.dma_sif0.madr as u64,
             0x1000_C020 => self.dma_sif0.qwc as u64,
@@ -375,6 +452,43 @@ impl Bus {
             // observation — never affects execution.
             0x1000_F180 => {
                 self.tty_push(v as u8);
+                return;
+            }
+            // GIF channel: starting a transfer runs it to completion.
+            0x1000_A000 => {
+                self.dma_gif.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_gif();
+                }
+                return;
+            }
+            0x1000_A010 => {
+                self.dma_gif.madr = v as u32;
+                return;
+            }
+            0x1000_A020 => {
+                self.dma_gif.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_A030 => {
+                self.dma_gif.tadr = v as u32;
+                return;
+            }
+            // VIF0 (ch0) / VIF1 (ch1): no VUs yet. Complete immediately so
+            // nothing waits forever on them; log so the gap stays visible.
+            0x1000_8000 | 0x1000_9000 => {
+                let ch = if addr & !0x3 == 0x1000_8000 { 0 } else { 1 };
+                if v as u32 & EE_CHCR_STR != 0 {
+                    warn!(target: "ps2_core::bus::dma", ch, "VIF DMA discarded (no VU/VIF yet)");
+                    self.ee_dma_irq(ch);
+                    write_le::<4>(
+                        &mut self.mmio,
+                        (addr & 0xFFFF) as usize,
+                        v & !(EE_CHCR_STR as u64),
+                    );
+                } else {
+                    write_le::<4>(&mut self.mmio, (addr & 0xFFFF) as usize, v);
+                }
                 return;
             }
             // EE DMAC SIF channels: starting a transfer pumps it to completion.
@@ -455,31 +569,54 @@ impl Bus {
     }
 
     fn read_gs_priv<const N: usize>(&mut self, addr: u32) -> u64 {
-        let off = (addr & 0x1FFF) as usize;
-        match addr & !0x3 {
-            // GS CSR: report FIFO empty and toggle VSYNC-ish bits off the
-            // cycle counter so polling loops terminate. Real GS comes later.
-            0x1200_1000 => {
-                let vsync = (self.now >> 19) & 1; // arbitrary but progressing
-                0x0000_0008 | (vsync << 3)
-            }
-            _ => {
-                let v = read_le::<N>(&self.gs_priv, off);
-                trace!(target: "ps2_core::bus::gs", addr = format_args!("{addr:#010x}"), "GS priv read (shadow)");
-                v
-            }
+        let v = self.gs.priv_read(addr & !0x7);
+        if N == 8 {
+            v
+        } else if addr & 4 != 0 {
+            v >> 32
+        } else {
+            v & 0xFFFF_FFFF
         }
     }
 
     fn write_gs_priv<const N: usize>(&mut self, addr: u32, v: u64) {
-        trace!(target: "ps2_core::bus::gs", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "GS priv write (shadow)");
-        write_le::<N>(&mut self.gs_priv, (addr & 0x1FFF) as usize, v);
+        let v = if N == 8 {
+            v
+        } else {
+            // 32-bit access: merge into the 64-bit register.
+            let cur = self.gs.priv_read(addr & !0x7);
+            if addr & 4 != 0 {
+                (cur & 0xFFFF_FFFF) | (v << 32)
+            } else {
+                (cur & !0xFFFF_FFFF) | (v & 0xFFFF_FFFF)
+            }
+        };
+        self.gs.priv_write(addr & !0x7, v);
+        self.gs_sync_int();
+    }
+
+    /// Fold a pending GS interrupt edge into EE INTC bit 0.
+    fn gs_sync_int(&mut self) {
+        if self.gs.intc_pending {
+            self.gs.intc_pending = false;
+            self.intc_stat |= 1;
+        }
     }
 
     // --- periodic events -------------------------------------------------
 
     /// Edge-detect timer interrupts on both sides. Called periodically.
     pub fn tick_timers(&mut self) {
+        // Deliver due deferred DMA completion interrupts.
+        let mut i = 0;
+        while i < self.dma_irq_queue.len() {
+            if self.dma_irq_queue[i].1 <= self.now {
+                self.d_stat |= self.dma_irq_queue[i].0;
+                self.dma_irq_queue.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
         self.intc_stat |= self.timers.check_irqs(self.now);
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
@@ -510,15 +647,91 @@ impl Bus {
         self.iop_i_stat |= fired;
     }
 
-    /// Vertical blank begin/end: EE INTC bits 2/3, IOP I_STAT bits 0/11.
+    /// Vertical blank begin/end: EE INTC bits 2/3, IOP I_STAT bits 0/11,
+    /// GS CSR VSINT.
     pub fn vblank(&mut self, begin: bool) {
         if begin {
             self.intc_stat |= 1 << 2;
             self.iop_i_stat |= 1 << 0;
+            self.gs.vblank();
+            self.gs_sync_int();
         } else {
             self.intc_stat |= 1 << 3;
             self.iop_i_stat |= 1 << 11;
         }
+    }
+
+    /// Run the GIF channel (ch2) to completion: normal or source chain.
+    fn pump_gif(&mut self) {
+        let mut guard = 0u32;
+        while self.dma_gif.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "GIF DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_gif.qwc > 0 {
+                let q = self.ee_dma_read128(self.dma_gif.madr);
+                let lo = q[0] as u64 | ((q[1] as u64) << 32);
+                let hi = q[2] as u64 | ((q[3] as u64) << 32);
+                self.gif.process(&mut self.gs, lo, hi);
+                self.dma_gif.madr = self.dma_gif.madr.wrapping_add(16);
+                self.dma_gif.qwc -= 1;
+                continue;
+            }
+            // Block finished.
+            let chain = (self.dma_gif.chcr >> 2) & 3 == 1;
+            if !chain || self.dma_gif.tag_end {
+                self.dma_gif.chcr &= !EE_CHCR_STR;
+                self.dma_gif.tag_end = false;
+                self.ee_dma_irq(2);
+                debug!(target: "ps2_core::bus::dma", "GIF DMA done");
+                break;
+            }
+            // Source-chain tag.
+            let tag = self.ee_dma_read128(self.dma_gif.tadr);
+            let qwc = tag[0] & 0xFFFF;
+            let id = (tag[0] >> 28) & 7;
+            let irq = tag[0] & 0x8000_0000 != 0;
+            let addr = tag[1] & 0x7FFF_FFF0;
+            match id {
+                0 => {
+                    self.dma_gif.madr = addr;
+                    self.dma_gif.tadr = self.dma_gif.tadr.wrapping_add(16);
+                    self.dma_gif.tag_end = true;
+                }
+                1 => {
+                    self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
+                    self.dma_gif.tadr = self.dma_gif.madr.wrapping_add(qwc * 16);
+                }
+                2 => {
+                    self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
+                    self.dma_gif.tadr = addr;
+                }
+                3 | 4 => {
+                    self.dma_gif.madr = addr;
+                    self.dma_gif.tadr = self.dma_gif.tadr.wrapping_add(16);
+                }
+                7 => {
+                    self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
+                    self.dma_gif.tag_end = true;
+                }
+                _ => {
+                    warn!(target: "ps2_core::bus::dma", id, "unhandled GIF chain tag id");
+                    self.dma_gif.tag_end = true;
+                }
+            }
+            if irq && self.dma_gif.chcr & EE_CHCR_TIE != 0 {
+                self.dma_gif.tag_end = true;
+            }
+            if self.dma_gif.chcr & EE_CHCR_TTE != 0 {
+                // TTE on the GIF channel sends the tag's upper 64 bits.
+                let lo = tag[2] as u64 | ((tag[3] as u64) << 32);
+                self.gif.process(&mut self.gs, lo, 0);
+            }
+            self.dma_gif.qwc = qwc;
+        }
+        self.gs_sync_int();
     }
 
     // --- SIF DMA ---------------------------------------------------------
@@ -592,7 +805,7 @@ impl Bus {
                 if self.dma_sif1.tag_end {
                     self.dma_sif1.chcr &= !EE_CHCR_STR;
                     self.dma_sif1.tag_end = false;
-                    self.d_stat |= 1 << 6;
+                    self.ee_dma_irq(6);
                     debug!(target: "ps2_core::bus::sifdma", "EE SIF1 chain done");
                 }
             } else {
@@ -653,7 +866,7 @@ impl Bus {
                 if qwc == 0 && self.dma_sif1.tag_end {
                     self.dma_sif1.chcr &= !EE_CHCR_STR;
                     self.dma_sif1.tag_end = false;
-                    self.d_stat |= 1 << 6;
+                    self.ee_dma_irq(6);
                 }
             }
         }
@@ -677,6 +890,7 @@ impl Bus {
                 self.sif.fifo1.pop_front();
                 self.sif.fifo1.pop_front();
                 ch.recv_addr = w0 & 0xFF_FFFF;
+                ch.recv_start = ch.recv_addr;
                 ch.recv_left = w1;
                 ch.recv_pad = (4 - (w1 & 3)) & 3;
                 ch.recv_end = w0 & 0xC000_0000 != 0;
@@ -712,7 +926,21 @@ impl Bus {
             if ch.recv_end {
                 ch.recv_end = false;
                 ch.chcr &= !IOP_CHCR_BUSY;
+                let start = ch.recv_start;
                 self.iop_dma_irq(10);
+                // An sceSifIopReset command (cid 0x80000003) means the IOP
+                // is about to reboot silently via UDNL: drop in-flight SIF
+                // state so the new kernel starts with clean FIFOs.
+                let cid = read_le::<4>(&self.iop_ram, ((start + 8) & 0x1F_FFFC) as usize) as u32;
+                if cid == 0x8000_0003 {
+                    debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
+                    self.sif.fifo0.clear();
+                    self.sif.fifo1.clear();
+                    self.iop_dma_sif0 = IopDmaChannel::default();
+                    let chcr = self.iop_dma_sif1.chcr;
+                    self.iop_dma_sif1 = IopDmaChannel::default();
+                    self.iop_dma_sif1.chcr = chcr;
+                }
             }
         }
         progressed
@@ -779,7 +1007,7 @@ impl Bus {
                 if self.dma_sif0.tag_end {
                     self.dma_sif0.tag_end = false;
                     self.dma_sif0.chcr &= !EE_CHCR_STR;
-                    self.d_stat |= 1 << 5;
+                    self.ee_dma_irq(5);
                     debug!(target: "ps2_core::bus::sifdma", "EE SIF0 chain done");
                     progressed = true;
                     continue;
@@ -876,6 +1104,9 @@ impl Bus {
                 trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "CDVD read (stub)");
                 0
             }
+            // ROM1 (DVD player ROM): not present; reads like erased flash so
+            // presence/version checks fail instead of "succeeding" with zeros.
+            0x1E00_0000..=0x1E3F_FFFF => u32::MAX,
             0x1F90_0000..=0x1F90_07FF => {
                 trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "SPU2 read (stub)");
                 0
@@ -962,6 +1193,12 @@ impl Bus {
             };
         }
         match addr {
+            // SIO2 (pad/memcard controller): report "no device attached".
+            // CTRL's start bit self-clears on write, RECV1 says disconnected.
+            0x1F80_8264 => 0xFF,    // FIFO out: empty response
+            0x1F80_826C => 0x1D100, // RECV1: no device
+            0x1F80_8270 => 0xF,     // RECV2: constant
+            0x1F80_8274 => 0,       // RECV3
             0x1F80_1070 => self.iop_i_stat,
             0x1F80_1074 => self.iop_i_mask,
             0x1F80_1078 => {
@@ -1010,6 +1247,15 @@ impl Bus {
             return;
         }
         match addr {
+            // SIO2 CTRL: the start bit kicks a transfer and self-clears;
+            // completion raises the SIO2 interrupt.
+            0x1F80_8268 => {
+                write_le::<4>(&mut self.iop_mmio, 0x8268, (v & !1) as u64);
+                if v & 1 != 0 {
+                    trace!(target: "ps2_core::iop::bus", "SIO2 transfer (no device)");
+                    self.iop_i_stat |= 1 << 17;
+                }
+            }
             // I_STAT write acknowledges: keeps only bits written as 1.
             0x1F80_1070 => self.iop_i_stat &= v,
             0x1F80_1074 => self.iop_i_mask = v,

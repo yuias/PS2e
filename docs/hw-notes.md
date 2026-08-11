@@ -80,3 +80,41 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
   after module loading.
 - IOP DMA completions report through DICR2 (enable bits 16+, flag bits
   24+ for channels 7-13) and I_STAT bit 3.
+
+## EE timers (learned during OSDSYS bring-up)
+
+- Tn_MODE: bits 0-1 CLKS, bit 7 CUE (count enable), bit 10 EQUF (equal
+  flag, W1C), bit 11 OVFF. Writing MODE clears COUNT.
+- The compare interrupt behaves as a latch: it fires only while EQUF is
+  clear, and EQUF stays set until a MODE write with bit 10. The kernel
+  parks T3 by leaving EQUF set (writes MODE 0x83) and rearms with 0x483/
+  0xC83. Getting this wrong produces spurious TIM3 interrupts ~4.2 s
+  apart (65536 hblanks) that crash the kernel's callback dispatcher.
+- The kernel schedules deferred callbacks (SIF handlers, alarms) through
+  a byte queue drained by a T3-driven dispatcher (kernel 0x80002650);
+  T3 runs on HBLANK with INTC bit 12.
+
+## EE kernel TLB usage
+
+- After boot the kernel relies on real TLB mappings: MMIO mapped per-4KB
+  at identity (0x10006000...), extended RAM mirrors, and high kernel
+  pages. Direct address folding stops working once OSDSYS loads; the
+  recorded tlbwi entries must actually be walked. Scratchpad is the
+  entry with EntryLo0 bit 31 set.
+
+## IOP silent reboot (sceSifIopReset)
+
+- The EE sends SIFCMD cid 0x80000003 with the IOPRP argument string; the
+  IOP reboots via UDNL without going through the ROM reset stub (no POST
+  codes). In-flight SIF FIFO state must be discarded at that point or
+  the new kernel's sifcmd handshake parses stale garbage and EELOAD
+  retries forever.
+- ROM1 (DVD player ROM, 0x1E000000 on both buses) should read like
+  erased flash (0xFF) when absent.
+
+## SIO2 (pads/memory cards)
+
+- CTRL 0x1F808268: writing bit 0 starts a transfer; the bit must read
+  back clear and I_STAT bit 17 must rise, or SIO2MAN spins forever.
+  RECV1 (0x1F80826C) = 0x1D100 reports "no device"; RECV2 (0x1F808270)
+  reads a constant 0xF; the out-FIFO (0x1F808264) reads 0xFF.

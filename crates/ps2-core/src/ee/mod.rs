@@ -301,7 +301,17 @@ impl Cpu {
                     self.set64(rd, self.r64(rs));
                 }
             }
-            0x0C => self.exception(EXC_SYSCALL),
+            0x0C => {
+                trace!(
+                    target: "ps2_core::ee::syscall",
+                    num = format_args!("{:#x}", self.r32(3)),
+                    pc = format_args!("{:#010x}", self.current_pc),
+                    a0 = format_args!("{:#010x}", self.r32(4)),
+                    a1 = format_args!("{:#010x}", self.r32(5)),
+                    "syscall"
+                );
+                self.exception(EXC_SYSCALL)
+            }
             0x0D => self.exception(EXC_BREAK),
             0x0F => {} // sync
             0x10 => self.set64(rd, self.hi[0]),
@@ -523,7 +533,17 @@ impl Cpu {
             }
             0x10..=0x1F => match instr & 0x3F {
                 0x01 => trace!(target: "ps2_core::ee::cop0", "tlbr (nop)"),
-                0x02 => self.cop0.tlb_write_indexed(),
+                0x02 => {
+                    self.cop0.tlb_write_indexed();
+                    let idx = (self.cop0.regs[0] & 0x3F) as usize;
+                    bus.ee_tlb_write(
+                        idx,
+                        self.cop0.regs[5],
+                        self.cop0.regs[10],
+                        self.cop0.regs[2],
+                        self.cop0.regs[3],
+                    );
+                }
                 0x06 => trace!(target: "ps2_core::ee::cop0", "tlbwr (nop)"),
                 0x08 => trace!(target: "ps2_core::ee::cop0", "tlbp (nop)"),
                 0x18 => {
@@ -830,7 +850,11 @@ impl Cpu {
         let a = self.r128(rs);
         let b = self.r128(rt);
         match sa {
-            0x0E => self.set128(rd, [b[0], a[0]]),               // pcpyld
+            0x08 => self.set128(rd, self.hi),      // pmfhi
+            0x09 => self.set128(rd, self.lo),      // pmflo
+            0x0E => self.set128(rd, [b[0], a[0]]), // pcpyld
+            // pinth: interleave rt's lower halfwords with rs's upper ones
+            0x0A => self.set128(rd, interleave_u16(b[0], a[1])),
             0x12 => self.set128(rd, [a[0] & b[0], a[1] & b[1]]), // pand
             0x13 => self.set128(rd, [a[0] ^ b[0], a[1] ^ b[1]]), // pxor
             _ => self.unimplemented("MMI2", instr),
@@ -842,9 +866,31 @@ impl Cpu {
         let a = self.r128(rs);
         let b = self.r128(rt);
         match sa {
-            0x0E => self.set128(rd, [a[1], b[1]]),               // pcpyud
+            0x08 => self.hi = a, // pmthi
+            0x09 => self.lo = a, // pmtlo
+            // pinteh: even halfwords of rs (upper) and rt (lower)
+            0x0A => {
+                let mut out = [0u64; 2];
+                for half in 0..2 {
+                    for lane in 0..2 {
+                        let bl = (b[half] >> (32 * lane)) & 0xFFFF;
+                        let al = (a[half] >> (32 * lane)) & 0xFFFF;
+                        out[half] |= (bl | (al << 16)) << (32 * lane);
+                    }
+                }
+                self.set128(rd, out);
+            }
+            0x0E => self.set128(rd, [a[1], b[1]]), // pcpyud
             0x12 => self.set128(rd, [a[0] | b[0], a[1] | b[1]]), // por
             0x13 => self.set128(rd, [!(a[0] | b[0]), !(a[1] | b[1])]), // pnor
+            // pcpyh: replicate the low halfword of each doubleword of rt
+            0x1B => {
+                let rep = |v: u64| {
+                    let h = v & 0xFFFF;
+                    h | (h << 16) | (h << 32) | (h << 48)
+                };
+                self.set128(rd, [rep(b[0]), rep(b[1])]);
+            }
             _ => self.unimplemented("MMI3", instr),
         }
     }

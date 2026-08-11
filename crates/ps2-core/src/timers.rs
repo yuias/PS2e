@@ -82,10 +82,10 @@ impl Timers {
                 // Bits 10/11 (equal/overflow flags) are write-1-to-clear.
                 let flags = timer.mode & 0xC00 & !(v & 0xC00);
                 timer.mode = (v & !0xC00) | flags;
-                // Changing the clock source restarts counting from the
-                // current value so the lazy count stays consistent.
-                timer.base = timer.count(now);
+                // Writing MODE clears the counter, as on hardware.
+                timer.base = 0;
                 timer.base_cycle = now;
+                timer.last_check = now;
             }
             0x20 => timer.comp = v as u16,
             0x30 => timer.hold = v as u16,
@@ -103,8 +103,11 @@ impl Timers {
     pub fn check_irqs(&mut self, now: u64) -> u32 {
         let mut intc = 0;
         for (t, timer) in self.timers.iter_mut().enumerate() {
-            // CMPE: compare interrupt enabled.
-            if timer.mode & (1 << 7) == 0 {
+            // CUE (bit 7) gates counting. The equal-flag (EQUF, bit 10)
+            // latches: a compare fires the INTC line only when the flag is
+            // still clear, and only a MODE write with bit 10 rearms it.
+            // (The kernel parks a timer by leaving EQUF set.)
+            if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
                 continue;
             }
             let before = timer.count(timer.last_check);

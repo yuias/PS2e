@@ -6,6 +6,8 @@
 
 pub mod bus;
 pub mod ee;
+pub mod gif;
+pub mod gs;
 pub mod iop;
 pub mod sif;
 pub mod timers;
@@ -80,5 +82,10 @@ impl Ps2System {
     /// Drain kernel TTY output captured since the last call.
     pub fn take_tty(&mut self) -> String {
         core::mem::take(&mut self.bus.tty_buffer)
+    }
+
+    /// Current display output as RGBA8: (width, height, pixels).
+    pub fn framebuffer(&self) -> (u32, u32, Vec<u8>) {
+        self.bus.gs.framebuffer()
     }
 }
