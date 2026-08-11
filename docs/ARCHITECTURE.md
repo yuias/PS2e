@@ -53,17 +53,23 @@ Planned crates:
    DMA, EE/IOP interrupts and timers. Cooperative boot completes: IOP
    modules load, SIF RPC works, EELOAD restarts the kernel into OSDSYS.
    Findings recorded in `docs/hw-notes.md`.
-3. **DMAC + GIF + GS** *(current)* — software rasterizer, boot screen
-   visible, egui UI. Done so far: GS core (linear-addressed VRAM,
-   raster pipeline, scanout), GIF, DMA ch2, real EE TLB, EE timer EQUF
-   semantics, CDVD S-command NVRAM/RTC model, SIO2 no-device stub,
-   `--screenshot`. Boot reaches OSDSYS with working RPC and 4 kernel
-   restarts, but OSDSYS does not draw yet. Known blockers: a stale
-   kernel T3-callback dispatch fires with a cleared handler table
-   (crashes via a null exec ~4 s in — needs the debugger to pin down),
-   cdvdman polls N-status 0x1F402005 for a value other than 0x40, and
-   VU0 macro ops are still nops (kernel context save/restore only so
-   far).
+3. **DMAC + GIF + GS** *(paused, resumes after the debugger)* — software
+   rasterizer, boot screen visible, egui UI. Done so far: GS core
+   (linear-addressed VRAM, raster pipeline, scanout), GIF, DMA ch2,
+   real EE TLB, EE timer EQUF semantics, CDVD S-command NVRAM/RTC
+   model, SIO2 no-device stub, `--screenshot`. Boot reaches OSDSYS with
+   working RPC and 4 kernel restarts, but OSDSYS does not draw yet.
+   Known blockers: a stale kernel T3-callback dispatch fires with a
+   cleared handler table (crashes via a null exec ~4 s in), cdvdman
+   polls N-status 0x1F402005 for a value other than 0x40, and VU0
+   macro ops are still nops (kernel context save/restore only so far).
+
+   **Next up instead: `ps2-debug`** (pulled forward from milestone 6).
+   The remaining blockers are kernel-internal timing/state bugs that
+   static disassembly of RAM dumps is too slow to chase; a gdb-remote
+   stub with breakpoints, watchpoints and PC tracing (PS1e's
+   `psx-debug` as the template, EE and IOP targets) pays for itself
+   immediately — and directly serves the PS2BiosRebuild workflow.
 4. **CDVD + ELF loading** — homebrew boot.
 5. **VU/VIF/IPU/SPU2/pads** — commercial game boot.
 6. **Platform reach** — `ps2-debug` (LLDB), wasm front-end.
