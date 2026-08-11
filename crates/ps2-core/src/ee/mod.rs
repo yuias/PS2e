@@ -14,6 +14,7 @@ use fpu::Fpu;
 use tracing::{error, trace, warn};
 
 /// Exception codes (Cause.ExcCode).
+const EXC_INTERRUPT: u32 = 0;
 const EXC_SYSCALL: u32 = 8;
 const EXC_BREAK: u32 = 9;
 const EXC_TRAP: u32 = 13;
@@ -155,6 +156,14 @@ impl Cpu {
         debug_assert_eq!(self.gpr[0], [0, 0]);
         if self.pc == 0 {
             panic!("EE jumped to null (previous pc {:#010x})", self.current_pc);
+        }
+        if self
+            .cop0
+            .interrupt_pending(bus.ee_int0_pending(), bus.ee_int1_pending())
+        {
+            self.current_pc = self.pc;
+            self.in_delay = self.next_is_delay;
+            self.exception(EXC_INTERRUPT);
         }
         self.current_pc = self.pc;
         self.in_delay = self.next_is_delay;
@@ -709,15 +718,35 @@ impl Cpu {
         let a = self.r128(rs);
         let b = self.r128(rt);
         match sa {
-            // paddw / psubw
-            0x00 => self.lanes_u32(rd, a, b, |x, y| x.wrapping_add(y)),
-            0x01 => self.lanes_u32(rd, a, b, |x, y| x.wrapping_sub(y)),
-            // paddh / psubh
-            0x08 => self.lanes_u16(rd, a, b, |x, y| x.wrapping_add(y)),
-            0x09 => self.lanes_u16(rd, a, b, |x, y| x.wrapping_sub(y)),
-            // paddb / psubb
-            0x10 => self.lanes_u8(rd, a, b, |x, y| x.wrapping_add(y)),
-            0x11 => self.lanes_u8(rd, a, b, |x, y| x.wrapping_sub(y)),
+            0x00 => self.lanes_u32(rd, a, b, |x, y| x.wrapping_add(y)), // paddw
+            0x01 => self.lanes_u32(rd, a, b, |x, y| x.wrapping_sub(y)), // psubw
+            0x02 => {
+                // pcgtw
+                self.lanes_u32(rd, a, b, |x, y| {
+                    (((x as i32) > y as i32) as u32).wrapping_neg()
+                })
+            }
+            0x03 => self.lanes_u32(rd, a, b, |x, y| (x as i32).max(y as i32) as u32), // pmaxw
+            0x04 => self.lanes_u16(rd, a, b, |x, y| x.wrapping_add(y)),               // paddh
+            0x05 => self.lanes_u16(rd, a, b, |x, y| x.wrapping_sub(y)),               // psubh
+            0x06 => {
+                // pcgth
+                self.lanes_u16(rd, a, b, |x, y| {
+                    (((x as i16) > y as i16) as u16).wrapping_neg()
+                })
+            }
+            0x07 => self.lanes_u16(rd, a, b, |x, y| (x as i16).max(y as i16) as u16), // pmaxh
+            0x08 => self.lanes_u8(rd, a, b, |x, y| x.wrapping_add(y)),                // paddb
+            0x09 => self.lanes_u8(rd, a, b, |x, y| x.wrapping_sub(y)),                // psubb
+            0x0A => {
+                // pcgtb
+                self.lanes_u8(rd, a, b, |x, y| {
+                    (((x as i8) > y as i8) as u8).wrapping_neg()
+                })
+            }
+            // paddsw / psubsw
+            0x10 => self.lanes_u32(rd, a, b, |x, y| (x as i32).saturating_add(y as i32) as u32),
+            0x11 => self.lanes_u32(rd, a, b, |x, y| (x as i32).saturating_sub(y as i32) as u32),
             // pextlw: interleave 32-bit words from the low halves
             0x12 => self.set128(
                 rd,
@@ -726,12 +755,74 @@ impl Cpu {
                     ((b[0] >> 32) as u32 as u64) | (((a[0] >> 32) as u32 as u64) << 32),
                 ],
             ),
+            // ppacw: pack the even 32-bit words of rt (low) and rs (high)
+            0x13 => self.set128(
+                rd,
+                [
+                    (b[0] as u32 as u64) | ((b[1] as u32 as u64) << 32),
+                    (a[0] as u32 as u64) | ((a[1] as u32 as u64) << 32),
+                ],
+            ),
+            // paddsh / psubsh
+            0x14 => self.lanes_u16(rd, a, b, |x, y| (x as i16).saturating_add(y as i16) as u16),
+            0x15 => self.lanes_u16(rd, a, b, |x, y| (x as i16).saturating_sub(y as i16) as u16),
+            0x16 => self.set128(rd, interleave_u16(b[0], a[0])), // pextlh
+            0x17 => self.set128(rd, pack_u16(b, a)),             // ppach
+            // paddsb / psubsb
+            0x18 => self.lanes_u8(rd, a, b, |x, y| (x as i8).saturating_add(y as i8) as u8),
+            0x19 => self.lanes_u8(rd, a, b, |x, y| (x as i8).saturating_sub(y as i8) as u8),
+            0x1A => self.set128(rd, interleave_u8(b[0], a[0])), // pextlb
+            0x1B => self.set128(rd, pack_u8(b, a)),             // ppacb
             _ => self.unimplemented("MMI0", instr),
         }
     }
 
-    fn op_mmi1(&mut self, instr: u32, _rs: usize, _rt: usize, _rd: usize) {
-        self.unimplemented("MMI1", instr)
+    fn op_mmi1(&mut self, instr: u32, rs: usize, rt: usize, rd: usize) {
+        let sa = (instr >> 6) & 31;
+        let a = self.r128(rs);
+        let b = self.r128(rt);
+        match sa {
+            0x01 => self.lanes_u32(rd, a, b, |_, y| (y as i32).unsigned_abs()), // pabsw
+            0x02 => self.lanes_u32(rd, a, b, |x, y| ((x == y) as u32).wrapping_neg()), // pceqw
+            0x03 => self.lanes_u32(rd, a, b, |x, y| (x as i32).min(y as i32) as u32), // pminw
+            0x05 => self.lanes_u16(rd, a, b, |_, y| (y as i16).unsigned_abs()), // pabsh
+            0x06 => self.lanes_u16(rd, a, b, |x, y| ((x == y) as u16).wrapping_neg()), // pceqh
+            0x07 => self.lanes_u16(rd, a, b, |x, y| (x as i16).min(y as i16) as u16), // pminh
+            0x0A => self.lanes_u8(rd, a, b, |x, y| ((x == y) as u8).wrapping_neg()), // pceqb
+            0x10 => self.lanes_u32(rd, a, b, |x, y| x.saturating_add(y)),       // padduw
+            0x11 => self.lanes_u32(rd, a, b, |x, y| x.saturating_sub(y)),       // psubuw
+            // pextuw: interleave 32-bit words from the upper halves
+            0x12 => self.set128(
+                rd,
+                [
+                    (b[1] as u32 as u64) | ((a[1] as u32 as u64) << 32),
+                    ((b[1] >> 32) as u32 as u64) | (((a[1] >> 32) as u32 as u64) << 32),
+                ],
+            ),
+            0x14 => self.lanes_u16(rd, a, b, |x, y| x.saturating_add(y)), // padduh
+            0x15 => self.lanes_u16(rd, a, b, |x, y| x.saturating_sub(y)), // psubuh
+            0x16 => self.set128(rd, interleave_u16(b[1], a[1])),          // pextuh
+            0x18 => self.lanes_u8(rd, a, b, |x, y| x.saturating_add(y)),  // paddub
+            0x19 => self.lanes_u8(rd, a, b, |x, y| x.saturating_sub(y)),  // psubub
+            0x1A => self.set128(rd, interleave_u8(b[1], a[1])),           // pextub
+            // qfsrv: 256-bit funnel shift right of rs:rt by the SA register
+            0x1B => {
+                let shift = self.sa & 0xFF;
+                let lo = u128::from(b[0]) | (u128::from(b[1]) << 64);
+                let hi = u128::from(a[0]) | (u128::from(a[1]) << 64);
+                let v = if shift == 0 {
+                    lo
+                } else if shift < 128 {
+                    (lo >> shift) | (hi << (128 - shift))
+                } else if shift < 256 {
+                    hi >> (shift - 128)
+                } else {
+                    0
+                };
+                self.set128(rd, [v as u64, (v >> 64) as u64]);
+            }
+            _ => self.unimplemented("MMI1", instr),
+        }
     }
 
     fn op_mmi2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize) {
@@ -795,6 +886,58 @@ impl Cpu {
     }
 }
 
+/// Interleave the 16-bit lanes of two 64-bit halves (pextlh/pextuh shape):
+/// result lanes alternate low-source, high-source.
+fn interleave_u16(lo: u64, hi: u64) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for i in 0..4 {
+        let l = (lo >> (16 * i)) & 0xFFFF;
+        let h = (hi >> (16 * i)) & 0xFFFF;
+        let half = i / 2;
+        let pos = (i % 2) * 32;
+        out[half] |= (l << pos) | (h << (pos + 16));
+    }
+    out
+}
+
+fn interleave_u8(lo: u64, hi: u64) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for i in 0..8 {
+        let l = (lo >> (8 * i)) & 0xFF;
+        let h = (hi >> (8 * i)) & 0xFF;
+        let half = i / 4;
+        let pos = (i % 4) * 16;
+        out[half] |= (l << pos) | (h << (pos + 8));
+    }
+    out
+}
+
+/// ppach: keep the even 16-bit lanes of each source; rt fills the low half.
+fn pack_u16(b: [u64; 2], a: [u64; 2]) -> [u64; 2] {
+    let squeeze = |v: [u64; 2]| -> u64 {
+        let mut out = 0u64;
+        for i in 0..4 {
+            let src = v[i / 2] >> (32 * (i % 2));
+            out |= (src & 0xFFFF) << (16 * i);
+        }
+        out
+    };
+    [squeeze(b), squeeze(a)]
+}
+
+/// ppacb: keep the even 8-bit lanes of each source; rt fills the low half.
+fn pack_u8(b: [u64; 2], a: [u64; 2]) -> [u64; 2] {
+    let squeeze = |v: [u64; 2]| -> u64 {
+        let mut out = 0u64;
+        for i in 0..8 {
+            let src = v[i / 4] >> (16 * (i % 4));
+            out |= (src & 0xFF) << (8 * i);
+        }
+        out
+    };
+    [squeeze(b), squeeze(a)]
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Ps2System;
@@ -809,6 +952,16 @@ mod tests {
         Ps2System::new(bios).unwrap()
     }
 
+    /// Step only the EE: these tests feed it R5900-only encodings the IOP
+    /// core would (rightly) reject.
+    fn run_ee(sys: &mut Ps2System, n: u64) {
+        for _ in 0..n {
+            sys.bus.now = sys.cycles;
+            sys.ee.step(&mut sys.bus);
+            sys.cycles += 1;
+        }
+    }
+
     #[test]
     fn lui_ori_addiu() {
         let mut sys = system_with(&[
@@ -816,7 +969,7 @@ mod tests {
             0x3508_BEEF, // ori $t0, $t0, 0xBEEF
             0x2509_0001, // addiu $t1, $t0, 1
         ]);
-        sys.run(3);
+        run_ee(&mut sys, 3);
         assert_eq!(sys.ee.gpr[8][0], 0xFFFF_FFFF_DEAD_BEEF);
         assert_eq!(sys.ee.gpr[9][0], 0xFFFF_FFFF_DEAD_BEF0);
     }
@@ -829,7 +982,7 @@ mod tests {
             0x2402_0002, // addiu $v0, $0, 2   (skipped)
             0x2403_0003, // addiu $v1, $0, 3   (branch target)
         ]);
-        sys.run(3);
+        run_ee(&mut sys, 3);
         assert_eq!(sys.ee.gpr[1][0], 1);
         assert_eq!(sys.ee.gpr[2][0], 0);
         assert_eq!(sys.ee.gpr[3][0], 3);
@@ -842,7 +995,7 @@ mod tests {
             0x2402_0002, // addiu $v0, $0, 2   (delay slot: skipped)
             0x2403_0003, // addiu $v1, $0, 3
         ]);
-        sys.run(2);
+        run_ee(&mut sys, 2);
         assert_eq!(sys.ee.gpr[2][0], 0);
         assert_eq!(sys.ee.gpr[3][0], 3);
     }
@@ -856,7 +1009,7 @@ mod tests {
             0x0000_0000,
             0x2404_0007, // addiu $a0, $0, 7 (target)
         ]);
-        sys.run(3);
+        run_ee(&mut sys, 3);
         assert_eq!(sys.ee.gpr[31][0], 0xFFFF_FFFF_BFC0_0008);
         assert_eq!(sys.ee.gpr[4][0], 7);
     }
@@ -869,7 +1022,7 @@ mod tests {
             0x7C28_0000, // sq $t0, 0($at)
             0x7829_0000, // lq $t1, 0($at)
         ]);
-        sys.run(4);
+        run_ee(&mut sys, 4);
         assert_eq!(sys.ee.gpr[9], sys.ee.gpr[8]);
     }
 
@@ -881,7 +1034,7 @@ mod tests {
             0x0109_0018, // mult $t0, $t1
             0x0109_001A, // div $t0, $t1 (6/7 = 0 rem 6)
         ]);
-        sys.run(4);
+        run_ee(&mut sys, 4);
         assert_eq!(sys.ee.lo[0], 0); // div overwrote lo0
         assert_eq!(sys.ee.hi[0], 6);
     }

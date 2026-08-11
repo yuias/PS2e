@@ -20,6 +20,8 @@ struct Timer {
     mode: u32,
     comp: u16,
     hold: u16,
+    /// Cycle stamp of the last interrupt check, for edge detection.
+    last_check: u64,
 }
 
 impl Timer {
@@ -94,6 +96,37 @@ impl Timers {
     fn decode(addr: u32) -> (usize, u32) {
         let t = ((addr >> 11) & 3) as usize;
         (t, addr & 0x30)
+    }
+
+    /// Edge-detect compare matches since the last call; returns an INTC bit
+    /// mask (bit 9+t per timer). Sets the mode equal-flag as on hardware.
+    pub fn check_irqs(&mut self, now: u64) -> u32 {
+        let mut intc = 0;
+        for (t, timer) in self.timers.iter_mut().enumerate() {
+            // CMPE: compare interrupt enabled.
+            if timer.mode & (1 << 7) == 0 {
+                continue;
+            }
+            let before = timer.count(timer.last_check);
+            let after = timer.count(now);
+            timer.last_check = now;
+            let crossed = if before <= after {
+                before < timer.comp && timer.comp <= after
+            } else {
+                // 16-bit wraparound between checks.
+                timer.comp > before || timer.comp <= after
+            };
+            if crossed {
+                timer.mode |= 1 << 10; // equal flag
+                if timer.mode & (1 << 6) != 0 {
+                    // ZRET: restart counting from zero on compare.
+                    timer.base = 0;
+                    timer.base_cycle = now;
+                }
+                intc |= 1 << (9 + t);
+            }
+        }
+        intc
     }
 }
 

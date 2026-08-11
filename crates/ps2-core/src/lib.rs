@@ -6,17 +6,25 @@
 
 pub mod bus;
 pub mod ee;
+pub mod iop;
+pub mod sif;
 pub mod timers;
 
 use bus::Bus;
-use ee::Cpu;
 
 /// EE core clock in Hz (294.912 MHz). IOP runs at 1/8 of this.
 pub const EE_CLOCK_HZ: u64 = 294_912_000;
+/// EE cycles per IOP cycle.
+pub const EE_PER_IOP: u64 = 8;
+/// EE cycles per video frame (~60 Hz).
+pub const EE_CYCLES_PER_FRAME: u64 = EE_CLOCK_HZ / 60;
+/// Vertical blank occupies roughly the last 5% of the frame.
+const VBLANK_CYCLES: u64 = EE_CYCLES_PER_FRAME / 20;
 
 /// Top-level system: owns every component, mirrors the real console.
 pub struct Ps2System {
-    pub ee: Cpu,
+    pub ee: ee::Cpu,
+    pub iop: iop::Cpu,
     pub bus: Bus,
     /// Total elapsed EE cycles since reset.
     pub cycles: u64,
@@ -33,18 +41,31 @@ impl Ps2System {
             ));
         }
         Ok(Self {
-            ee: Cpu::new(),
+            ee: ee::Cpu::new(),
+            iop: iop::Cpu::new(),
             bus: Bus::new(bios),
             cycles: 0,
         })
     }
 
-    /// Execute one EE instruction.
+    /// Execute one EE instruction, stepping the IOP at the 8:1 clock ratio.
     pub fn step(&mut self) {
         self.bus.now = self.cycles;
         self.ee.step(&mut self.bus);
         // 1 cycle per instruction for now; wait states and dual-issue
         // approximation come later.
+        if self.cycles.is_multiple_of(EE_PER_IOP) {
+            self.iop.step(&mut self.bus);
+        }
+        if self.cycles.is_multiple_of(64) {
+            self.bus.tick_timers();
+        }
+        let frame_pos = self.cycles % EE_CYCLES_PER_FRAME;
+        if frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
+            self.bus.vblank(true);
+        } else if frame_pos == 0 && self.cycles != 0 {
+            self.bus.vblank(false);
+        }
         self.cycles += 1;
     }
 

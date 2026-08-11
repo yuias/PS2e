@@ -108,7 +108,26 @@ impl Cop0 {
         } else {
             0x8000_0000
         };
-        base + 0x180
+        // Interrupts use the dedicated V_INTERRUPT vector.
+        if code == 0 {
+            base + 0x200
+        } else {
+            base + 0x180
+        }
+    }
+
+    /// Update the external interrupt pending bits (Cause.IP2/IP3, level
+    /// triggered) and report whether an interrupt should be taken.
+    pub fn interrupt_pending(&mut self, int0: bool, int1: bool) -> bool {
+        let cause =
+            (self.regs[CAUSE] & !(0b11 << 10)) | ((int0 as u32) << 10) | ((int1 as u32) << 11);
+        self.regs[CAUSE] = cause;
+        let status = self.regs[STATUS];
+        // IE, EIE set; EXL, ERL clear.
+        if status & 1 == 0 || status & STATUS_EIE == 0 || status & (STATUS_EXL | STATUS_ERL) != 0 {
+            return false;
+        }
+        (status >> 8) & (cause >> 8) & 0xFF != 0
     }
 
     /// ERET: return address, or None if neither ERL nor EXL is set.
