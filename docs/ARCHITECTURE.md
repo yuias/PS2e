@@ -47,10 +47,14 @@ Planned crates:
 
 ## Milestones
 
-1. **EE bring-up** *(current)* — R5900 interpreter + bus + BIOS load; run
-   SCPH-50000 to its first kernel TTY output.
-2. **IOP + SIF** — R3000A core (ported from PS1e), EE/IOP cooperative boot.
-3. **DMAC + GIF + GS** — software rasterizer, boot screen visible, egui UI.
+1. **EE bring-up** *(done)* — R5900 interpreter + bus + BIOS load; runs
+   SCPH-50000 through full kernel init to the DECI2 manager banner.
+2. **IOP + SIF** *(done)* — R3000A core, SIF mailboxes/flags + SIF0/SIF1
+   DMA, EE/IOP interrupts and timers. Cooperative boot completes: IOP
+   modules load, SIF RPC works, EELOAD restarts the kernel into OSDSYS.
+   Findings recorded in `docs/hw-notes.md`.
+3. **DMAC + GIF + GS** *(current)* — software rasterizer, boot screen
+   visible, egui UI.
 4. **CDVD + ELF loading** — homebrew boot.
 5. **VU/VIF/IPU/SPU2/pads** — commercial game boot.
 6. **Platform reach** — `ps2-debug` (LLDB), wasm front-end.
@@ -59,14 +63,18 @@ Planned crates:
 
 ```
 ps2-core/src/
-├── lib.rs        # Ps2System: top level, owns EE + Bus + cycle counter
-├── bus.rs        # EE memory map, MMIO dispatch, RDRAM init handshake, TTY capture
-└── ee/
-    ├── mod.rs    # R5900 interpreter (128-bit GPRs, MMI, branch delay slots)
-    ├── cop0.rs   # System control coprocessor (Status/Cause/EPC, exceptions, ERET)
-    └── fpu.rs    # COP1 (non-IEEE single-precision; host f32 approximation for now)
+├── lib.rs        # Ps2System: EE + IOP interleave (8:1), vblank scheduling
+├── bus.rs        # Both memory maps, MMIO dispatch, SIF DMA pump, INTC/DMAC/IOP-DMA state
+├── sif.rs        # SIF mailboxes/flags/control + SIF0/SIF1 FIFOs
+├── timers.rs     # EE timers (lazy counts, compare interrupts)
+├── ee/
+│   ├── mod.rs    # R5900 interpreter (128-bit GPRs, MMI, branch delay slots)
+│   ├── cop0.rs   # Status/Cause/EPC, exceptions, ERET, interrupt gating
+│   └── fpu.rs    # COP1 (non-IEEE single-precision; host f32 approximation for now)
+└── iop/
+    └── mod.rs    # R3000A interpreter (load delay slots, PS1-style COP0)
 ```
 
-Planned: `iop/`, `gs/`, `vu/`, `dmac/`, `gif/`, `vif/`, `sif/`, `ipu/`,
-`timers/`, `intc/`, `scheduler` (event-driven for VBlank-class events only;
+Planned: `gs/`, `vu/`, `dmac/` (full 10-channel), `gif/`, `vif/`, `ipu/`,
+`cdvd/`, `spu2/`, `scheduler` (event-driven for VBlank-class events only;
 everything else catch-up ticks, as in PS1e).
