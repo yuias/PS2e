@@ -11,6 +11,8 @@ struct Args {
     bios: String,
     cycles: u64,
     log: Option<String>,
+    /// Directory to dump EE/IOP RAM into after the run (bring-up aid).
+    dump: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -18,6 +20,7 @@ fn parse_args() -> Result<Args, String> {
         bios: "assets/SCPH-50000.bin".to_string(),
         cycles: 500_000_000,
         log: None,
+        dump: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -32,6 +35,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("bad --cycles: {e}"))?;
             }
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
+            "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -101,8 +105,25 @@ fn main() -> ExitCode {
 
     tracing::info!(
         cycles = sys.cycles,
-        pc = format_args!("{:#010x}", sys.ee.pc),
+        ee_pc = format_args!("{:#010x}", sys.ee.pc),
+        iop_pc = format_args!("{:#010x}", sys.iop.pc),
+        iop_i_mask = format_args!("{:#x}", sys.bus.iop_i_mask),
+        iop_i_ctrl = sys.bus.iop_i_ctrl,
+        intc_mask = format_args!("{:#x}", sys.bus.intc_mask),
+        d_mask = format_args!("{:#x}", sys.bus.d_mask),
         "run finished"
     );
+
+    if let Some(dir) = &args.dump {
+        let ee = format!("{dir}/ee_ram.bin");
+        let iop = format!("{dir}/iop_ram.bin");
+        if let Err(e) =
+            std::fs::write(&ee, &sys.bus.ram).and_then(|_| std::fs::write(&iop, &sys.bus.iop_ram))
+        {
+            eprintln!("error: RAM dump failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        tracing::info!(dir = %dir, "dumped EE and IOP RAM");
+    }
     ExitCode::SUCCESS
 }
