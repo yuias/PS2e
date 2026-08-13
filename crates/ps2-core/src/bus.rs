@@ -8,6 +8,7 @@ use crate::gif::Gif;
 use crate::gs::Gs;
 use crate::sif::Sif;
 use crate::timers::Timers;
+use crate::vif::Vif;
 use std::collections::HashSet;
 use tracing::{debug, trace, warn};
 
@@ -205,6 +206,7 @@ pub struct Bus {
     mmio: Box<[u8]>,
     pub gs: Gs,
     pub gif: Gif,
+    pub vif1: Vif,
     pub timers: Timers,
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
@@ -225,7 +227,9 @@ pub struct Bus {
     /// EE INTC.
     pub intc_stat: u32,
     pub intc_mask: u32,
-    /// EE DMAC: GIF (ch2), SIF0 (ch5) and SIF1 (ch6), interrupt status/mask.
+    /// EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) and SIF1 (ch6),
+    /// interrupt status/mask.
+    pub dma_vif1: EeDmaChannel,
     pub dma_gif: EeDmaChannel,
     pub dma_sif0: EeDmaChannel,
     pub dma_sif1: EeDmaChannel,
@@ -272,6 +276,7 @@ impl Bus {
             mmio,
             gs: Gs::new(),
             gif: Gif::new(),
+            vif1: Vif::new(),
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
@@ -283,6 +288,7 @@ impl Bus {
             iop_timers: [IopTimer::default(); 6],
             intc_stat: 0,
             intc_mask: 0,
+            dma_vif1: EeDmaChannel::default(),
             dma_gif: EeDmaChannel::default(),
             dma_sif0: EeDmaChannel::default(),
             dma_sif1: EeDmaChannel::default(),
@@ -494,6 +500,9 @@ impl Bus {
                 0
             }
             0x1FC0_0000..=0x1FFF_FFFF => read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize),
+            // CDVD (MECHACON) registers, also visible from the EE: the OSD
+            // peeks N-status directly.
+            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr) as u64,
             // ROM1 (DVD player ROM): absent, reads like erased flash.
             0x1E00_0000..=0x1E3F_FFFF => u64::MAX >> (64 - 8 * N as u32),
             // SBUS CRT-controller command interface used by ROMGSCRT:
@@ -641,13 +650,12 @@ impl Bus {
                 self.dma_gif.tadr = v as u32;
                 return;
             }
-            // VIF0 (ch0) / VIF1 (ch1): no VUs yet. Complete immediately so
-            // nothing waits forever on them; log so the gap stays visible.
-            0x1000_8000 | 0x1000_9000 => {
-                let ch = if addr & !0x3 == 0x1000_8000 { 0 } else { 1 };
+            // VIF0 (ch0): no VU0 yet. Complete immediately so nothing waits
+            // forever on it; log so the gap stays visible.
+            0x1000_8000 => {
                 if v as u32 & EE_CHCR_STR != 0 {
-                    warn!(target: "ps2_core::bus::dma", ch, "VIF DMA discarded (no VU/VIF yet)");
-                    self.ee_dma_irq(ch);
+                    warn!(target: "ps2_core::bus::dma", "VIF0 DMA discarded (no VU0 yet)");
+                    self.ee_dma_irq(0);
                     write_le::<4>(
                         &mut self.mmio,
                         (addr & 0xFFFF) as usize,
@@ -655,6 +663,34 @@ impl Bus {
                     );
                 } else {
                     write_le::<4>(&mut self.mmio, (addr & 0xFFFF) as usize, v);
+                }
+                return;
+            }
+            // VIF1 channel: starting a transfer runs it to completion.
+            0x1000_9000 => {
+                self.dma_vif1.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_vif1();
+                }
+                return;
+            }
+            0x1000_9010 => {
+                self.dma_vif1.madr = v as u32;
+                return;
+            }
+            0x1000_9020 => {
+                self.dma_vif1.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_9030 => {
+                self.dma_vif1.tadr = v as u32;
+                return;
+            }
+            // VIF1 FIFO: direct programmed writes feed the same parser.
+            0x1000_5000..=0x1000_5FF0 => {
+                for i in 0..(N as u32 / 4) {
+                    let w = (v >> (32 * i)) as u32;
+                    self.vif1.push_word(&mut self.gs, &mut self.gif, w);
                 }
                 return;
             }
@@ -841,6 +877,91 @@ impl Bus {
         }
     }
 
+    /// Run the VIF1 channel (ch1) to completion: normal or source chain.
+    /// With TTE set, each chain tag's upper 64 bits carry two vifcodes.
+    fn pump_vif1(&mut self) {
+        let mut guard = 0u32;
+        while self.dma_vif1.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "VIF1 DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_vif1.qwc > 0 {
+                let q = self.ee_dma_read128(self.dma_vif1.madr);
+                for w in q {
+                    self.vif1.push_word(&mut self.gs, &mut self.gif, w);
+                }
+                self.dma_vif1.madr = self.dma_vif1.madr.wrapping_add(16);
+                self.dma_vif1.qwc -= 1;
+                continue;
+            }
+            // Block finished.
+            let chain = (self.dma_vif1.chcr >> 2) & 3 == 1;
+            if !chain || self.dma_vif1.tag_end {
+                self.dma_vif1.chcr &= !EE_CHCR_STR;
+                self.dma_vif1.tag_end = false;
+                self.ee_dma_irq(1);
+                debug!(target: "ps2_core::bus::dma", "VIF1 DMA done");
+                break;
+            }
+            // Source-chain tag.
+            let tag = self.ee_dma_read128(self.dma_vif1.tadr);
+            let qwc = tag[0] & 0xFFFF;
+            let id = (tag[0] >> 28) & 7;
+            let irq = tag[0] & 0x8000_0000 != 0;
+            // Keep bit 31: it selects the scratchpad (SPR) as the source.
+            let addr = tag[1] & 0xFFFF_FFF0;
+            trace!(
+                target: "ps2_core::bus::dma",
+                tadr = format_args!("{:#010x}", self.dma_vif1.tadr),
+                id, qwc,
+                addr = format_args!("{addr:#010x}"),
+                chcr = format_args!("{:#x}", self.dma_vif1.chcr),
+                tag_hi = format_args!("{:08x} {:08x}", tag[2], tag[3]),
+                "VIF1 tag"
+            );
+            match id {
+                0 => {
+                    self.dma_vif1.madr = addr;
+                    self.dma_vif1.tadr = self.dma_vif1.tadr.wrapping_add(16);
+                    self.dma_vif1.tag_end = true;
+                }
+                1 => {
+                    self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
+                    self.dma_vif1.tadr = self.dma_vif1.madr.wrapping_add(qwc * 16);
+                }
+                2 => {
+                    self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
+                    self.dma_vif1.tadr = addr;
+                }
+                3 | 4 => {
+                    self.dma_vif1.madr = addr;
+                    self.dma_vif1.tadr = self.dma_vif1.tadr.wrapping_add(16);
+                }
+                7 => {
+                    self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
+                    self.dma_vif1.tag_end = true;
+                }
+                _ => {
+                    warn!(target: "ps2_core::bus::dma", id, "unhandled VIF1 chain tag id");
+                    self.dma_vif1.chcr &= !EE_CHCR_STR;
+                    break;
+                }
+            }
+            if irq && self.dma_vif1.chcr & EE_CHCR_TIE != 0 {
+                self.dma_vif1.tag_end = true;
+            }
+            // The tag's upper 64 bits always reach VIF1 on chain transfers:
+            // OSDSYS relies on DIRECT codes riding there even with TTE
+            // clear (its 2D chains kick with CHCR 0x105). A zero upper half
+            // is just two NOPs, so feeding it unconditionally is safe.
+            self.vif1.push_word(&mut self.gs, &mut self.gif, tag[2]);
+            self.vif1.push_word(&mut self.gs, &mut self.gif, tag[3]);
+            self.dma_vif1.qwc = qwc;
+        }
+    }
+
     /// Run the GIF channel (ch2) to completion: normal or source chain.
     fn pump_gif(&mut self) {
         let mut guard = 0u32;
@@ -873,7 +994,8 @@ impl Bus {
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let irq = tag[0] & 0x8000_0000 != 0;
-            let addr = tag[1] & 0x7FFF_FFF0;
+            // Keep bit 31: it selects the scratchpad (SPR) as the source.
+            let addr = tag[1] & 0xFFFF_FFF0;
             match id {
                 0 => {
                     self.dma_gif.madr = addr;
@@ -924,7 +1046,19 @@ impl Bus {
         self.d_stat & self.d_mask & 0x3FF != 0
     }
 
-    fn ee_dma_read128(&self, addr: u32) -> [u32; 4] {
+    /// Read one quadword for EE-side DMA. Bit 31 of MADR/TADR/tag
+    /// addresses selects the scratchpad (SPR) instead of main RAM — the
+    /// OSD builds its display lists there.
+    fn ee_dma_read128(&mut self, addr: u32) -> [u32; 4] {
+        if addr & 0x8000_0000 != 0 {
+            let a = (addr & 0x3FF0) as usize; // 16 KiB scratchpad, wraps
+            return [
+                read_le::<4>(&self.spad, a) as u32,
+                read_le::<4>(&self.spad, a + 4) as u32,
+                read_le::<4>(&self.spad, a + 8) as u32,
+                read_le::<4>(&self.spad, a + 12) as u32,
+            ];
+        }
         let a = (addr & 0x1FFF_FFF0) as usize;
         if a + 16 <= RAM_SIZE {
             [
@@ -934,7 +1068,9 @@ impl Bus {
                 read_le::<4>(&self.ram, a + 12) as u32,
             ]
         } else {
-            warn!(target: "ps2_core::bus::sifdma", addr = format_args!("{addr:#010x}"), "EE DMA read outside RAM");
+            if self.warned_unmapped.insert(addr & !0xFFF) {
+                warn!(target: "ps2_core::bus::sifdma", addr = format_args!("{addr:#010x}"), "EE DMA read outside RAM (reported once per page)");
+            }
             [0; 4]
         }
     }
@@ -997,7 +1133,8 @@ impl Bus {
                 let qwc = tag[0] & 0xFFFF;
                 let id = (tag[0] >> 28) & 7;
                 let irq = tag[0] & 0x8000_0000 != 0;
-                let addr = tag[1] & 0x7FFF_FFF0;
+                // Keep bit 31: it selects the scratchpad (SPR) as the source.
+            let addr = tag[1] & 0xFFFF_FFF0;
                 trace!(
                     target: "ps2_core::bus::sifdma",
                     tadr = format_args!("{:#010x}", self.dma_sif1.tadr),

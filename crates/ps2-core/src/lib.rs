@@ -11,6 +11,7 @@ pub mod gs;
 pub mod iop;
 pub mod sif;
 pub mod timers;
+pub mod vif;
 
 use bus::Bus;
 
