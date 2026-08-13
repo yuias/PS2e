@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ps2-core", "crates/ps2-app"]
+members = ["crates/ps2-core", "crates/ps2-app", "crates/ps2-debug"]
 
 [workspace.package]
 edition = "2024"

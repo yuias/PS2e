@@ -79,6 +79,7 @@ name = "ps2-app"
 version = "0.1.0"
 dependencies = [
  "ps2-core",
+ "ps2-debug",
  "tracing",
  "tracing-subscriber",
 ]
@@ -87,6 +88,14 @@ dependencies = [
 name = "ps2-core"
 version = "0.1.0"
 dependencies = [
+ "tracing",
+]
+
+[[package]]
+name = "ps2-debug"
+version = "0.1.0"
+dependencies = [
+ "ps2-core",
  "tracing",
 ]
 
