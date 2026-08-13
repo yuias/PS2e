@@ -404,6 +404,63 @@ impl Bus {
         self.read32(vaddr)
     }
 
+    // --- debugger access (side-effect-free) ------------------------------
+
+    /// Side-effect-free EE-side read for the debugger. Takes `&mut self`
+    /// only because translation feeds the TLB cache (invisible to software).
+    /// MMIO returns `None` so inspection cannot disturb device state.
+    pub fn peek8(&mut self, vaddr: u32) -> Option<u8> {
+        let addr = self.translate(vaddr);
+        match addr {
+            0x0000_0000..=0x01FF_FFFF => Some(self.ram[addr as usize]),
+            0x7000_0000..=0x7000_3FFF => Some(self.spad[(addr & 0x3FFF) as usize]),
+            0x1C00_0000..=0x1C1F_FFFF => Some(self.iop_ram[(addr & 0x1F_FFFF) as usize]),
+            0x1FC0_0000..=0x1FFF_FFFF => Some(self.bios[(addr & 0x3F_FFFF) as usize]),
+            _ => None,
+        }
+    }
+
+    /// Side-effect-free EE-side write for the debugger. ROM and MMIO are
+    /// refused (`false`).
+    pub fn poke8(&mut self, vaddr: u32, v: u8) -> bool {
+        let addr = self.translate(vaddr);
+        match addr {
+            0x0000_0000..=0x01FF_FFFF => self.ram[addr as usize] = v,
+            0x7000_0000..=0x7000_3FFF => self.spad[(addr & 0x3FFF) as usize] = v,
+            0x1C00_0000..=0x1C1F_FFFF => self.iop_ram[(addr & 0x1F_FFFF) as usize] = v,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Side-effect-free IOP-side read for the debugger.
+    pub fn iop_peek8(&self, vaddr: u32) -> Option<u8> {
+        if vaddr >= 0xFFFE_0000 {
+            return None; // KSEG2 cache control
+        }
+        let addr = vaddr & 0x1FFF_FFFF;
+        match addr {
+            0x0000_0000..=0x007F_FFFF => Some(self.iop_ram[(addr & 0x1F_FFFF) as usize]),
+            0x1F80_0000..=0x1F80_03FF => Some(self.iop_spad[(addr & 0x3FF) as usize]),
+            0x1FC0_0000..=0x1FFF_FFFF => Some(self.bios[(addr & 0x3F_FFFF) as usize]),
+            _ => None,
+        }
+    }
+
+    /// Side-effect-free IOP-side write for the debugger.
+    pub fn iop_poke8(&mut self, vaddr: u32, v: u8) -> bool {
+        if vaddr >= 0xFFFE_0000 {
+            return false;
+        }
+        let addr = vaddr & 0x1FFF_FFFF;
+        match addr {
+            0x0000_0000..=0x007F_FFFF => self.iop_ram[(addr & 0x1F_FFFF) as usize] = v,
+            0x1F80_0000..=0x1F80_03FF => self.iop_spad[(addr & 0x3FF) as usize] = v,
+            _ => return false,
+        }
+        true
+    }
+
     fn read<const N: usize>(&mut self, vaddr: u32) -> u64 {
         let addr = self.translate(vaddr);
         match addr {
