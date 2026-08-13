@@ -162,19 +162,28 @@ struct IopTimer {
     last_check: u64,
 }
 
+/// NTSC hblank rate on the IOP sysclock (36.864 MHz / 15734 Hz).
+const IOP_HBLANK_DIV: u64 = 2343;
+
 impl IopTimer {
-    /// IOP sysclock ticks are EE cycles / 8; wide timers add a prescaler.
+    /// IOP sysclock ticks are EE cycles / 8; mode bit 8 selects the external
+    /// clock (pixel for counter 0, hblank for counters 1/3), bit 9 is /8 on
+    /// counter 2, and wide timers add a sysclock prescaler in bits 13-14.
     fn count(&self, idx: usize, now: u64) -> u32 {
         let sys = now.saturating_sub(self.base_cycle) / 8;
-        let ticks = if idx >= 3 {
-            match (self.mode >> 13) & 3 {
+        let external = self.mode & (1 << 8) != 0;
+        let ticks = match idx {
+            // ~13.5 MHz dot clock, coarsely approximated.
+            0 if external => sys / 3,
+            1 | 3 if external => sys / IOP_HBLANK_DIV,
+            2 if self.mode & (1 << 9) != 0 => sys / 8,
+            3.. => match (self.mode >> 13) & 3 {
                 0 => sys,
                 1 => sys / 8,
                 2 => sys / 16,
                 _ => sys / 256,
-            }
-        } else {
-            sys
+            },
+            _ => sys,
         };
         let count = self.base as u64 + ticks;
         if idx < 3 {
@@ -780,26 +789,39 @@ impl Bus {
         let mut fired = 0u32;
         let now = self.now;
         for (t, timer) in self.iop_timers.iter_mut().enumerate() {
-            // IRQ on target (bit 4).
-            if timer.mode & (1 << 4) == 0 {
-                continue;
+            if timer.mode == 0 {
+                continue; // never configured
             }
             let before = timer.count(t, timer.last_check);
             let after = timer.count(t, now);
             timer.last_check = now;
+            if before == after {
+                continue;
+            }
             let target = timer.target;
             let crossed = if before <= after {
                 before < target && target <= after
             } else {
                 target > before || target <= after
             };
+            // The reached-target/reached-max flags latch even with the IRQ
+            // disabled — timrman's GetTimerStatus pollers depend on them.
+            // Bits 4/5 gate the interrupt for target/overflow respectively.
             if crossed {
                 timer.mode |= 1 << 11; // reached target
                 if timer.mode & (1 << 3) != 0 {
                     timer.base = 0;
                     timer.base_cycle = now;
                 }
-                fired |= 1 << IRQ_BITS[t];
+                if timer.mode & (1 << 4) != 0 {
+                    fired |= 1 << IRQ_BITS[t];
+                }
+            }
+            if after < before {
+                timer.mode |= 1 << 12; // reached max (wrap)
+                if timer.mode & (1 << 5) != 0 {
+                    fired |= 1 << IRQ_BITS[t];
+                }
             }
         }
         self.iop_i_stat |= fired;
