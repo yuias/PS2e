@@ -54,24 +54,28 @@ Planned crates:
    DMA, EE/IOP interrupts and timers. Cooperative boot completes: IOP
    modules load, SIF RPC works, EELOAD restarts the kernel into OSDSYS.
    Findings recorded in `docs/hw-notes.md`.
-3. **DMAC + GIF + GS** *(paused, resumes after the debugger)* — software
-   rasterizer, boot screen visible, egui UI. Done so far: GS core
-   (linear-addressed VRAM, raster pipeline, scanout), GIF, DMA ch2,
-   real EE TLB, EE timer EQUF semantics, CDVD S-command NVRAM/RTC
-   model, SIO2 no-device stub, `--screenshot`. Boot reaches OSDSYS with
-   working RPC and 4 kernel restarts, but OSDSYS does not draw yet.
-   Known blockers: a stale kernel T3-callback dispatch fires with a
-   cleared handler table (crashes via a null exec ~4 s in), cdvdman
-   polls N-status 0x1F402005 for a value other than 0x40, and VU0
-   macro ops are still nops (kernel context save/restore only so far).
+3. **DMAC + GIF + GS** *(in progress)* — software rasterizer, boot
+   screen visible, egui UI. Done so far: GS core (linear-addressed
+   VRAM, raster pipeline, scanout), GIF, DMA ch2, real EE TLB, EE
+   timer EQUF+CMPE semantics, CDVD S-command NVRAM/RTC model, SIO2
+   no-device stub, `--screenshot`, SPU2 DMA completion + register
+   shadow, IOP timer status flags/external clocks. The three former
+   blockers fell to the debugger in one session: the ~4 s null-exec
+   was a spurious TIM3 on the 16-bit wrap (CMPE, mode bit 8, was not
+   gating the INTC line), the post-libsd stall was an OSDSYS module
+   polling GetTimerStatus for a reached-target flag we never latched,
+   and the cdvdman N-status poll turned out to be a bounded phase, not
+   a hang. OSDSYS now runs indefinitely, configures the GS display
+   (640x448, vblank-synced) — but the frame stays black: the OSD draws
+   through VIF1/VU1, which are still stubs. Remaining for the boot
+   screen: VIF1 command parser + enough VU1 (or the GIF PATH2/PATH3
+   fallback the OSD uses for 2D), and VU0 macro ops stay nops.
 
-   **`ps2-debug` is done** (pulled forward from milestone 6): the
-   remaining blockers are kernel-internal timing/state bugs that static
-   disassembly of RAM dumps was too slow to chase. The stub (PS1e's
-   `psx-debug` as the template) gives both cores attach/halt, register
-   and memory access, address breakpoints, single-step and polled write
-   watchpoints; validated end-to-end at the wire-protocol level and
-   against the real BIOS. Milestone 3 resumes here, debugger in hand.
+   **`ps2-debug` is done** (pulled forward from milestone 6): the stub
+   (PS1e's `psx-debug` as the template) gives both cores attach/halt,
+   register and memory access, address breakpoints, single-step and
+   polled write watchpoints; validated end-to-end at the wire-protocol
+   level and against the real BIOS, then used for all of the above.
 4. **CDVD + ELF loading** — homebrew boot.
 5. **VU/VIF/IPU/SPU2/pads** — commercial game boot.
 6. **Platform reach** — wasm front-end (`ps2-debug` was pulled forward
