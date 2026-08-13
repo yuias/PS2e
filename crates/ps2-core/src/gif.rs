@@ -26,6 +26,26 @@ impl Gif {
         self.nloop == 0
     }
 
+    /// Between packets: the last tag's data is done and it carried EOP.
+    /// XGKICK uses this to know where a kicked packet stream ends.
+    pub fn end_of_packet(&self) -> bool {
+        self.nloop == 0 && self.eop
+    }
+
+    /// Diagnostic snapshot: (nloop, flg, reg_index/nreg, eop).
+    pub fn debug_state(&self) -> (u32, u32, u32, u32, bool) {
+        (self.nloop, self.flg, self.reg_index, self.nreg, self.eop)
+    }
+
+    /// Abandon the current packet and return to the between-packets state.
+    /// XGKICK uses this when a kicked stream never reaches EOP (the OSD
+    /// kicks split packets whose continuation is not written yet).
+    pub fn reset_path(&mut self) {
+        self.nloop = 0;
+        self.reg_index = 0;
+        self.eop = true;
+    }
+
     /// Feed one quadword from DMA.
     pub fn process(&mut self, gs: &mut Gs, lo: u64, hi: u64) {
         if self.nloop == 0 {

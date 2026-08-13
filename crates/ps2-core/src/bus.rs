@@ -9,6 +9,7 @@ use crate::gs::Gs;
 use crate::sif::Sif;
 use crate::timers::Timers;
 use crate::vif::Vif;
+use crate::vu1::Vu1;
 use std::collections::HashSet;
 use tracing::{debug, trace, warn};
 
@@ -87,7 +88,9 @@ impl Cdvd {
             0x15 | 0x16 => self.s_results.push(5),
             // OpenConfig/WriteConfig/CloseConfig: plain OK.
             0x40 | 0x42 | 0x43 => self.s_results.push(0),
-            // ReadConfig: one 15-byte block of zeroes.
+            // ReadConfig: one 15-byte block of zeroes. (A fabricated
+            // "already configured" block was tried and made the OSD draw
+            // nothing at all — real NVRAM content semantics still unknown.)
             0x41 => self.s_results.extend_from_slice(&[0; 15]),
             // BootCertify: accepted.
             0x1A => self.s_results.push(1),
@@ -207,6 +210,7 @@ pub struct Bus {
     pub gs: Gs,
     pub gif: Gif,
     pub vif1: Vif,
+    pub vu1: Vu1,
     pub timers: Timers,
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
@@ -277,6 +281,7 @@ impl Bus {
             gs: Gs::new(),
             gif: Gif::new(),
             vif1: Vif::new(),
+            vu1: Vu1::new(),
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
@@ -487,9 +492,15 @@ impl Bus {
             0x0000_0000..=0x01FF_FFFF => read_le::<N>(&self.ram, addr as usize),
             0x7000_0000..=0x7000_3FFF => read_le::<N>(&self.spad, (addr & 0x3FFF) as usize),
             0x1000_0000..=0x1000_FFFF => self.read_mmio::<N>(addr),
-            0x1100_0000..=0x1100_FFFF => {
-                // VU0/VU1 code and data memory; plain storage until VUs exist.
-                trace!(target: "ps2_core::bus", addr, "VU memory read (stub)");
+            // VU memory windows: VU0 micro/data (stubs), VU1 micro/data.
+            0x1100_8000..=0x1100_BFFF => {
+                read_le::<N>(&self.vu1.micro, (addr & 0x3FFF) as usize)
+            }
+            0x1100_C000..=0x1100_FFFF => {
+                read_le::<N>(&self.vu1.data, (addr & 0x3FFF) as usize)
+            }
+            0x1100_0000..=0x1100_7FFF => {
+                trace!(target: "ps2_core::bus", addr, "VU0 memory read (stub)");
                 0
             }
             0x1200_0000..=0x1200_1FFF => self.read_gs_priv::<N>(addr),
@@ -529,8 +540,14 @@ impl Bus {
             0x0000_0000..=0x01FF_FFFF => write_le::<N>(&mut self.ram, addr as usize, v),
             0x7000_0000..=0x7000_3FFF => write_le::<N>(&mut self.spad, (addr & 0x3FFF) as usize, v),
             0x1000_0000..=0x1000_FFFF => self.write_mmio::<N>(addr, v),
-            0x1100_0000..=0x1100_FFFF => {
-                trace!(target: "ps2_core::bus", addr, "VU memory write (stub)");
+            0x1100_8000..=0x1100_BFFF => {
+                write_le::<N>(&mut self.vu1.micro, (addr & 0x3FFF) as usize, v)
+            }
+            0x1100_C000..=0x1100_FFFF => {
+                write_le::<N>(&mut self.vu1.data, (addr & 0x3FFF) as usize, v)
+            }
+            0x1100_0000..=0x1100_7FFF => {
+                trace!(target: "ps2_core::bus", addr, "VU0 memory write (stub)");
             }
             0x1200_0000..=0x1200_1FFF => self.write_gs_priv::<N>(addr, v),
             0x1C00_0000..=0x1C1F_FFFF => {
@@ -690,7 +707,8 @@ impl Bus {
             0x1000_5000..=0x1000_5FF0 => {
                 for i in 0..(N as u32 / 4) {
                     let w = (v >> (32 * i)) as u32;
-                    self.vif1.push_word(&mut self.gs, &mut self.gif, w);
+                    self.vif1
+                        .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, w);
                 }
                 return;
             }
@@ -890,7 +908,8 @@ impl Bus {
             if self.dma_vif1.qwc > 0 {
                 let q = self.ee_dma_read128(self.dma_vif1.madr);
                 for w in q {
-                    self.vif1.push_word(&mut self.gs, &mut self.gif, w);
+                    self.vif1
+                        .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, w);
                 }
                 self.dma_vif1.madr = self.dma_vif1.madr.wrapping_add(16);
                 self.dma_vif1.qwc -= 1;
@@ -956,8 +975,10 @@ impl Bus {
             // OSDSYS relies on DIRECT codes riding there even with TTE
             // clear (its 2D chains kick with CHCR 0x105). A zero upper half
             // is just two NOPs, so feeding it unconditionally is safe.
-            self.vif1.push_word(&mut self.gs, &mut self.gif, tag[2]);
-            self.vif1.push_word(&mut self.gs, &mut self.gif, tag[3]);
+            self.vif1
+                .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[2]);
+            self.vif1
+                .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[3]);
             self.dma_vif1.qwc = qwc;
         }
     }

@@ -1,0 +1,884 @@
+//! VU1 microprogram interpreter.
+//!
+//! Executes the micro memory filled by VIF1 MPG when MSCAL/MSCNT fires.
+//! One instruction pair per step, upper (FMAC) then lower — the true
+//! parallel read semantics are approximated by committing the upper result
+//! before the lower executes, which the OSD's programs tolerate. XGKICK
+//! streams GIF packets from VU1 data memory (PATH1). Unimplemented
+//! opcodes panic loudly with pc and instruction, same as the CPU cores:
+//! during bring-up a silent wrong result is worse than a stop.
+
+use crate::gif::Gif;
+use crate::gs::Gs;
+use tracing::{trace, warn};
+
+const MICRO_SIZE: usize = 16 * 1024;
+const DATA_SIZE: usize = 16 * 1024;
+
+pub struct Vu1 {
+    /// Micro memory (code, filled by VIF MPG or EE stores).
+    pub micro: Box<[u8]>,
+    /// Data memory (filled by VIF UNPACK; XGKICK reads from here).
+    pub data: Box<[u8]>,
+    /// Float registers as raw bits; vf00 = (0,0,0,1).
+    vf: [[u32; 4]; 32],
+    /// 16-bit integer registers; vi00 = 0.
+    vi: [u16; 16],
+    acc: [u32; 4],
+    q: f32,
+    i: f32,
+    r: u32,
+    /// P register (EFU result, VU1 only). Stub: whatever was last set.
+    p: f32,
+    mac: u16,
+    status: u16,
+    clip: u32,
+    /// TOP/ITOP as latched by VIF at MSCAL/MSCNT (XTOP/XITOP).
+    pub top: u16,
+    pub itop: u16,
+    /// Resume address for MSCNT, in instruction pairs.
+    next_pc: u16,
+}
+
+impl Default for Vu1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vu1 {
+    pub fn new() -> Self {
+        Self {
+            micro: vec![0u8; MICRO_SIZE].into_boxed_slice(),
+            data: vec![0u8; DATA_SIZE].into_boxed_slice(),
+            vf: [[0; 4]; 32],
+            vi: [0; 16],
+            acc: [0; 4],
+            q: 0.0,
+            i: 0.0,
+            r: 0,
+            p: 0.0,
+            mac: 0,
+            status: 0,
+            clip: 0,
+            top: 0,
+            itop: 0,
+            next_pc: 0,
+        }
+    }
+
+    /// MSCAL/MSCALF: run from `start` (in instruction pairs).
+    pub fn start(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+        self.run(gs, gif, start);
+    }
+
+    /// MSCNT: continue after the previously executed program.
+    pub fn continue_run(&mut self, gs: &mut Gs, gif: &mut Gif) {
+        let pc = self.next_pc;
+        self.run(gs, gif, pc);
+    }
+
+    // --- register helpers ------------------------------------------------
+
+    #[inline]
+    fn vf_read(&self, r: usize) -> [f32; 4] {
+        let raw = self.vf[r];
+        [
+            f32::from_bits(raw[0]),
+            f32::from_bits(raw[1]),
+            f32::from_bits(raw[2]),
+            f32::from_bits(raw[3]),
+        ]
+    }
+
+    /// Write masked fields and update MAC/status flags for them.
+    fn vf_write(&mut self, r: usize, dest: u32, vals: [f32; 4]) {
+        let mut mac = 0u16;
+        for f in 0..4 {
+            if dest & (8 >> f) != 0 {
+                let v = vals[f];
+                if r != 0 {
+                    self.vf[r][f] = v.to_bits();
+                }
+                if v == 0.0 {
+                    mac |= 8 >> f; // zero flags, x at bit 3
+                }
+                if v.is_sign_negative() {
+                    mac |= (8 >> f) << 4; // sign flags, x at bit 7
+                }
+            }
+        }
+        self.mac = mac;
+        let mut st = self.status & !0x3;
+        if mac & 0x0F != 0 {
+            st |= 1; // Z
+        }
+        if mac & 0xF0 != 0 {
+            st |= 2; // S
+        }
+        // Sticky copies.
+        st |= (st & 0x3F) << 6;
+        self.status = st;
+    }
+
+    fn vf_write_raw(&mut self, r: usize, dest: u32, vals: [u32; 4]) {
+        if r == 0 {
+            return;
+        }
+        for f in 0..4 {
+            if dest & (8 >> f) != 0 {
+                self.vf[r][f] = vals[f];
+            }
+        }
+    }
+
+    #[inline]
+    fn vi_write(&mut self, r: usize, v: u16) {
+        if r != 0 {
+            self.vi[r & 0xF] = v;
+        }
+    }
+
+    fn data_qword(&self, qw: u32) -> [u32; 4] {
+        let a = ((qw as usize) & 0x3FF) * 16;
+        let w = |o: usize| u32::from_le_bytes(self.data[a + o..a + o + 4].try_into().unwrap());
+        [w(0), w(4), w(8), w(12)]
+    }
+
+    fn set_data_qword(&mut self, qw: u32, dest: u32, vals: [u32; 4]) {
+        let a = ((qw as usize) & 0x3FF) * 16;
+        for f in 0..4 {
+            if dest & (8 >> f) != 0 {
+                self.data[a + f * 4..a + f * 4 + 4].copy_from_slice(&vals[f].to_le_bytes());
+            }
+        }
+    }
+
+    fn unimplemented(&self, kind: &str, pc: u16, instr: u32) -> ! {
+        tracing::error!(
+            target: "ps2_core::vu1",
+            pc,
+            instr = format_args!("{instr:#010x}"),
+            "unimplemented VU1 {kind}"
+        );
+        panic!("unimplemented VU1 {kind}: instr {instr:#010x} at pair {pc:#x}");
+    }
+
+    // --- main loop -------------------------------------------------------
+
+    fn run(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+        // vf00/vi00 are architectural constants.
+        self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
+        self.vi[0] = 0;
+        let mut pc = start & 0x7FF;
+        let mut end_after: i32 = -1; // pairs still to run after E bit
+        let mut branch: Option<u16> = None;
+        for _ in 0..1_000_000 {
+            let a = (pc as usize & 0x7FF) * 8;
+            let lower = u32::from_le_bytes(self.micro[a..a + 4].try_into().unwrap());
+            let upper = u32::from_le_bytes(self.micro[a + 4..a + 8].try_into().unwrap());
+            let next = branch.take();
+            if upper & (1 << 31) != 0 {
+                // I bit: the lower slot holds a 32-bit float constant that
+                // this very pair's upper instruction may use.
+                self.i = f32::from_bits(lower);
+            }
+            self.exec_upper(pc, upper);
+            if upper & (1 << 31) == 0 {
+                self.exec_lower(gs, gif, pc, lower, &mut branch);
+            }
+            pc = match next {
+                Some(t) => t & 0x7FF,
+                None => (pc + 1) & 0x7FF,
+            };
+            if end_after >= 0 {
+                end_after -= 1;
+                if end_after < 0 {
+                    self.next_pc = pc;
+                    return;
+                }
+            }
+            if upper & (1 << 30) != 0 {
+                end_after = 0; // E bit: one more pair (delay slot), then stop
+            }
+        }
+        warn!(target: "ps2_core::vu1", start, "VU1 program hit its iteration limit");
+        self.next_pc = pc;
+    }
+
+    // --- upper pipeline --------------------------------------------------
+
+    fn exec_upper(&mut self, pc: u16, instr: u32) {
+        let dest = (instr >> 21) & 0xF;
+        let ft = ((instr >> 16) & 0x1F) as usize;
+        let fs = ((instr >> 11) & 0x1F) as usize;
+        let fd = ((instr >> 6) & 0x1F) as usize;
+        let s = self.vf_read(fs);
+        let t = self.vf_read(ft);
+        let bc = t[(instr & 3) as usize];
+        let acc = |me: &Self| -> [f32; 4] {
+            [
+                f32::from_bits(me.acc[0]),
+                f32::from_bits(me.acc[1]),
+                f32::from_bits(me.acc[2]),
+                f32::from_bits(me.acc[3]),
+            ]
+        };
+        let map =
+            |f: &dyn Fn(usize) -> f32| -> [f32; 4] { [f(0), f(1), f(2), f(3)] };
+        let op = instr & 0x3F;
+        match op {
+            0x00..=0x03 => self.vf_write(fd, dest, map(&|f| s[f] + bc)),
+            0x04..=0x07 => self.vf_write(fd, dest, map(&|f| s[f] - bc)),
+            0x08..=0x0B => {
+                let a = acc(self);
+                self.vf_write(fd, dest, map(&|f| a[f] + s[f] * bc));
+            }
+            0x0C..=0x0F => {
+                let a = acc(self);
+                self.vf_write(fd, dest, map(&|f| a[f] - s[f] * bc));
+            }
+            0x10..=0x13 => self.vf_write(fd, dest, map(&|f| s[f].max(bc))),
+            0x14..=0x17 => self.vf_write(fd, dest, map(&|f| s[f].min(bc))),
+            0x18..=0x1B => self.vf_write(fd, dest, map(&|f| s[f] * bc)),
+            0x1C => {
+                let q = self.q;
+                self.vf_write(fd, dest, map(&|f| s[f] * q));
+            }
+            0x1D => {
+                let i = self.i;
+                self.vf_write(fd, dest, map(&|f| s[f].max(i)));
+            }
+            0x1E => {
+                let i = self.i;
+                self.vf_write(fd, dest, map(&|f| s[f] * i));
+            }
+            0x1F => {
+                let i = self.i;
+                self.vf_write(fd, dest, map(&|f| s[f].min(i)));
+            }
+            0x20 => {
+                let q = self.q;
+                self.vf_write(fd, dest, map(&|f| s[f] + q));
+            }
+            0x21 => {
+                let (a, q) = (acc(self), self.q);
+                self.vf_write(fd, dest, map(&|f| a[f] + s[f] * q));
+            }
+            0x22 => {
+                let i = self.i;
+                self.vf_write(fd, dest, map(&|f| s[f] + i));
+            }
+            0x23 => {
+                let (a, i) = (acc(self), self.i);
+                self.vf_write(fd, dest, map(&|f| a[f] + s[f] * i));
+            }
+            0x24 => {
+                let q = self.q;
+                self.vf_write(fd, dest, map(&|f| s[f] - q));
+            }
+            0x25 => {
+                let (a, q) = (acc(self), self.q);
+                self.vf_write(fd, dest, map(&|f| a[f] - s[f] * q));
+            }
+            0x26 => {
+                let i = self.i;
+                self.vf_write(fd, dest, map(&|f| s[f] - i));
+            }
+            0x27 => {
+                let (a, i) = (acc(self), self.i);
+                self.vf_write(fd, dest, map(&|f| a[f] - s[f] * i));
+            }
+            0x28 => self.vf_write(fd, dest, map(&|f| s[f] + t[f])),
+            0x29 => {
+                let a = acc(self);
+                self.vf_write(fd, dest, map(&|f| a[f] + s[f] * t[f]));
+            }
+            0x2A => self.vf_write(fd, dest, map(&|f| s[f] * t[f])),
+            0x2B => self.vf_write(fd, dest, map(&|f| s[f].max(t[f]))),
+            0x2C => self.vf_write(fd, dest, map(&|f| s[f] - t[f])),
+            0x2D => {
+                let a = acc(self);
+                self.vf_write(fd, dest, map(&|f| a[f] - s[f] * t[f]));
+            }
+            0x2E => {
+                // OPMSUB: outer product stage 2 (xyz).
+                let a = acc(self);
+                let v = [
+                    a[0] - s[1] * t[2],
+                    a[1] - s[2] * t[0],
+                    a[2] - s[0] * t[1],
+                    0.0,
+                ];
+                self.vf_write(fd, dest & 0xE, v);
+            }
+            0x2F => self.vf_write(fd, dest, map(&|f| s[f].min(t[f]))),
+            0x3C..=0x3F => {
+                let op2 = (instr & 3) | ((instr >> 4) & 0x7C);
+                self.exec_upper2(pc, instr, op2, dest, ft, fs, s, t, bc);
+            }
+            _ => self.unimplemented("upper", pc, instr),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_upper2(
+        &mut self,
+        pc: u16,
+        instr: u32,
+        op2: u32,
+        dest: u32,
+        ft: usize,
+        fs: usize,
+        s: [f32; 4],
+        t: [f32; 4],
+        bc: f32,
+    ) {
+        let map =
+            |f: &dyn Fn(usize) -> f32| -> [f32; 4] { [f(0), f(1), f(2), f(3)] };
+        let acc = |me: &Self| -> [f32; 4] {
+            [
+                f32::from_bits(me.acc[0]),
+                f32::from_bits(me.acc[1]),
+                f32::from_bits(me.acc[2]),
+                f32::from_bits(me.acc[3]),
+            ]
+        };
+        let set_acc = |me: &mut Self, dest: u32, vals: [f32; 4]| {
+            for f in 0..4 {
+                if dest & (8 >> f) != 0 {
+                    me.acc[f] = vals[f].to_bits();
+                }
+            }
+        };
+        match op2 {
+            0x00..=0x03 => set_acc(self, dest, map(&|f| s[f] + bc)), // ADDAbc
+            0x04..=0x07 => set_acc(self, dest, map(&|f| s[f] - bc)), // SUBAbc
+            0x08..=0x0B => {
+                let a = acc(self);
+                set_acc(self, dest, map(&|f| a[f] + s[f] * bc)); // MADDAbc
+            }
+            0x0C..=0x0F => {
+                let a = acc(self);
+                set_acc(self, dest, map(&|f| a[f] - s[f] * bc)); // MSUBAbc
+            }
+            0x10 => {
+                // ITOF0
+                let raw = self.vf[fs];
+                self.vf_write_raw(
+                    ft,
+                    dest,
+                    raw.map(|v| (v as i32 as f32).to_bits()),
+                );
+            }
+            0x11 => {
+                let raw = self.vf[fs];
+                self.vf_write_raw(
+                    ft,
+                    dest,
+                    raw.map(|v| ((v as i32 as f32) / 16.0).to_bits()),
+                );
+            }
+            0x12 => {
+                let raw = self.vf[fs];
+                self.vf_write_raw(
+                    ft,
+                    dest,
+                    raw.map(|v| ((v as i32 as f32) / 4096.0).to_bits()),
+                );
+            }
+            0x13 => {
+                let raw = self.vf[fs];
+                self.vf_write_raw(
+                    ft,
+                    dest,
+                    raw.map(|v| ((v as i32 as f32) / 32768.0).to_bits()),
+                );
+            }
+            0x14 => self.vf_write_raw(ft, dest, s.map(|v| clamp_i32(v) as u32)), // FTOI0
+            0x15 => self.vf_write_raw(ft, dest, s.map(|v| clamp_i32(v * 16.0) as u32)),
+            0x16 => self.vf_write_raw(ft, dest, s.map(|v| clamp_i32(v * 4096.0) as u32)),
+            0x17 => self.vf_write_raw(ft, dest, s.map(|v| clamp_i32(v * 32768.0) as u32)),
+            0x18..=0x1B => set_acc(self, dest, map(&|f| s[f] * bc)), // MULAbc
+            0x1C => {
+                let q = self.q;
+                set_acc(self, dest, map(&|f| s[f] * q)); // MULAq
+            }
+            0x1D => {
+                // ABS
+                self.vf_write(ft, dest, s.map(|v| v.abs()));
+            }
+            0x1E => {
+                let i = self.i;
+                set_acc(self, dest, map(&|f| s[f] * i)); // MULAi
+            }
+            0x1F => {
+                // CLIP: judge fs.xyz against |ft.w|, shift into the flag.
+                let w = t[3].abs();
+                let mut j = 0u32;
+                j |= ((s[0] > w) as u32) << 0;
+                j |= ((s[0] < -w) as u32) << 1;
+                j |= ((s[1] > w) as u32) << 2;
+                j |= ((s[1] < -w) as u32) << 3;
+                j |= ((s[2] > w) as u32) << 4;
+                j |= ((s[2] < -w) as u32) << 5;
+                self.clip = ((self.clip << 6) | j) & 0xFF_FFFF;
+            }
+            0x20 => {
+                let i = self.i;
+                set_acc(self, dest, map(&|f| s[f] + i)); // ADDAi
+            }
+            0x21 => {
+                let (a, q) = (acc(self), self.q);
+                set_acc(self, dest, map(&|f| a[f] + s[f] * q)); // MADDAq
+            }
+            0x22 => {
+                let (a, i) = (acc(self), self.i);
+                set_acc(self, dest, map(&|f| a[f] + s[f] * i)); // MADDAi
+            }
+            0x25 => {
+                let (a, q) = (acc(self), self.q);
+                set_acc(self, dest, map(&|f| a[f] - s[f] * q)); // MSUBAq
+            }
+            0x26 => {
+                let (a, i) = (acc(self), self.i);
+                set_acc(self, dest, map(&|f| a[f] - s[f] * i)); // MSUBAi
+            }
+            0x28 => set_acc(self, dest, map(&|f| s[f] + t[f])), // ADDA
+            0x29 => {
+                let a = acc(self);
+                set_acc(self, dest, map(&|f| a[f] + s[f] * t[f])); // MADDA
+            }
+            0x2A => set_acc(self, dest, map(&|f| s[f] * t[f])), // MULA
+            0x2C => set_acc(self, dest, map(&|f| s[f] - t[f])), // SUBA
+            0x2D => {
+                let a = acc(self);
+                set_acc(self, dest, map(&|f| a[f] - s[f] * t[f])); // MSUBA
+            }
+            0x2E => {
+                // OPMULA: outer product stage 1 (xyz into ACC).
+                let v = [s[1] * t[2], s[2] * t[0], s[0] * t[1], 0.0];
+                set_acc(self, dest & 0xE, v);
+            }
+            0x2F => {} // NOP
+            _ => self.unimplemented("upper", pc, instr),
+        }
+    }
+
+    // --- lower pipeline --------------------------------------------------
+
+    fn exec_lower(
+        &mut self,
+        gs: &mut Gs,
+        gif: &mut Gif,
+        pc: u16,
+        instr: u32,
+        branch: &mut Option<u16>,
+    ) {
+        let opcode = instr >> 25;
+        let dest = (instr >> 21) & 0xF;
+        let it = ((instr >> 16) & 0x1F) as usize;
+        let is = ((instr >> 11) & 0x1F) as usize;
+        let imm11 = ((instr & 0x7FF) as i32) << 21 >> 21; // sign-extended
+        let vi_s = self.vi[is & 0xF] as i16;
+        let vi_t = self.vi[it & 0xF] as i16;
+        let take = |branch: &mut Option<u16>, cond: bool| {
+            if cond {
+                *branch = Some((pc as i32 + 1 + imm11) as u16);
+            }
+        };
+        match opcode {
+            0x00 => {
+                // LQ
+                let qw = (vi_s as i32 + imm11) as u32;
+                let v = self.data_qword(qw);
+                self.vf_write_raw(it, dest, v);
+            }
+            0x01 => {
+                // SQ
+                let qw = (vi_t as i32 + imm11) as u32;
+                let v = self.vf[is & 0x1F];
+                self.set_data_qword(qw, dest, v);
+            }
+            0x04 => {
+                // ILW: 16-bit int from the selected field's 32-bit slot.
+                let qw = (vi_s as i32 + imm11) as u32;
+                let v = self.data_qword(qw);
+                let f = field_index(dest);
+                self.vi_write(it, v[f] as u16);
+            }
+            0x05 => {
+                // ISW
+                let qw = (vi_t as i32 + imm11) as u32;
+                let f = field_index(dest);
+                let mut v = [0u32; 4];
+                v[f] = self.vi[is & 0xF] as u32;
+                self.set_data_qword(qw, 8 >> f, v);
+            }
+            0x08 => {
+                // IADDIU
+                let imm15 = (instr & 0x7FF) | ((instr >> 10) & 0x7800);
+                self.vi_write(it, (vi_s as u16).wrapping_add(imm15 as u16));
+            }
+            0x09 => {
+                let imm15 = (instr & 0x7FF) | ((instr >> 10) & 0x7800);
+                self.vi_write(it, (vi_s as u16).wrapping_sub(imm15 as u16));
+            }
+            0x11 => self.clip = instr & 0xFF_FFFF, // FCSET
+            0x12 => {
+                // FCAND
+                self.vi_write(1, (self.clip & (instr & 0xFF_FFFF) != 0) as u16);
+            }
+            0x13 => {
+                // FCOR
+                let all = (self.clip | (instr & 0xFF_FFFF)) == 0xFF_FFFF;
+                self.vi_write(1, all as u16);
+            }
+            0x16 => {
+                // FSAND
+                self.vi_write(it, self.status & (instr & 0xFFF) as u16);
+            }
+            0x1A => {
+                // FMAND
+                self.vi_write(it, self.mac & self.vi[is & 0xF]);
+            }
+            0x1C => {
+                // FCGET
+                self.vi_write(it, (self.clip & 0xFFF) as u16);
+            }
+            0x20 => take(branch, true), // B
+            0x21 => {
+                // BAL: link points past the delay slot.
+                self.vi_write(it, pc + 2);
+                take(branch, true);
+            }
+            0x24 => *branch = Some(self.vi[is & 0xF]), // JR
+            0x25 => {
+                self.vi_write(it, pc + 2);
+                *branch = Some(self.vi[is & 0xF]); // JALR
+            }
+            0x28 => take(branch, vi_t == vi_s),
+            0x29 => take(branch, vi_t != vi_s),
+            0x2C => take(branch, vi_s < 0),
+            0x2D => take(branch, vi_s > 0),
+            0x2E => take(branch, vi_s <= 0),
+            0x2F => take(branch, vi_s >= 0),
+            0x40 => self.exec_lower_special(gs, gif, pc, instr),
+            _ => self.unimplemented("lower", pc, instr),
+        }
+    }
+
+    fn exec_lower_special(&mut self, gs: &mut Gs, gif: &mut Gif, pc: u16, instr: u32) {
+        let dest = (instr >> 21) & 0xF;
+        let it = ((instr >> 16) & 0x1F) as usize;
+        let is = ((instr >> 11) & 0x1F) as usize;
+        let id = ((instr >> 6) & 0x1F) as usize;
+        let funct = instr & 0x3F;
+        match funct {
+            0x30 => {
+                let v = self.vi[is & 0xF].wrapping_add(self.vi[it & 0xF]);
+                self.vi_write(id, v); // IADD
+            }
+            0x31 => {
+                let v = self.vi[is & 0xF].wrapping_sub(self.vi[it & 0xF]);
+                self.vi_write(id, v); // ISUB
+            }
+            0x32 => {
+                // IADDI: 5-bit signed immediate in the id slot.
+                let imm5 = ((id as i32) << 27 >> 27) as i16;
+                self.vi_write(it, (self.vi[is & 0xF] as i16).wrapping_add(imm5) as u16);
+            }
+            0x34 => {
+                let v = self.vi[is & 0xF] & self.vi[it & 0xF];
+                self.vi_write(id, v); // IAND
+            }
+            0x35 => {
+                let v = self.vi[is & 0xF] | self.vi[it & 0xF];
+                self.vi_write(id, v); // IOR
+            }
+            0x3C..=0x3F => {
+                let id2 = (instr & 3) | ((instr >> 4) & 0x7C);
+                self.exec_lower2(gs, gif, pc, instr, id2, dest, it, is);
+            }
+            _ => self.unimplemented("lower", pc, instr),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_lower2(
+        &mut self,
+        gs: &mut Gs,
+        gif: &mut Gif,
+        pc: u16,
+        instr: u32,
+        id2: u32,
+        dest: u32,
+        it: usize,
+        is: usize,
+    ) {
+        let fsf = ((instr >> 21) & 3) as usize;
+        let ftf = ((instr >> 23) & 3) as usize;
+        match id2 {
+            0x30 => {
+                // MOVE
+                let v = self.vf[is & 0x1F];
+                self.vf_write_raw(it, dest, v);
+            }
+            0x31 => {
+                // MR32: x<-y, y<-z, z<-w, w<-x.
+                let v = self.vf[is & 0x1F];
+                self.vf_write_raw(it, dest, [v[1], v[2], v[3], v[0]]);
+            }
+            0x34 => {
+                // LQI
+                let qw = self.vi[is & 0xF] as u32;
+                let v = self.data_qword(qw);
+                self.vf_write_raw(it, dest, v);
+                self.vi_write(is, self.vi[is & 0xF].wrapping_add(1));
+            }
+            0x35 => {
+                // SQI
+                let qw = self.vi[it & 0xF] as u32;
+                let v = self.vf[is & 0x1F];
+                self.set_data_qword(qw, dest, v);
+                self.vi_write(it, self.vi[it & 0xF].wrapping_add(1));
+            }
+            0x36 => {
+                // LQD
+                let qw = self.vi[is & 0xF].wrapping_sub(1);
+                self.vi_write(is, qw);
+                let v = self.data_qword(qw as u32);
+                self.vf_write_raw(it, dest, v);
+            }
+            0x37 => {
+                // SQD
+                let qw = self.vi[it & 0xF].wrapping_sub(1);
+                self.vi_write(it, qw);
+                let v = self.vf[is & 0x1F];
+                self.set_data_qword(qw as u32, dest, v);
+            }
+            0x38 => {
+                // DIV: division by zero saturates instead of producing inf.
+                let n = f32::from_bits(self.vf[is & 0x1F][fsf]);
+                let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
+                self.q = if d == 0.0 {
+                    if n.is_sign_negative() != d.is_sign_negative() {
+                        -f32::MAX
+                    } else {
+                        f32::MAX
+                    }
+                } else {
+                    n / d
+                };
+            }
+            0x39 => {
+                // SQRT
+                let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
+                self.q = d.abs().sqrt();
+            }
+            0x3A => {
+                // RSQRT
+                let n = f32::from_bits(self.vf[is & 0x1F][fsf]);
+                let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
+                let r = d.abs().sqrt();
+                self.q = if r == 0.0 { f32::MAX.copysign(n) } else { n / r };
+            }
+            0x3B => {} // WAITQ: Q has no latency here
+            0x3C => {
+                // MTIR
+                self.vi_write(it, self.vf[is & 0x1F][fsf] as u16);
+            }
+            0x3D => {
+                // MFIR: sign-extended 16-bit int into fields.
+                let v = self.vi[is & 0xF] as i16 as i32 as u32;
+                self.vf_write_raw(it, dest, [v; 4]);
+            }
+            0x3E => {
+                // ILWR
+                let v = self.data_qword(self.vi[is & 0xF] as u32);
+                let f = field_index(dest);
+                self.vi_write(it, v[f] as u16);
+            }
+            0x3F => {
+                // ISWR
+                let f = field_index(dest);
+                let mut v = [0u32; 4];
+                v[f] = self.vi[it & 0xF] as u32;
+                self.set_data_qword(self.vi[is & 0xF] as u32, 8 >> f, v);
+            }
+            0x40 => {
+                // RNEXT: advance the LFSR, then read.
+                let x = (self.r >> 4) & 1;
+                let y = (self.r >> 22) & 1;
+                self.r = (((self.r << 1) ^ x ^ y) & 0x7F_FFFF) | 0x3F80_0000;
+                self.vf_write_raw(it, dest, [self.r; 4]);
+            }
+            0x41 => self.vf_write_raw(it, dest, [self.r; 4]), // RGET
+            0x42 => {
+                // RINIT
+                self.r = 0x3F80_0000 | (self.vf[is & 0x1F][fsf] & 0x7F_FFFF);
+            }
+            0x43 => {
+                // RXOR
+                self.r = 0x3F80_0000 | ((self.r ^ self.vf[is & 0x1F][fsf]) & 0x7F_FFFF);
+            }
+            0x64 => {
+                // MFP
+                let p = self.p.to_bits();
+                self.vf_write_raw(it, dest, [p; 4]);
+            }
+            0x68 => self.vi_write(it, self.top),  // XTOP
+            0x69 => self.vi_write(it, self.itop), // XITOP
+            0x6C => self.xgkick(gs, gif, self.vi[is & 0xF]),
+            0x7B => {} // WAITP
+            _ => self.unimplemented("lower", pc, instr),
+        }
+    }
+
+    /// XGKICK: stream GIF packets from data memory (PATH1) until a tag
+    /// with EOP finishes.
+    fn xgkick(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+        if !gif.idle() {
+            let st = gif.debug_state();
+            warn!(target: "ps2_core::vu1", start, state = format_args!("{st:?}"), "XGKICK with GIF mid-packet");
+        }
+        let mut qw = start as u32;
+        for _ in 0..1024 {
+            let v = self.data_qword(qw);
+            qw += 1;
+            let lo = v[0] as u64 | ((v[1] as u64) << 32);
+            let hi = v[2] as u64 | ((v[3] as u64) << 32);
+            gif.process(gs, lo, hi);
+            if gif.end_of_packet() {
+                return;
+            }
+        }
+        // No EOP within data memory: the packet's continuation isn't
+        // written yet (the OSD kicks split packets). Abandon it so the
+        // next kick starts from a clean between-packets state.
+        trace!(target: "ps2_core::vu1", start, "XGKICK reached the scan limit without EOP; resetting");
+        gif.reset_path();
+    }
+}
+
+/// FTOI with the hardware's saturating conversion.
+fn clamp_i32(v: f32) -> i32 {
+    if v >= 2147483647.0 {
+        i32::MAX
+    } else if v <= -2147483648.0 {
+        i32::MIN
+    } else if v.is_nan() {
+        i32::MAX
+    } else {
+        v as i32
+    }
+}
+
+/// Map a single-field dest mask to its field index (x=0..w=3).
+fn field_index(dest: u32) -> usize {
+    match dest {
+        8 => 0,
+        4 => 1,
+        2 => 2,
+        _ => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(upper: u32, lower: u32) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&lower.to_le_bytes());
+        out[4..].copy_from_slice(&upper.to_le_bytes());
+        out
+    }
+
+    fn run_prog(vu: &mut Vu1, pairs: &[(u32, u32)]) {
+        for (i, &(u, l)) in pairs.iter().enumerate() {
+            vu.micro[i * 8..i * 8 + 8].copy_from_slice(&pair(u, l));
+        }
+        let (mut gs, mut gif) = (Gs::new(), Gif::new());
+        vu.start(&mut gs, &mut gif, 0);
+    }
+
+    #[test]
+    fn add_and_e_bit_stop() {
+        let mut vu = Vu1::new();
+        vu.vf[1] = [f32::to_bits(1.5); 4];
+        vu.vf[2] = [f32::to_bits(2.0); 4];
+        // ADD.xyzw vf03, vf01, vf02 with E bit; delay-slot NOP pair.
+        let add = (0xF << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28;
+        run_prog(&mut vu, &[(add | (1 << 30), 0x8000_033C), (0, 0x8000_033C)]);
+        assert_eq!(f32::from_bits(vu.vf[3][0]), 3.5);
+    }
+
+    #[test]
+    fn i_bit_loads_float_constant() {
+        let mut vu = Vu1::new();
+        vu.vf[1] = [f32::to_bits(2.0); 4];
+        // MULi.xyzw vf03, vf01, I with I=0.5 (I bit), then E-bit pair.
+        let muli = (1 << 31) | (0xF << 21) | (1 << 11) | (3 << 6) | 0x1E;
+        run_prog(
+            &mut vu,
+            &[
+                (muli, f32::to_bits(0.5)),
+                (1 << 30, 0x8000_033C),
+                (0, 0x8000_033C),
+            ],
+        );
+        assert_eq!(f32::from_bits(vu.vf[3][2]), 1.0);
+    }
+
+    #[test]
+    fn lq_sq_round_trip() {
+        let mut vu = Vu1::new();
+        vu.data[16..20].copy_from_slice(&f32::to_bits(7.0).to_le_bytes());
+        // LQ.xyzw vf04, 1(vi00); SQ.xyzw vf04, 2(vi00); E.
+        let lq = (0xF << 21) | (4 << 16) | 1;
+        let sq = (0x1 << 25) | (0xF << 21) | (4 << 11) | 2;
+        run_prog(
+            &mut vu,
+            &[
+                (0, lq),
+                (1 << 30, sq),
+                (0, 0x8000_033C),
+            ],
+        );
+        assert_eq!(&vu.data[32..36], &f32::to_bits(7.0).to_le_bytes());
+    }
+
+    #[test]
+    fn xgkick_stops_at_eop() {
+        let mut vu = Vu1::new();
+        let put = |vu: &mut Vu1, qw: usize, v: [u32; 4]| {
+            for (i, w) in v.iter().enumerate() {
+                vu.data[qw * 16 + i * 4..qw * 16 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        // The OSD's runaway shape: A+D tag (EOP=0), then a PACKED
+        // ST/RGBAQ/XYZF2 tag with EOP=1.
+        put(&mut vu, 18, [0x0000_0002, 0x1000_0000, 0x0000_000E, 0]);
+        put(&mut vu, 19, [0, 0, 0x47, 0]);
+        put(&mut vu, 20, [0, 0, 0x42, 0]);
+        put(&mut vu, 21, [0x0000_8004, 0x302E_6000, 0x0000_0412, 0]);
+        // 4 loops x 3 regs = 12 data qwords at 22..34 (zeros are fine).
+        let (mut gs, mut gif) = (Gs::new(), Gif::new());
+        vu.xgkick(&mut gs, &mut gif, 18);
+        assert!(gif.end_of_packet());
+    }
+
+    #[test]
+    fn xtop_and_iaddiu() {
+        let mut vu = Vu1::new();
+        vu.top = 0x200;
+        // XTOP vi01; IADDIU vi02, vi01, 4; E.
+        // id2 = (instr & 3) | ((instr >> 4) & 0x7C) must equal 0x68:
+        // funct = 0x3C, bits 6-10 = 0x68 >> 2.
+        let xtop = (0x40 << 25) | (1 << 16) | ((0x68 >> 2) << 6) | 0x3C;
+        let iaddiu = (0x08 << 25) | (2 << 16) | (1 << 11) | 4;
+        run_prog(&mut vu, &[(0, xtop), (1 << 30, iaddiu), (0, 0x8000_033C)]);
+        assert_eq!(vu.vi[2], 0x204);
+    }
+}
