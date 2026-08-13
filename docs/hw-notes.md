@@ -125,6 +125,20 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
 - The 2D layer is plain DIRECT -> GIF PACKED/A+D packets (no VU1
   needed). The 3D layer (backgrounds, towers) is UNPACK + MPG + MSCAL
   on VU1 — nothing draws from it until VU1 executes microprograms.
+- **XGKICK kicks split packets**: an early kick sends a GIFtag with
+  EOP=0 whose continuation (the vertex tag) is only written to VU1
+  data memory by a later kick. An emulator that streams "until EOP"
+  must abandon the packet when it runs off the written data, or the
+  GIF stays mid-packet and every later transfer desyncs.
+- OSD render structure: context 1 draws the 2D/text layer straight
+  into the displayed buffer (FBP 0), context 0 draws into an offscreen
+  buffer (FBP 0x46), PMODE=0x66 (read circuit 2 only, DISPFB2 -> FBP
+  0). ~2000 textured prims/frame keep flowing even while the boot sits
+  on its first interactive screen (no pad input, zeroed NVRAM).
+- Fabricating a "configured" CDVD NVRAM ReadConfig block (version=2,
+  language set) makes the OSD draw *nothing* — the real osdconfig
+  format has checksums/semantics we haven't decoded; all-zero blocks
+  at least keep it on the first-boot path.
 - UNPACK input length depends on STCYCL (wl > cl row-fills whole
   writes) and, with the m flag, on STMASK (codes != 0 take no input) —
   getting either wrong desyncs the whole command stream.
