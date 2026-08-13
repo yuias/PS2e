@@ -200,6 +200,10 @@ pub struct Bus {
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
     pub iop_spad: Box<[u8]>,
+    /// SPU2 register shadow (0x1F900000..0x1F901000). No sound yet: writes
+    /// stick so libsd's read-modify-write sequences behave; STATX always
+    /// reads ready.
+    spu2: Box<[u8]>,
     /// Shadow storage for IOP MMIO (0x1F801000..0x1F810000), same idea as
     /// the EE shadow.
     iop_mmio: Box<[u8]>,
@@ -262,6 +266,7 @@ impl Bus {
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
+            spu2: vec![0u8; 0x1000].into_boxed_slice(),
             iop_mmio: vec![0u8; 0x10000].into_boxed_slice(),
             iop_i_stat: 0,
             iop_i_mask: 0,
@@ -912,13 +917,16 @@ impl Bus {
         }
     }
 
-    /// Raise an IOP DMA completion interrupt for channel 9 or 10 via DICR2.
+    /// Raise an IOP DMA completion interrupt: channels 0-6 report through
+    /// DICR, 7-13 through DICR2 (enable bits 16+, flag bits 24+).
     fn iop_dma_irq(&mut self, ch: u32) {
-        let flag = 1 << ch; // DICR2 flags for ch7..13 sit at bits 24+(ch-7)+... see below
-        let bit = 1 << (24 + (ch - 7));
-        let enabled = self.iop_dicr2 & (1 << (16 + (ch - 7))) != 0;
-        self.iop_dicr2 |= bit;
-        let _ = flag;
+        let (reg, bit) = if ch < 7 {
+            (&mut self.iop_dicr, ch)
+        } else {
+            (&mut self.iop_dicr2, ch - 7)
+        };
+        let enabled = *reg & (1 << (16 + bit)) != 0;
+        *reg |= 1 << (24 + bit);
         if enabled {
             // IOP DMA interrupt line.
             self.iop_i_stat |= 1 << 3;
@@ -1257,9 +1265,14 @@ impl Bus {
             // ROM1 (DVD player ROM): not present; reads like erased flash so
             // presence/version checks fail instead of "succeeding" with zeros.
             0x1E00_0000..=0x1E3F_FFFF => u32::MAX,
-            0x1F90_0000..=0x1F90_07FF => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "SPU2 read (stub)");
-                0
+            0x1F90_0000..=0x1F90_0FFF => {
+                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "SPU2 read (shadow)");
+                match addr & 0xFFF {
+                    // Core 0/1 STATX: report transfer-ready so libsd's DMA
+                    // handler doesn't spin on its 16M-iteration timeout.
+                    0x344 | 0x744 => 0x80,
+                    off => read_le::<N>(&self.spu2, off as usize) as u32,
+                }
             }
             0x1FC0_0000..=0x1FFF_FFFF => {
                 read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize) as u32
@@ -1301,8 +1314,9 @@ impl Bus {
                     self.iop_i_stat |= 1 << 2;
                 }
             }
-            0x1F90_0000..=0x1F90_07FF => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "SPU2 write (stub)");
+            0x1F90_0000..=0x1F90_0FFF => {
+                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "SPU2 write (shadow)");
+                write_le::<N>(&mut self.spu2, (addr & 0xFFF) as usize, v as u64);
             }
             0x1FC0_0000..=0x1FFF_FFFF => {
                 warn!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "IOP write to BIOS ROM ignored");
@@ -1413,6 +1427,17 @@ impl Bus {
             0x1F80_1070 => self.iop_i_stat &= v,
             0x1F80_1074 => self.iop_i_mask = v,
             0x1F80_1078 => self.iop_i_ctrl = v,
+            // SPU2 DMA (ch4 = core 0, ch7 = core 1): no SPU RAM yet, so a
+            // kicked transfer completes instantly and only the interrupt
+            // matters — libsd blocks on it after every 1 KiB chunk.
+            0x1F80_10C8 | 0x1F80_1508 => {
+                let ch = if addr == 0x1F80_10C8 { 4 } else { 7 };
+                write_le::<4>(&mut self.iop_mmio, (addr & 0xFFFF) as usize, (v & !IOP_CHCR_BUSY) as u64);
+                if v & IOP_CHCR_BUSY != 0 {
+                    debug!(target: "ps2_core::iop::bus", ch, chcr = format_args!("{v:#010x}"), "SPU2 DMA discarded (no SPU RAM yet)");
+                    self.iop_dma_irq(ch);
+                }
+            }
             0x1F80_1520 => self.iop_dma_sif0.madr = v & 0xFF_FFFF,
             0x1F80_1524 => self.iop_dma_sif0.bcr = v,
             0x1F80_1528 => {
