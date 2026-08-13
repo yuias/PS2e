@@ -39,6 +39,7 @@ pub struct Cpu {
     /// PC of the instruction currently executing (for diagnostics/exceptions).
     current_pc: u32,
     in_delay: bool,
+    warned_vu0_macro: bool,
 }
 
 impl Default for Cpu {
@@ -63,6 +64,7 @@ impl Cpu {
             next_is_delay: false,
             current_pc: 0xBFC0_0000,
             in_delay: false,
+            warned_vu0_macro: false,
         }
     }
 
@@ -656,12 +658,16 @@ impl Cpu {
             0x06 => self.vu0_ctrl[rd] = self.r32(rt),
             0x10..=0x1F => {
                 // VU0 macro instructions: shadow-nop until the VUs exist.
-                warn!(
-                    target: "ps2_core::ee::cpu",
-                    pc = format_args!("{:#010x}", self.current_pc),
-                    instr = format_args!("{instr:#010x}"),
-                    "VU0 macro op (nop stub)"
-                );
+                // Warn once — sync loops execute these millions of times.
+                if !self.warned_vu0_macro {
+                    self.warned_vu0_macro = true;
+                    warn!(
+                        target: "ps2_core::ee::cpu",
+                        pc = format_args!("{:#010x}", self.current_pc),
+                        instr = format_args!("{instr:#010x}"),
+                        "VU0 macro op (nop stub, reported once)"
+                    );
+                }
             }
             _ => self.unimplemented("COP2", instr),
         }

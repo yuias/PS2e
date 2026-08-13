@@ -109,6 +109,8 @@ pub struct Gs {
     /// Statistics for bring-up logging.
     pub prims_drawn: u64,
     pub prims_textured: u64,
+    /// Registers already reported as unhandled (warn once, not per write).
+    warned_regs: [u64; 4],
 }
 
 impl Default for Gs {
@@ -157,6 +159,7 @@ impl Gs {
             intc_pending: false,
             prims_drawn: 0,
             prims_textured: 0,
+            warned_regs: [0; 4],
         }
     }
 
@@ -293,7 +296,11 @@ impl Gs {
             0x61 => self.raise_int(1), // FINISH
             0x62 => {}                 // LABEL
             _ => {
-                warn!(target: "ps2_core::gs", reg = format_args!("{reg:#04x}"), "unhandled GS register");
+                let (slot, bit) = ((reg >> 6) as usize, reg & 63);
+                if self.warned_regs[slot] & (1 << bit) == 0 {
+                    self.warned_regs[slot] |= 1 << bit;
+                    warn!(target: "ps2_core::gs", reg = format_args!("{reg:#04x}"), "unhandled GS register (reported once)");
+                }
             }
         }
     }
