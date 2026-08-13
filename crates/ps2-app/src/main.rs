@@ -158,6 +158,16 @@ fn main() -> ExitCode {
 
     tracing::info!(
         cycles = sys.cycles,
+        prims = sys.bus.gs.prims_drawn,
+        prims_tex = sys.bus.gs.prims_textured,
+        pmode = format_args!("{:#x}", sys.bus.gs.pmode),
+        dispfb1 = format_args!("{:#x}", sys.bus.gs.dispfb1),
+        dispfb2 = format_args!("{:#x}", sys.bus.gs.dispfb2),
+        frame0 = format_args!("{:#x}", sys.bus.gs.ctx[0].frame),
+        frame1 = format_args!("{:#x}", sys.bus.gs.ctx[1].frame),
+        zbuf0 = format_args!("{:#x}", sys.bus.gs.ctx[0].zbuf),
+        test0 = format_args!("{:#x}", sys.bus.gs.ctx[0].test),
+        test1 = format_args!("{:#x}", sys.bus.gs.ctx[1].test),
         ee_pc = format_args!("{:#010x}", sys.ee.pc),
         iop_pc = format_args!("{:#010x}", sys.iop.pc),
         iop_i_mask = format_args!("{:#x}", sys.bus.iop_i_mask),
@@ -170,13 +180,15 @@ fn main() -> ExitCode {
     if let Some(dir) = &args.dump {
         let ee = format!("{dir}/ee_ram.bin");
         let iop = format!("{dir}/iop_ram.bin");
-        if let Err(e) =
-            std::fs::write(&ee, &sys.bus.ram).and_then(|_| std::fs::write(&iop, &sys.bus.iop_ram))
+        let vram = format!("{dir}/gs_vram.bin");
+        if let Err(e) = std::fs::write(&ee, &sys.bus.ram)
+            .and_then(|_| std::fs::write(&iop, &sys.bus.iop_ram))
+            .and_then(|_| std::fs::write(&vram, &sys.bus.gs.vram))
         {
             eprintln!("error: RAM dump failed: {e}");
             return ExitCode::FAILURE;
         }
-        tracing::info!(dir = %dir, "dumped EE and IOP RAM");
+        tracing::info!(dir = %dir, "dumped EE/IOP RAM and GS VRAM");
     }
     if let Some(path) = &args.screenshot {
         let (w, h, rgba) = sys.framebuffer();
