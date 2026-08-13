@@ -15,6 +15,11 @@ struct Args {
     dump: Option<String>,
     /// Write the final framebuffer as a BMP.
     screenshot: Option<String>,
+    /// gdb-remote stub ports for the EE and IOP targets.
+    debug_ee: Option<u16>,
+    debug_iop: Option<u16>,
+    /// Hold execution at the reset vector until a debugger attaches.
+    wait_debugger: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -24,6 +29,9 @@ fn parse_args() -> Result<Args, String> {
         log: None,
         dump: None,
         screenshot: None,
+        debug_ee: None,
+        debug_iop: None,
+        wait_debugger: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -40,20 +48,39 @@ fn parse_args() -> Result<Args, String> {
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
             "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
             "--screenshot" => args.screenshot = Some(it.next().ok_or("--screenshot needs a path")?),
+            "--debug-ee" => {
+                args.debug_ee = Some(parse_port(it.next().ok_or("--debug-ee needs a port")?)?)
+            }
+            "--debug-iop" => {
+                args.debug_iop = Some(parse_port(it.next().ok_or("--debug-iop needs a port")?)?)
+            }
+            "--wait-debugger" => args.wait_debugger = true,
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
                      \n\
-                     --bios    BIOS image (default assets/SCPH-50000.bin)\n\
-                     --cycles  EE cycles to run (default 500_000_000)\n\
-                     --log     tracing filter, e.g. 'info,ps2_core::tty=debug'"
+                     --bios           BIOS image (default assets/SCPH-50000.bin)\n\
+                     --cycles         EE cycles to run (default 500_000_000)\n\
+                     --log            tracing filter, e.g. 'info,ps2_core::tty=debug'\n\
+                     --dump           directory for EE/IOP RAM dumps after the run\n\
+                     --screenshot     write the final framebuffer as a BMP\n\
+                     --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
+                     --debug-iop      gdb-remote stub port for the IOP\n\
+                     --wait-debugger  hold at the reset vector until a debugger attaches"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if args.wait_debugger && args.debug_ee.is_none() && args.debug_iop.is_none() {
+        return Err("--wait-debugger needs --debug-ee or --debug-iop".to_string());
+    }
     Ok(args)
+}
+
+fn parse_port(s: String) -> Result<u16, String> {
+    s.parse().map_err(|e| format!("bad port '{s}': {e}"))
 }
 
 fn main() -> ExitCode {
@@ -89,22 +116,44 @@ fn main() -> ExitCode {
         }
     };
 
+    let mut debugger = match (args.debug_ee, args.debug_iop) {
+        (None, None) => None,
+        (ee, iop) => match ps2_debug::DebugServer::bind(ee, iop) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("error: cannot bind debug port: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
     tracing::info!(bios = %args.bios, cycles = args.cycles, "booting");
 
     // Run in slices so TTY output streams out as it appears.
     const SLICE: u64 = 1_000_000;
     let stdout = std::io::stdout();
     let mut remaining = args.cycles;
+    let mut debugger_seen = false;
     while remaining > 0 {
+        // While a debugger is attached (or awaited), it owns execution: the
+        // stub runs the system from inside pump() and we only track cycles.
+        if let Some(dbg) = &mut debugger {
+            let before = sys.cycles;
+            dbg.pump(&mut sys, remaining.min(SLICE));
+            remaining -= (sys.cycles - before).min(remaining);
+            debugger_seen |= dbg.attached();
+            if dbg.attached() || (args.wait_debugger && !debugger_seen) {
+                if !dbg.attached() || dbg.halted() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                flush_tty(&stdout, &mut sys);
+                continue;
+            }
+        }
         let n = remaining.min(SLICE);
         sys.run(n);
         remaining -= n;
-        let tty = sys.take_tty();
-        if !tty.is_empty() {
-            let mut out = stdout.lock();
-            let _ = out.write_all(tty.as_bytes());
-            let _ = out.flush();
-        }
+        flush_tty(&stdout, &mut sys);
     }
 
     tracing::info!(
@@ -138,6 +187,15 @@ fn main() -> ExitCode {
         tracing::info!(path = %path, w, h, "screenshot written");
     }
     ExitCode::SUCCESS
+}
+
+fn flush_tty(stdout: &std::io::Stdout, sys: &mut Ps2System) {
+    let tty = sys.take_tty();
+    if !tty.is_empty() {
+        let mut out = stdout.lock();
+        let _ = out.write_all(tty.as_bytes());
+        let _ = out.flush();
+    }
 }
 
 /// Minimal 24-bit bottom-up BMP writer.

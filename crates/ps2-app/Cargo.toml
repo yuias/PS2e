@@ -7,5 +7,6 @@ description = "Native front-end for ps2-core (headless CLI for now)"
 
 [dependencies]
 ps2-core = { path = "../ps2-core" }
+ps2-debug = { path = "../ps2-debug" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
