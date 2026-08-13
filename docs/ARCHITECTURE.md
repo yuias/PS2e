@@ -66,10 +66,11 @@ Planned crates:
    polling GetTimerStatus for a reached-target flag we never latched,
    and the cdvdman N-status poll turned out to be a bounded phase, not
    a hang. OSDSYS now runs indefinitely, configures the GS display
-   (640x448, vblank-synced) — but the frame stays black: the OSD draws
-   through VIF1/VU1, which are still stubs. Remaining for the boot
-   screen: VIF1 command parser + enough VU1 (or the GIF PATH2/PATH3
-   fallback the OSD uses for 2D), and VU0 macro ops stay nops.
+   (640x448, vblank-synced), and — with the VIF1 command parser
+   (DIRECT/UNPACK/MPG, SPR-sourced chains, tag-word vifcodes) — renders
+   its first 2D elements. Remaining for a full boot screen: VU1
+   microprogram execution (backgrounds/towers; MSCAL is still dropped),
+   texture/interlace polish, and VU0 macro ops stay nops.
 
    **`ps2-debug` is done** (pulled forward from milestone 6): the stub
    (PS1e's `psx-debug` as the template) gives both cores attach/halt,

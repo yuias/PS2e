@@ -114,6 +114,21 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
   recorded tlbwi entries must actually be walked. Scratchpad is the
   entry with EntryLo0 bit 31 set.
 
+## VIF1 / OSDSYS drawing path
+
+- OSDSYS submits everything through VIF1 source chains. 3D packets kick
+  with CHCR 0x145 (TTE set), but the 2D layer kicks with **CHCR 0x105 —
+  TTE clear — while still carrying `[NOP, DIRECT n]` in the tag's upper
+  64 bits**: the DMAC evidently delivers the tag upper half to VIF1 on
+  chain transfers regardless of TTE, and the OSD depends on it. Chain
+  tags and data live in the scratchpad (address bit 31 = SPR).
+- The 2D layer is plain DIRECT -> GIF PACKED/A+D packets (no VU1
+  needed). The 3D layer (backgrounds, towers) is UNPACK + MPG + MSCAL
+  on VU1 — nothing draws from it until VU1 executes microprograms.
+- UNPACK input length depends on STCYCL (wl > cl row-fills whole
+  writes) and, with the m flag, on STMASK (codes != 0 take no input) —
+  getting either wrong desyncs the whole command stream.
+
 ## IOP silent reboot (sceSifIopReset)
 
 - The EE sends SIFCMD cid 0x80000003 with the IOPRP argument string; the
