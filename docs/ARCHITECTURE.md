@@ -17,16 +17,16 @@ BIOS reimplementation project (`PS2BiosRebuild`).
 
 ## Workspace layout
 
-| Crate      | Role                                                                  |
-| ---------- | --------------------------------------------------------------------- |
-| `ps2-core` | Platform-independent emulator core. No windowing, graphics API or I/O dependencies; wasm-safe. |
-| `ps2-app`  | Native front-end. Headless CLI first; egui + wgpu UI once the GS renders. |
+| Crate       | Role                                                                  |
+| ----------- | --------------------------------------------------------------------- |
+| `ps2-core`  | Platform-independent emulator core. No windowing, graphics API or I/O dependencies; wasm-safe. |
+| `ps2-app`   | Native front-end. Headless CLI first; egui + wgpu UI once the GS renders. |
+| `ps2-debug` | gdb-remote debug stub (LLDB first-class), EE and IOP targets on separate TCP ports. `--debug-ee <port>` / `--debug-iop <port>`; `--wait-debugger` holds at the reset vector until attach. |
 
 Planned crates:
 
 | Crate       | Role                                                        |
 | ----------- | ----------------------------------------------------------- |
-| `ps2-debug` | gdb-remote debug stub (LLDB first-class), EE and IOP targets. |
 | `ps2-wasm`  | wasm bindings for a browser front-end.                       |
 
 ## Decisions
@@ -44,6 +44,7 @@ Planned crates:
 | Logging | `tracing` with per-component targets (`ps2_core::ee::cpu`, `ps2_core::tty`, …) | Fine-grained runtime filtering; static max-level features strip verbose logs from release builds. |
 | Unimplemented ops/MMIO | Log at `error` and panic (ops) / log and shadow (MMIO) | During bring-up, silently continuing past an unknown instruction corrupts state; a loud stop with context is the iteration loop. |
 | Save states | Not yet; will use `serde` + `postcard` like PS1e, excluding external assets (BIOS by fingerprint) | Deferred until the component set stabilizes. |
+| Debugger | PS1e `psx-debug` design: polled TCP, no threads, `pump(&mut sys, budget)`; one gdb-remote port per core instead of gdb multiprocess extensions | The cores are lock-stepped 8:1, so halting either target halts the whole machine and per-core ports keep the single-thread protocol LLDB already speaks. EE registers are presented as 64-bit GPR/LO/HI (low halves; MMI upper halves, LO1/HI1, SA not exposed) under a `mips64el` triple so doubleword ops disassemble. Write watchpoints (`Z2`) are polled per instruction against a byte snapshot — slow but exact, and they catch DMA writes too. Debugger memory access goes through side-effect-free `peek8`/`poke8` (MMIO refused). |
 
 ## Milestones
 
@@ -64,15 +65,17 @@ Planned crates:
    polls N-status 0x1F402005 for a value other than 0x40, and VU0
    macro ops are still nops (kernel context save/restore only so far).
 
-   **Next up instead: `ps2-debug`** (pulled forward from milestone 6).
-   The remaining blockers are kernel-internal timing/state bugs that
-   static disassembly of RAM dumps is too slow to chase; a gdb-remote
-   stub with breakpoints, watchpoints and PC tracing (PS1e's
-   `psx-debug` as the template, EE and IOP targets) pays for itself
-   immediately — and directly serves the PS2BiosRebuild workflow.
+   **`ps2-debug` is done** (pulled forward from milestone 6): the
+   remaining blockers are kernel-internal timing/state bugs that static
+   disassembly of RAM dumps was too slow to chase. The stub (PS1e's
+   `psx-debug` as the template) gives both cores attach/halt, register
+   and memory access, address breakpoints, single-step and polled write
+   watchpoints; validated end-to-end at the wire-protocol level and
+   against the real BIOS. Milestone 3 resumes here, debugger in hand.
 4. **CDVD + ELF loading** — homebrew boot.
 5. **VU/VIF/IPU/SPU2/pads** — commercial game boot.
-6. **Platform reach** — `ps2-debug` (LLDB), wasm front-end.
+6. **Platform reach** — wasm front-end (`ps2-debug` was pulled forward
+   and completed during milestone 3).
 
 ## Component map (ps2-core)
 
