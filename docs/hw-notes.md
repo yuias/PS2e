@@ -83,16 +83,28 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
 
 ## EE timers (learned during OSDSYS bring-up)
 
-- Tn_MODE: bits 0-1 CLKS, bit 7 CUE (count enable), bit 10 EQUF (equal
-  flag, W1C), bit 11 OVFF. Writing MODE clears COUNT.
-- The compare interrupt behaves as a latch: it fires only while EQUF is
-  clear, and EQUF stays set until a MODE write with bit 10. The kernel
-  parks T3 by leaving EQUF set (writes MODE 0x83) and rearms with 0x483/
-  0xC83. Getting this wrong produces spurious TIM3 interrupts ~4.2 s
-  apart (65536 hblanks) that crash the kernel's callback dispatcher.
+- Tn_MODE: bits 0-1 CLKS, bit 7 CUE (count enable), bit 8 CMPE (compare
+  interrupt enable), bit 10 EQUF (equal flag, W1C), bit 11 OVFF. Writing
+  MODE clears COUNT.
+- **CMPE gates the INTC line, not the flag**: a compare match always
+  latches EQUF (no new event until a MODE write with bit 10 rearms it),
+  but only raises INTC when bit 8 is set. The kernel *free-runs* T3 with
+  MODE 0xC83 / COMP 0xFFFF at init — CUE on, CMPE off — and only enables
+  the interrupt while its callback queue is loaded (0x583 + COMP =
+  next-callback delay; back to 0x483 when the queue drains). Raising
+  INTC on a CMPE-clear compare produces a spurious TIM3 exactly at the
+  16-bit wrap, 65535 hblanks ≈ 4.2 s after kernel init, which crashes
+  the callback dispatcher (below).
 - The kernel schedules deferred callbacks (SIF handlers, alarms) through
-  a byte queue drained by a T3-driven dispatcher (kernel 0x80002650);
-  T3 runs on HBLANK with INTC bit 12.
+  a byte queue drained by a T3-driven dispatcher (kernel 0x80002650,
+  registered in the INTC vector table 0x800153C0 under bit 12). The
+  dispatcher **unconditionally dispatches at least one callback per
+  invocation** — it assumes T3 only interrupts while the queue is
+  non-empty, so a spurious TIM3 jalr's through a NULL handler entry.
+  Structures: pending count 0x80019CB0, byte queue 0x8001A1B8, pending
+  bitmask (u64) 0x80019CA8, handler table 0x80019CB8 with 0x14-byte
+  entries {fn, arg, gp, id:u16}. Handlers run on a dedicated stack via
+  the trampoline at 0x81FE0 (lui sp,8; jalr; syscall -5 on return).
 
 ## EE kernel TLB usage
 

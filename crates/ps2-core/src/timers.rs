@@ -104,9 +104,8 @@ impl Timers {
         let mut intc = 0;
         for (t, timer) in self.timers.iter_mut().enumerate() {
             // CUE (bit 7) gates counting. The equal-flag (EQUF, bit 10)
-            // latches: a compare fires the INTC line only when the flag is
-            // still clear, and only a MODE write with bit 10 rearms it.
-            // (The kernel parks a timer by leaving EQUF set.)
+            // latches: no new compare event until a MODE write with bit 10
+            // rearms it.
             if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
                 continue;
             }
@@ -126,7 +125,15 @@ impl Timers {
                     timer.base = 0;
                     timer.base_cycle = now;
                 }
-                intc |= 1 << (9 + t);
+                // CMPE (bit 8) gates the INTC line, not the flag. The kernel
+                // free-runs T3 with MODE 0xC83 (CMPE clear) and only enables
+                // the interrupt (0x583) while its callback queue is loaded;
+                // raising INTC on a disabled compare invokes the callback
+                // dispatcher with an empty queue, which jumps through a NULL
+                // handler on the 16-bit wrap ~4.2 s after kernel init.
+                if timer.mode & (1 << 8) != 0 {
+                    intc |= 1 << (9 + t);
+                }
             }
         }
         intc
@@ -158,5 +165,31 @@ mod tests {
         let mut t = Timers::new();
         t.write(0x1000_0000, 100, 0);
         assert_eq!(t.read(0x1000_0000, 200), 200);
+    }
+
+    #[test]
+    fn compare_without_cmpe_sets_flag_but_no_irq() {
+        let mut t = Timers::new();
+        // T3 as the kernel inits it: CUE on, hblank clock, CMPE clear.
+        t.write(0x1000_1810, 0xC83, 0);
+        t.write(0x1000_1820, 0xFFFF, 0);
+        let at_comp = 0xFFFF * super::HBLANK_DIV * 2;
+        assert_eq!(t.check_irqs(at_comp), 0);
+        // EQUF still latches as a status flag.
+        assert_ne!(t.read(0x1000_1810, at_comp) & (1 << 10), 0);
+    }
+
+    #[test]
+    fn compare_with_cmpe_fires_once() {
+        let mut t = Timers::new();
+        // T3 as the dispatcher arms it: CMPE set.
+        t.write(0x1000_1810, 0x583, 0);
+        t.write(0x1000_1820, 100, 0);
+        let past = 200 * super::HBLANK_DIV * 2;
+        assert_eq!(t.check_irqs(past), 1 << 12);
+        // Latched until rearmed by a MODE write with bit 10.
+        assert_eq!(t.check_irqs(past * 2), 0);
+        t.write(0x1000_1810, 0x583, past * 2);
+        assert_eq!(t.check_irqs(past * 3), 1 << 12);
     }
 }
