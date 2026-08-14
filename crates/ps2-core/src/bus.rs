@@ -114,6 +114,7 @@ impl Cdvd {
         debug!(target: "ps2_core::iop::cdvd",
             cmd = format_args!("{cmd:#04x}"),
             params = format_args!("{:02x?}", self.s_params),
+            unread = self.s_results.len().saturating_sub(self.s_result_pos),
             "S command");
         self.s_results.clear();
         self.s_result_pos = 0;
@@ -124,6 +125,15 @@ impl Cdvd {
                 .extend_from_slice(&[0, 0, 0, 0, 0, 1, 1, 0x25]),
             // Forbid/permit DVD player: canonical result is 5.
             0x15 | 0x16 => self.s_results.push(5),
+            // sceCdReadModelNumber: param is a byte offset into the model
+            // string; result is [stat, model bytes from that offset].
+            0x17 => {
+                const MODEL: &[u8; 16] = b"SCPH-50000\0\0\0\0\0\0";
+                let off = self.s_params.first().copied().unwrap_or(0) as usize & 0xF;
+                self.s_results.push(0);
+                self.s_results
+                    .extend_from_slice(&MODEL[off..(off + 8).min(16)]);
+            }
             // OpenConfig: params are [b, a, count]; the count is the
             // session's only state. The OSD opens (1, 0, 2) for its config.
             0x40 => {
