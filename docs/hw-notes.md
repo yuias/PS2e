@@ -135,13 +135,52 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
   buffer (FBP 0x46), PMODE=0x66 (read circuit 2 only, DISPFB2 -> FBP
   0). ~2000 textured prims/frame keep flowing even while the boot sits
   on its first interactive screen (no pad input, zeroed NVRAM).
-- Fabricating a "configured" CDVD NVRAM ReadConfig block (version=2,
-  language set) makes the OSD draw *nothing* — the real osdconfig
-  format has checksums/semantics we haven't decoded; all-zero blocks
-  at least keep it on the first-boot path.
 - UNPACK input length depends on STCYCL (wl > cl row-fills whole
   writes) and, with the m flag, on STMASK (codes != 0 take no input) —
   getting either wrong desyncs the whole command stream.
+
+## CDVD osdconfig (what makes the OSD skip first-boot setup)
+
+Wire format decoded by PS2BiosRebuild (see
+`N:\PS2BiosRebuild` analysis; SCPH-50000): a config block is 15 data
+bytes + a one-byte sum mod 256; CDVDMAN verifies the sum and never
+looks inside. The OSD opens area (1, 0) with count 2 — wire triple
+`[0, 1, 2]` — reads two blocks, and retries open/read/close while the
+returned status has bit 0x01 or 0x80 set.
+
+- Block 0 is copied out uninterpreted. Block 1 carries the fields:
+  byte +0 top three bits non-zero selects the "new generation" layout
+  where byte +1 bits 0-4 are the language index; that index subscripts
+  an 8-entry table with **no bounds check** (out of range = null string
+  table = the OSD silently draws nothing — the old "fabricated config
+  draws nothing" mystery).
+- **Byte +2 bit 7 is the "configured" flag** (found by disassembling
+  the expanded OSDSYS decoder at 0x203698; it returns the flag's
+  inverse and never stores it in the config struct, which is why field
+  sweeps missed it). Set: boot goes SCE splash -> PS logo -> browser
+  menu. Clear: first-boot language setup.
+- Byte +3 (low 8) + byte +2 bits 0-2 (high 3) = timezone offset in
+  minutes; byte +2 bit 3 = +1h DST, bit 4 = 12h clock.
+
+## GS lessons from the OSD boot screens
+
+- HOST->LOCAL IMAGE transfers in PSMCT24 are a **packed 3-bytes-per-
+  pixel stream with no 64-bit alignment**; a partial pixel carries
+  across HWREG chunks. Treating it as 32-bit shifts every pixel's
+  channels — the OSD's PS-logo frames (135x97, uploaded per frame)
+  render as RGB-striped noise.
+- CSM1 CLUTs live in VRAM as a 16x16 PSMCT32 image whose entry order
+  has bits 3 and 4 swapped (8x2-entry tiles). The OSD uploads 16-entry
+  font CLUTs as literal 8x2 IMAGE transfers, which lands entries 8-15
+  one buffer row (64 words) down — a linear "row of 256" CLUT read
+  returns garbage for them.
+- The OSD runs the display interlaced with half-height field buffers
+  (SMODE2 INT+FFMD, FRAME/DISPFB alternating FBP 0 and 0x46 per
+  field, 640x224 each). Scanout must line-double one field to the
+  448-line display; reading 448 consecutive lines walks into the
+  other field's buffer and shows everything twice.
+- OSD glyphs are PSMT4 atlases (font at one block-aligned-ish base,
+  e.g. block 12037, TBW 4 = 256 px) with grayscale alpha-ramp CLUTs.
 
 ## IOP silent reboot (sceSifIopReset)
 
