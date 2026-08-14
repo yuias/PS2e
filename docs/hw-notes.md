@@ -196,5 +196,53 @@ returned status has bit 0x01 or 0x80 set.
 
 - CTRL 0x1F808268: writing bit 0 starts a transfer; the bit must read
   back clear and I_STAT bit 17 must rise, or SIO2MAN spins forever.
-  RECV1 (0x1F80826C) = 0x1D100 reports "no device"; RECV2 (0x1F808270)
-  reads a constant 0xF; the out-FIFO (0x1F808264) reads 0xFF.
+  RECV1 (0x1F80826C) = 0x1D100 reports "no device" (0x1100 = present);
+  RECV2 (0x1F808270) reads a constant 0xF.
+- A transfer is described by SEND3 slots (0x1F808200+): port in bits
+  0-1, byte length in bits 8-16; slot 0 terminates on the first zero.
+  The first command byte selects the device class: 0x01 pad, 0x81
+  memory card, 0x21 multitap. This BIOS's XSIO2MAN probes the multitap
+  on ports 2/3 with `[21 12 ..]`/`[21 13 ..]` (len 6) and memory cards
+  with `[81 11]`/`[81 52]`/`[81 F3]`; PADMAN polls `[01 42 00 00 00]`
+  and settles for a digital pad after a short 0x43/0x45/0x4D config
+  probe. A DualShock answering 0x42 with `FF 41 5A lo hi` (buttons
+  active-low) is enough for continuous polling.
+- **XSIO2MAN starts CTRL before the data arrives**: it kicks DMA ch11
+  (SIO2in, 0x1F801540) *after* setting the start bit — the DMAC only
+  moves data once DRQ asserts — and reads responses back with DMA ch12
+  (SIO2out, 0x1F801550). It also writes the FIFO-reset bits (0x0C)
+  *together with* the start bit in one CTRL write, so honoring the
+  reset on that write throws away the DMA-delivered command bytes.
+- With no device on a port, reads float high: respond 0xFF, not 0x00.
+
+## VU0 macro mode (COP2)
+
+- **The OSD transforms nearly all of its 3D geometry on the EE with
+  VU0 macro instructions** and sends finished GIF packets via VIF1
+  DIRECT (PATH2). Only ~7 UNPACKs and one MSCAL happen per boot —
+  stubbing COP2 macro ops as NOPs makes every 3D vertex collapse to
+  the matrix translation column (menu background invisible, browser
+  black) while 2D text keeps working.
+- COP2 macro instructions use the exact microcode field layout (dest
+  21-24, ft 16-20, fs 11-15, fd 6-10, opcode 0-5), so a VU core can
+  execute them directly. Dispatch: funct 0x30-0x35 are the lower
+  integer ops (VIADD..VIOR); funct 0x3C-0x3F with op2 = (instr&3) |
+  ((instr>>4)&0x7C) >= 0x30 are lower special2 (DIV, MOVE, MTIR,
+  LQI, ...), everything else is the upper FMAC set. CFC2/CTC2 regs
+  0-15 map to vi, 16 status, 17 mac, 18 clip, 20 R, 21 I, 22 Q;
+  VPU-STAT (29) must read 0 ("never busy").
+
+## OSD browser render pipeline (open issue)
+
+The browser scene is a feedback compositor: orbs and a full-res copy
+of the previous screen accumulate in a half-buffer (FBP 0xD2), a
+full-screen sprite composites it back modulated by the background
+tint, cloud strips (MODULATE of a 128x128 noise texture) draw over
+it, and 2-3 downsample/upsample sprite passes through FBP 0x118 blur
+the result. All passes run and write plausible values per-pixel, but
+the final frame stays ~20x too dim compared to hardware (fade overlay
+constant at A=0x1E, most content ending near black). Unresolved.
+Z-buffer interaction is ruled out (forcing the depth test off changes
+nothing); remaining suspects are blend/alpha precision in the
+feedback loop and the scene possibly holding a "checking devices"
+wait state.
