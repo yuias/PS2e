@@ -549,12 +549,11 @@ impl Cpu {
                 0x06 => trace!(target: "ps2_core::ee::cop0", "tlbwr (nop)"),
                 0x08 => trace!(target: "ps2_core::ee::cop0", "tlbp (nop)"),
                 0x18 => {
-                    if let Some(target) = self.cop0.eret() {
-                        trace!(target: "ps2_core::ee::cop0", to = format_args!("{target:#010x}"), "eret");
-                        self.pc = target;
-                        self.next_pc = target.wrapping_add(4);
-                        self.next_is_delay = false;
-                    }
+                    let target = self.cop0.eret();
+                    trace!(target: "ps2_core::ee::cop0", to = format_args!("{target:#010x}"), "eret");
+                    self.pc = target;
+                    self.next_pc = target.wrapping_add(4);
+                    self.next_is_delay = false;
                 }
                 0x38 => self.cop0.set_eie(true),
                 0x39 => self.cop0.set_eie(false),

@@ -130,16 +130,16 @@ impl Cop0 {
         (status >> 8) & (cause >> 8) & 0xFF != 0
     }
 
-    /// ERET: return address, or None if neither ERL nor EXL is set.
-    pub fn eret(&mut self) -> Option<u32> {
+    /// ERET: return address. ERL selects ErrorEPC; otherwise EPC is used
+    /// even with EXL clear — the kernel's LoadExecPS2 path erets to EELOAD
+    /// with neither bit set and relies on this.
+    pub fn eret(&mut self) -> u32 {
         if self.regs[STATUS] & STATUS_ERL != 0 {
             self.regs[STATUS] &= !STATUS_ERL;
-            Some(self.regs[ERROR_EPC])
-        } else if self.regs[STATUS] & STATUS_EXL != 0 {
-            self.regs[STATUS] &= !STATUS_EXL;
-            Some(self.regs[EPC])
+            self.regs[ERROR_EPC]
         } else {
-            None
+            self.regs[STATUS] &= !STATUS_EXL;
+            self.regs[EPC]
         }
     }
 
