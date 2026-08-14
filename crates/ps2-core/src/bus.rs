@@ -179,6 +179,12 @@ impl Cdvd {
             0x0B => self.s_results.push(0),
             // BootCertify: accepted.
             0x1A => self.s_results.push(1),
+            // MagicGate mechacon commands, used by SECRMAN for memory-card
+            // authentication. No real crypto: status 0 with zeroed payloads
+            // satisfies SECRMAN's shape checks. 0x84/0x85 hand out the
+            // console-side challenges as [status, 16 bytes].
+            0x84 | 0x85 => self.s_results.extend_from_slice(&[0; 17]),
+            0x80..=0x8F => self.s_results.push(0),
             // Mecacon version: stat + version bytes.
             0x03 => self.s_results.extend_from_slice(&[0, 3, 0, 6]),
             _ => {
@@ -263,15 +269,187 @@ pub struct Sio2 {
     /// to deliver the command bytes (the DMAC only moves data once the
     /// start bit asserts DRQ, so CTRL can legitimately come first).
     pending: bool,
+    /// DMA ch11 block geometry (block bytes, block count). With more than
+    /// one block, each sub-transfer's command sits at the start of its own
+    /// block and its reply is padded to a full block (MCMAN's layout);
+    /// a single block packs the sub-transfers back to back (PADMAN's).
+    in_block: (usize, usize),
     /// DualShock command-0x43 config mode.
     pad_config: bool,
     /// Analog mode (command 0x44); adds four stick bytes to polls.
     pad_analog: bool,
+    /// Memory card in slot 1 (SIO2 port 2).
+    pub memcard: MemCard,
 }
 
 /// RECV1 values SIO2MAN checks after a transfer.
 const SIO2_RECV1_CONNECTED: u32 = 0x1100;
 const SIO2_RECV1_DISCONNECTED: u32 = 0x1D100;
+
+/// A PS2 memory card: 16384 pages of 512 data + 16 ECC bytes, stored as
+/// contiguous 528-byte pages (the common .ps2 image layout). MCMAN talks
+/// to it with `[0x81, cmd, ...]` sub-transfers; replies carry an 0x2B
+/// acknowledge and end with a settable terminator byte. The MagicGate
+/// authentication (cmd 0xF0) is answered formally, without real crypto,
+/// mirroring what PCSX2 does — MCMAN only checks the message shapes and
+/// the XOR of its own challenge bytes.
+pub struct MemCard {
+    pub data: Vec<u8>,
+    /// Set whenever a write or erase lands, so the host can persist.
+    pub dirty: bool,
+    terminator: u8,
+    /// Page selected by SetSector, and the byte cursor within it that
+    /// ReadData/WriteData advance.
+    sector: u32,
+    progress: usize,
+}
+
+pub const MEMCARD_PAGE: usize = 528;
+pub const MEMCARD_PAGES: usize = 16384;
+/// Pages per erase block.
+const MEMCARD_BLOCK: usize = 16;
+
+impl Default for MemCard {
+    fn default() -> Self {
+        Self {
+            // Erased flash reads all-ones; the OSD offers to format it.
+            data: vec![0xFF; MEMCARD_PAGE * MEMCARD_PAGES],
+            dirty: false,
+            terminator: 0x55,
+            sector: 0,
+            progress: 0,
+        }
+    }
+}
+
+impl MemCard {
+    fn pos(&self) -> usize {
+        (self.sector as usize * MEMCARD_PAGE + self.progress) % (MEMCARD_PAGE * MEMCARD_PAGES)
+    }
+
+    /// Build the `len`-byte reply for one `[0x81, op, ...]` sub-transfer.
+    fn respond(&mut self, cmd: &[u8], len: usize) -> Vec<u8> {
+        let op = cmd.get(1).copied().unwrap_or(0);
+        // Default shape: 0xFF while the host clocks out the header, zeros
+        // after, 0x2B acknowledge at len-2 and the terminator at len-1.
+        let mut r = vec![0u8; len];
+        r[..len.min(2)].fill(0xFF);
+        let ack = |r: &mut Vec<u8>| {
+            let n = r.len();
+            if n >= 2 {
+                r[n - 2] = 0x2B;
+                r[n - 1] = self.terminator;
+            }
+        };
+        match op {
+            // Probe / write-delete-end / reset-style commands: bare ack.
+            0x11 | 0x12 | 0x81 | 0xBF | 0xF3 | 0xF7 => ack(&mut r),
+            // SetSector for erase/write/read: 4-byte page + checksum.
+            0x21 | 0x22 | 0x23 => {
+                self.sector = u32::from(cmd.get(2).copied().unwrap_or(0))
+                    | u32::from(cmd.get(3).copied().unwrap_or(0)) << 8
+                    | u32::from(cmd.get(4).copied().unwrap_or(0)) << 16
+                    | u32::from(cmd.get(5).copied().unwrap_or(0)) << 24;
+                self.progress = 0;
+                ack(&mut r);
+            }
+            // GetSpecs: sector size, pages per erase block, page count.
+            0x26 => {
+                let specs = [0x00u8, 0x02, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00];
+                let xor = specs.iter().fold(0u8, |a, &b| a ^ b);
+                if len >= 13 {
+                    r[2] = 0x2B;
+                    r[3..11].copy_from_slice(&specs);
+                    r[11] = xor;
+                    r[12] = self.terminator;
+                }
+            }
+            0x27 => {
+                // SetTerminator: takes effect for the NEXT command's reply.
+                let old = self.terminator;
+                self.terminator = cmd.get(2).copied().unwrap_or(0x55);
+                let n = r.len();
+                if n >= 2 {
+                    r[n - 2] = 0x2B;
+                    r[n - 1] = old;
+                }
+            }
+            0x28 => {
+                // GetTerminator.
+                if len >= 5 {
+                    r[2] = 0x2B;
+                    r[3] = self.terminator;
+                    r[4] = self.terminator;
+                }
+            }
+            // WriteData: [0x81, 0x42, size, data.., xor]; ack at the tail.
+            0x42 => {
+                let size = cmd.get(2).copied().unwrap_or(0) as usize;
+                for i in 0..size.min(cmd.len().saturating_sub(3)) {
+                    let p = self.pos();
+                    self.data[p] = cmd[3 + i];
+                    self.progress += 1;
+                }
+                self.dirty = true;
+                ack(&mut r);
+            }
+            // ReadData: [0x81, 0x43, size]; reply carries the page bytes
+            // plus their XOR before the terminator.
+            0x43 => {
+                let size = cmd.get(2).copied().unwrap_or(0) as usize;
+                if len >= size + 5 {
+                    r[2] = 0x2B;
+                    let mut xor = 0u8;
+                    for i in 0..size {
+                        let b = self.data[self.pos()];
+                        self.progress += 1;
+                        r[3 + i] = b;
+                        xor ^= b;
+                    }
+                    r[3 + size] = xor;
+                    r[4 + size] = self.terminator;
+                }
+            }
+            // EraseBlock: fill the block holding the selected page.
+            0x82 => {
+                let block = (self.sector as usize / MEMCARD_BLOCK) * MEMCARD_BLOCK;
+                let start = (block * MEMCARD_PAGE) % self.data.len();
+                let end = (start + MEMCARD_BLOCK * MEMCARD_PAGE).min(self.data.len());
+                self.data[start..end].fill(0xFF);
+                self.dirty = true;
+                ack(&mut r);
+            }
+            // MagicGate auth: formal replies only. "Card responds" subs
+            // return 8 (zero) bytes plus their XOR; "console sends" subs
+            // acknowledge the console's 8 bytes with their XOR.
+            0xF0 => {
+                let sub = cmd.get(2).copied().unwrap_or(0);
+                match sub {
+                    0x01 | 0x02 | 0x04 | 0x0F | 0x11 | 0x13 => {
+                        // SECRMAN checks r[3]==0x2B, r[12]==XOR(r[4..12])
+                        // and r[13] != 0x66 (its "busy" marker).
+                        let n = r.len();
+                        if n >= 6 {
+                            r[3] = 0x2B;
+                            // Data bytes r[4..n-2] stay zero; XOR of zeros.
+                            r[n - 2] = 0;
+                            r[n - 1] = self.terminator;
+                        }
+                    }
+                    // Console-to-card subs (06/07/0B) just want the plain
+                    // acknowledge at the tail; everything else likewise.
+                    _ => ack(&mut r),
+                }
+            }
+            _ => {
+                debug!(target: "ps2_core::iop::sio2",
+                    op = format_args!("{op:#04x}"), "unhandled memcard command");
+                ack(&mut r);
+            }
+        }
+        r
+    }
+}
 
 impl Sio2 {
     /// Execute the queued transfer: walk SEND3, consume the in-FIFO and
@@ -280,7 +458,10 @@ impl Sio2 {
         self.fifo_out.clear();
         self.out_pos = 0;
         let mut pos = 0usize;
-        for slot in self.send3 {
+        let mut any_connected = false;
+        let (block_bytes, blocks) = self.in_block;
+        let blocked = blocks > 1;
+        for (i, slot) in self.send3.into_iter().enumerate() {
             if slot == 0 {
                 break;
             }
@@ -288,6 +469,9 @@ impl Sio2 {
             let len = ((slot >> 8) & 0x1FF) as usize;
             if len == 0 {
                 break;
+            }
+            if blocked {
+                pos = i * block_bytes;
             }
             let end = (pos + len).min(self.fifo_in.len());
             let cmd: Vec<u8> = self.fifo_in[pos.min(end)..end].to_vec();
@@ -297,13 +481,39 @@ impl Sio2 {
                 "sub-transfer");
             if port == 0 && cmd.first() == Some(&0x01) {
                 self.pad_respond(&cmd, len);
-                self.recv1 = SIO2_RECV1_CONNECTED;
+                any_connected = true;
+            } else if port == 2 && cmd.first() == Some(&0x81) {
+                let r = self.memcard.respond(&cmd, len);
+                self.fifo_out.extend(r);
+                any_connected = true;
+            } else if port == 2 && cmd.first() == Some(&0x21) {
+                // Multitap query hitting the memory card: the card answers
+                // 0x66 ("not a tap") at byte 5 — replying 0xFF here makes
+                // XSIO2MAN think a tap with a nonsense slot is present.
+                let mut r = vec![0xFFu8; len];
+                if len > 5 {
+                    r[5] = 0x66;
+                }
+                self.fifo_out.extend(r);
+                any_connected = true;
             } else {
                 // No device: the line floats high, so reads return 0xFF.
                 self.fifo_out.extend(std::iter::repeat(0xFFu8).take(len));
-                self.recv1 = SIO2_RECV1_DISCONNECTED;
+            }
+            if blocked {
+                // Each sub-transfer's reply fills its own block.
+                self.fifo_out.resize((i + 1) * block_bytes, 0);
             }
         }
+        self.in_block = (0, 0);
+        // MCMAN wraps its card command between helper sub-transfers and
+        // checks one status word for the whole transfer: a present device
+        // anywhere in the group must win over absent ones.
+        self.recv1 = if any_connected {
+            SIO2_RECV1_CONNECTED
+        } else {
+            SIO2_RECV1_DISCONNECTED
+        };
         self.fifo_in.clear();
     }
 
@@ -491,6 +701,9 @@ pub struct Bus {
     pub iop_dicr2: u32,
     pub iop_dma_sio2in: IopDmaChannel,
     pub iop_dma_sio2out: IopDmaChannel,
+    /// DMA ch12 armed before the SIO2 transfer produced its response; the
+    /// copy runs when the transfer executes (hardware waits on DRQ).
+    sio2out_deferred: bool,
     pub cdvd: Cdvd,
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
@@ -554,6 +767,7 @@ impl Bus {
             iop_dicr2: 0,
             iop_dma_sio2in: IopDmaChannel::default(),
             iop_dma_sio2out: IopDmaChannel::default(),
+            sio2out_deferred: false,
             cdvd: Cdvd::default(),
             sio2: Sio2::default(),
             now: 0,
@@ -1355,6 +1569,23 @@ impl Bus {
         ((bcr & 0xFFFF).max(1) as usize) * ((bcr >> 16).max(1) as usize) * 4
     }
 
+    /// Drain the SIO2 out-FIFO into RAM for DMA ch12.
+    fn do_sio2_out(&mut self) {
+        let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2out.bcr);
+        let start = (self.iop_dma_sio2out.madr & 0x1F_FFFF) as usize;
+        for i in 0..bytes {
+            let b = self.sio2.read(0x1F80_8264) as u8;
+            let len = self.iop_ram.len();
+            self.iop_ram[(start + i) % len] = b;
+        }
+        debug!(target: "ps2_core::iop::sio2",
+            bytes,
+            madr = format_args!("{:#x}", self.iop_dma_sio2out.madr),
+            head = format_args!("{:02x?}", &self.iop_ram[start..(start + 8).min(start + bytes)]),
+            "DMA out");
+        self.iop_dma_irq(12);
+    }
+
     fn iop_dma_irq(&mut self, ch: u32) {
         let (reg, bit) = if ch < 7 {
             (&mut self.iop_dicr, ch)
@@ -1856,6 +2087,10 @@ impl Bus {
                 if self.sio2.write(addr, v) {
                     // Transfer completion raises the SIO2 interrupt line.
                     self.iop_i_stat |= 1 << 17;
+                    if self.sio2out_deferred {
+                        self.sio2out_deferred = false;
+                        self.do_sio2_out();
+                    }
                 }
             }
             // I_STAT write acknowledges: keeps only bits written as 1.
@@ -1898,7 +2133,9 @@ impl Bus {
             0x1F80_1548 => {
                 self.iop_dma_sio2in.chcr = v & !IOP_CHCR_BUSY;
                 if v & IOP_CHCR_BUSY != 0 {
-                    let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2in.bcr);
+                    let bcr = self.iop_dma_sio2in.bcr;
+                    let bytes = Self::iop_bcr_bytes(bcr);
+                    self.sio2.in_block = (((bcr & 0xFFFF) * 4) as usize, (bcr >> 16) as usize);
                     let start = (self.iop_dma_sio2in.madr & 0x1F_FFFF) as usize;
                     for i in 0..bytes {
                         let b = self.iop_ram[(start + i) % self.iop_ram.len()];
@@ -1907,6 +2144,10 @@ impl Bus {
                     debug!(target: "ps2_core::iop::sio2", bytes, "DMA in");
                     if self.sio2.dma_in_done() {
                         self.iop_i_stat |= 1 << 17;
+                        if self.sio2out_deferred {
+                            self.sio2out_deferred = false;
+                            self.do_sio2_out();
+                        }
                     }
                     self.iop_dma_irq(11);
                 }
@@ -1916,15 +2157,17 @@ impl Bus {
             0x1F80_1558 => {
                 self.iop_dma_sio2out.chcr = v & !IOP_CHCR_BUSY;
                 if v & IOP_CHCR_BUSY != 0 {
-                    let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2out.bcr);
-                    let start = (self.iop_dma_sio2out.madr & 0x1F_FFFF) as usize;
-                    for i in 0..bytes {
-                        let b = self.sio2.read(0x1F80_8264) as u8;
-                        let len = self.iop_ram.len();
-                        self.iop_ram[(start + i) % len] = b;
+                    // The hardware channel waits on the SIO2's DRQ: if the
+                    // transfer hasn't produced its response yet (the driver
+                    // may arm this DMA before CTRL), hold the copy until it
+                    // runs.
+                    if self.sio2.out_pos >= self.sio2.fifo_out.len()
+                        && (self.sio2.pending || !self.sio2.fifo_in.is_empty())
+                    {
+                        self.sio2out_deferred = true;
+                    } else {
+                        self.do_sio2_out();
                     }
-                    debug!(target: "ps2_core::iop::sio2", bytes, "DMA out");
-                    self.iop_dma_irq(12);
                 }
             }
             // DICR/DICR2: enables in bits 16-23, flags (W1C) in bits 24-30.
