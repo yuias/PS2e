@@ -182,6 +182,56 @@ returned status has bit 0x01 or 0x80 set.
 - OSD glyphs are PSMT4 atlases (font at one block-aligned-ish base,
   e.g. block 12037, TBW 4 = 256 px) with grayscale alpha-ramp CLUTs.
 
+## SIO2 memory-card transfers (MCMAN's shapes)
+
+- MCMAN drives SIO2 with a **block per sub-transfer**: DMA ch11/12 use
+  BCR block size 0x24 words (144 bytes) x N blocks, each sub-command
+  at its block's start and each reply padded to a full block. PADMAN
+  instead packs its sub-transfers back to back in one block — the
+  BCR block count tells them apart.
+- DMA ch12 (SIO2out) is armed before CTRL starts the transfer; the
+  hardware paces it with DRQ, an instant model must defer the copy.
+- MCMAN checks one status word per transfer group: RECV1 must say
+  "present" (0x1100) if ANY sub-transfer reached a device.
+- Card reply conventions: 0x2B acknowledge; a settable terminator
+  byte (0x27 sets it — reply carries the OLD one, so MCMAN issues it
+  twice and checks the second); 0x66 = busy/absent marker everywhere
+  (a multitap probe hitting the card must get 0x66 at reply byte 5 or
+  XSIO2MAN invents a phantom tap with a nonsense slot). MagicGate
+  auth (0x81 0xF0 sub): card-responds subs ack at reply[3] with 8
+  data bytes and their XOR at [12]; console-sends subs (06/07/0B)
+  just ack at the tail. SECRMAN delegates the crypto checks to the
+  mechacon over S commands 0x80-0x8F — status-0 replies with zeroed
+  16-byte challenges from 0x84/0x85 satisfy it.
+- Page reads run SetReadSector (0x23, page number + XOR) then 0x43
+  chunks of 128 + a 16-byte tail = 528 bytes per page (data + ECC),
+  finished with ReadWriteEnd (0x81).
+
+## CDVD disc reads and the disc key
+
+- N 0x06/0x08 params: LSN and count as LE u32 at bytes 0-3/4-7.
+  DvdRead (0x08) returns 2064-byte raw sectors: 12-byte header with
+  the physical sector number (LBA + 0x30000), 2048 data, 4-byte EDC.
+- IOP DMA ch3 (0x1F8010B0) drains the sector data and is armed before
+  the N command — defer it or cdvdman reads zeros.
+- **N 0x0C (sceCdReadKey)** must return a real key or the OSD rejects
+  the disc with the red screen. The mechacon derives it from the boot
+  serial (4 letters + 5 digits, e.g. SLPS-25918): with n = the digits
+  as a number and l = the four letters' low 7 bits packed high-to-low,
+  key[0..4] = LE32((n & 0x1FC00) >> 10 | (l & 0x1FFFFFF) << 7),
+  key[4] = (n & 0x1F) << 3 | (l & 0xE000000) >> 25, and for command
+  arg 75 key[14] = (n & 0x3E0) >> 2 | 0x04 (PCSX2's cdvdReadKey).
+  cdvdman reads the key through the XOR-obfuscated register window:
+  banks 0x2020-0x2024 / 0x2028-0x202C / 0x2030-0x2034 (5 bytes each,
+  XORed with reg 0x2039), validity bits in 0x2038 (0x07 = all three),
+  decrypt flag in 0x203A (0x05 for arg 75, else 0x01).
+- With key and reads working, the boot chain runs: the OSD prints
+  `ExecutePs2GameDisk`, walks the ISO (PVD sector 16, path table,
+  directory, SYSTEM.CNF) and LoadExec restarts the kernel. **Open:**
+  after the restart EELOAD never issues the disc reads for the game
+  ELF and the EE eventually wanders into unmapped memory — the
+  EELOAD-to-CDVDFSV RPC path is the next frontier.
+
 ## IOP silent reboot (sceSifIopReset)
 
 - The EE sends SIFCMD cid 0x80000003 with the IOPRP argument string; the
