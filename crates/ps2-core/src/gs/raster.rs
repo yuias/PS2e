@@ -380,17 +380,22 @@ impl Gs {
         let cpsm = ((tex0 >> 51) & 0xF) as u32;
         let csm = (tex0 >> 55) & 1;
         let csa = ((tex0 >> 56) & 0x1F) as u32;
-        // CSM1 stores 256-entry CLUTs with bits 3 and 4 of the index
-        // swapped (the "CSM1 shuffle"); 16-entry CLUTs are linear.
-        let idx = if eight_bit && csm == 0 {
-            (index & 0xE7) | ((index & 0x08) << 1) | ((index & 0x10) >> 1)
+        // CSA offsets in 16-entry slots (must be 0 for 8-bit CLUTs).
+        let e = if eight_bit { index } else { index + csa * 16 };
+        let (x, y) = if csm == 0 {
+            // CSM1 packs the CLUT as a 16x16 image whose entries sit in
+            // 8x2-entry tiles — equivalently, a linear 16x16 layout with
+            // bits 3 and 4 of the entry number swapped.
+            let e = (e & 0xE7) | ((e & 0x08) << 1) | ((e & 0x10) >> 1);
+            (e & 0xF, e >> 4)
         } else {
-            index + csa * 16
+            // CSM2: linear row (TEXCLUT offset/width not modelled).
+            (e & 0xFF, e >> 8)
         };
         if cpsm == 0 {
-            self.read_psmct32(cbp, 1, idx & 0xFF, idx >> 8)
+            self.read_psmct32(cbp, 1, x, y)
         } else {
-            expand16(self.read_psmct16(cbp, 1, idx & 0xFF, idx >> 8), self.texa)
+            expand16(self.read_psmct16(cbp, 1, x, y), self.texa)
         }
     }
 }
