@@ -227,10 +227,46 @@ returned status has bit 0x01 or 0x80 set.
   decrypt flag in 0x203A (0x05 for arg 75, else 0x01).
 - With key and reads working, the boot chain runs: the OSD prints
   `ExecutePs2GameDisk`, walks the ISO (PVD sector 16, path table,
-  directory, SYSTEM.CNF) and LoadExec restarts the kernel. **Open:**
-  after the restart EELOAD never issues the disc reads for the game
-  ELF and the EE eventually wanders into unmapped memory — the
-  EELOAD-to-CDVDFSV RPC path is the next frontier.
+  directory, SYSTEM.CNF) and LoadExec restarts the kernel.
+- **Drive status (reg 0x200A) must read 0x0A (PAUSE) when idle with a
+  disc.** cdvdman's sceCdDiskReady polls that register and waits for
+  exactly 0x0A (code at module offset ~0x1ef78 in this build: reads
+  0xBF40200A, compares with 0x0A, blocking mode loops on an event flag
+  until it matches, non-blocking returns 6 "not ready"). The OSD never
+  tripped on this because ExecutePs2GameDisk reads without DiskReady.
+- **DEC-SET (reg 0x203A, IOP-writable) arms drive-side decryption of
+  the DMA'd sector data**: bit 0 = XOR each byte with disc key byte 4,
+  bit 1 = rotate right by bits 4-6 (PCSX2's mechaDecryptBytes). The PS2
+  logo area (lsn 0-11) is stored encrypted on disc (an all-0xF5 sector
+  0 is XOR-key 0xF5 over zero padding); cdvdman writes 0x53 before
+  PS2LOGO's 12-sector read and 0x00 after. Without this, PS2LOGO's
+  logo check fails and it silently execs **rom0:OSDSYS instead of the
+  game** — the boot "stall" was really the relaunched browser retrying
+  LoadModule of the (absent, 0xFF) rom1 DVD-player modules forever.
+  Debug hazards that mimicked real blockers: rmman2 polls S 0x1E every
+  ~55 ms and MCMAN re-probes cards with mechacon MG groups (S 0x80-0x8F)
+  on a seconds cadence — neither is boot-path traffic.
+- EELOAD reads the boot ELF with N 0x06 for the first sectors, then
+  switches to raw DVD N 0x08 for the bulk (2064-byte framing).
+
+## EE kernel LoadExecPS2 path (game ELF boot)
+
+- The LoadExecPS2 syscall handler (kernel 0x5744 area, this ROM) calls
+  its Restart routine (prints `# Restart.` ... `# Restart Done.`),
+  copies EELOAD from ROM to 0x00082000, sets EPC via `mtc0` and
+  transfers control with **`eret` while neither Status.EXL nor ERL is
+  set**. The R5900 eret still jumps to EPC in that state (ERL selects
+  ErrorEPC, otherwise EPC — there is no "neither" fallthrough). An
+  emulator that treats flagless eret as a no-op falls through into the
+  handler's own epilogue, "returns" from the never-returning syscall
+  into the just-cleared caller (OSDSYS at ~0x202aac), and the EE slides
+  through zeroed RAM off the 32 MB end (the old pc 0x10000004 panic).
+- Boot chain observed for a retail disc: OSDSYS `ExecutePs2GameDisk` →
+  LoadExecPS2 → EELOAD (entry 0x82000, hit only via that eret) →
+  chains rom0:PS2LOGO ("Restart Without Memory Clear", reads lsn 0-11)
+  → LoadExecPS2(cdrom0:ELF) → EELOAD resets the IOP with
+  "rom0:UDNL rom0:EELOADCNF" (twice, ~0.7s apart) → sceCdDiskReady →
+  sceCdSearchFile/sceCdRead for the ELF.
 
 ## IOP silent reboot (sceSifIopReset)
 
