@@ -24,6 +24,8 @@ struct Args {
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
     memcard: Option<String>,
+    /// Disc image (2048-byte-sector ISO), streamed on demand.
+    disc: Option<String>,
 }
 
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
@@ -84,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         wait_debugger: false,
         presses: Vec::new(),
         memcard: None,
+        disc: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -111,6 +114,7 @@ fn parse_args() -> Result<Args, String> {
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
             "--memcard" => args.memcard = Some(it.next().ok_or("--memcard needs a path")?),
+            "--disc" => args.disc = Some(it.next().ok_or("--disc needs a path")?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -125,7 +129,8 @@ fn parse_args() -> Result<Args, String> {
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>]\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
-                     --memcard        card image to load/persist (created if missing)"
+                     --memcard        card image to load/persist (created if missing)\n\
+                     --disc           disc image (2048-byte-sector ISO), streamed"
                 );
                 std::process::exit(0);
             }
@@ -185,6 +190,19 @@ fn main() -> ExitCode {
             }
         },
     };
+
+    if let Some(path) = &args.disc {
+        match std::fs::File::open(path) {
+            Ok(f) => {
+                sys.bus.cdvd.disc = Some(f);
+                tracing::info!(path = %path, "disc image attached");
+            }
+            Err(e) => {
+                eprintln!("error: cannot open disc '{path}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     if let Some(path) = &args.memcard {
         match std::fs::read(path) {
