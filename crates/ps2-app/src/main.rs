@@ -22,6 +22,8 @@ struct Args {
     wait_debugger: bool,
     /// Scripted pad input: (button mask, first cycle, last cycle).
     presses: Vec<(u16, u64, u64)>,
+    /// Memory card image to load and persist (16384 x 528-byte pages).
+    memcard: Option<String>,
 }
 
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
@@ -81,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
         debug_iop: None,
         wait_debugger: false,
         presses: Vec::new(),
+        memcard: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -107,6 +110,7 @@ fn parse_args() -> Result<Args, String> {
             "--press" => args
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
+            "--memcard" => args.memcard = Some(it.next().ok_or("--memcard needs a path")?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -120,7 +124,8 @@ fn parse_args() -> Result<Args, String> {
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>]\n\
-                     \x20                (circle, cross, up, down, start, ...; repeatable)"
+                     \x20                (circle, cross, up, down, start, ...; repeatable)\n\
+                     --memcard        card image to load/persist (created if missing)"
                 );
                 std::process::exit(0);
             }
@@ -180,6 +185,26 @@ fn main() -> ExitCode {
             }
         },
     };
+
+    if let Some(path) = &args.memcard {
+        match std::fs::read(path) {
+            Ok(img) if img.len() == sys.bus.sio2.memcard.data.len() => {
+                sys.bus.sio2.memcard.data.copy_from_slice(&img);
+                tracing::info!(path = %path, "memory card image loaded");
+            }
+            Ok(img) => {
+                eprintln!(
+                    "error: memcard '{path}' has {} bytes, expected {}",
+                    img.len(),
+                    sys.bus.sio2.memcard.data.len()
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(_) => {
+                tracing::info!(path = %path, "memcard image missing, starting blank");
+            }
+        }
+    }
 
     tracing::info!(bios = %args.bios, cycles = args.cycles, "booting");
 
@@ -245,6 +270,16 @@ fn main() -> ExitCode {
         .map(|(psm, n)| format!("{psm:#04x}:{n}"))
         .collect();
     tracing::info!(psms = psms.join(" "), "texture samples per PSM");
+
+    if let Some(path) = &args.memcard
+        && sys.bus.sio2.memcard.dirty
+    {
+        if let Err(e) = std::fs::write(path, &sys.bus.sio2.memcard.data) {
+            eprintln!("error: memcard save failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        tracing::info!(path = %path, "memory card image saved");
+    }
 
     if let Some(dir) = &args.dump {
         let ee = format!("{dir}/ee_ram.bin");
