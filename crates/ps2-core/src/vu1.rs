@@ -21,18 +21,18 @@ pub struct Vu1 {
     /// Data memory (filled by VIF UNPACK; XGKICK reads from here).
     pub data: Box<[u8]>,
     /// Float registers as raw bits; vf00 = (0,0,0,1).
-    vf: [[u32; 4]; 32],
+    pub(crate) vf: [[u32; 4]; 32],
     /// 16-bit integer registers; vi00 = 0.
-    vi: [u16; 16],
+    pub(crate) vi: [u16; 16],
     acc: [u32; 4],
-    q: f32,
-    i: f32,
-    r: u32,
+    pub(crate) q: f32,
+    pub(crate) i: f32,
+    pub(crate) r: u32,
     /// P register (EFU result, VU1 only). Stub: whatever was last set.
     p: f32,
-    mac: u16,
-    status: u16,
-    clip: u32,
+    pub(crate) mac: u16,
+    pub(crate) status: u16,
+    pub(crate) clip: u32,
     /// TOP/ITOP as latched by VIF at MSCAL/MSCNT (XTOP/XITOP).
     pub top: u16,
     pub itop: u16,
@@ -48,10 +48,12 @@ impl Default for Vu1 {
 
 impl Vu1 {
     pub fn new() -> Self {
+        let mut vf = [[0; 4]; 32];
+        vf[0] = [0, 0, 0, f32::to_bits(1.0)];
         Self {
             micro: vec![0u8; MICRO_SIZE].into_boxed_slice(),
             data: vec![0u8; DATA_SIZE].into_boxed_slice(),
-            vf: [[0; 4]; 32],
+            vf,
             vi: [0; 16],
             acc: [0; 4],
             q: 0.0,
@@ -76,6 +78,27 @@ impl Vu1 {
     pub fn continue_run(&mut self, gs: &mut Gs, gif: &mut Gif) {
         let pc = self.next_pc;
         self.run(gs, gif, pc);
+    }
+
+    /// One COP2 macro-mode instruction (this instance acting as VU0).
+    /// Macro ops share the microcode field layout: special2 op2 >= 0x30
+    /// selects the lower-pipeline set (DIV, MOVE, MTIR, LQI, ...), all
+    /// other encodings are the upper FMAC set.
+    pub fn exec_macro(&mut self, gs: &mut Gs, gif: &mut Gif, instr: u32) {
+        let op = instr & 0x3F;
+        match op {
+            // Integer ops (VIADD..VIOR) only exist in the lower pipeline.
+            0x30..=0x35 => self.exec_lower_special(gs, gif, 0, instr),
+            0x3C..=0x3F => {
+                let op2 = (instr & 3) | ((instr >> 4) & 0x7C);
+                if op2 >= 0x30 {
+                    self.exec_lower_special(gs, gif, 0, instr);
+                } else {
+                    self.exec_upper(0, instr);
+                }
+            }
+            _ => self.exec_upper(0, instr),
+        }
     }
 
     // --- register helpers ------------------------------------------------

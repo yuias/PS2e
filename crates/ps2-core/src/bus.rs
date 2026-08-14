@@ -443,6 +443,9 @@ pub struct Bus {
     pub gif: Gif,
     pub vif1: Vif,
     pub vu1: Vu1,
+    /// VU0 register state for COP2 macro mode (reuses the VU core; its
+    /// micro/data memories stand in for VU0's 4 KiB ones).
+    pub vu0: Vu1,
     pub timers: Timers,
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
@@ -516,6 +519,7 @@ impl Bus {
             gs: Gs::new(),
             gif: Gif::new(),
             vif1: Vif::new(),
+            vu0: Vu1::new(),
             vu1: Vu1::new(),
             timers: Timers::new(),
             sif: Sif::new(),

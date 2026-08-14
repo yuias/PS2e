@@ -31,15 +31,14 @@ pub struct Cpu {
     pub sa: u32,
     pub cop0: Cop0,
     pub fpu: Fpu,
-    /// VU0 macro-mode register shadow until the VUs exist.
-    pub vu0_vf: [[u64; 2]; 32],
+    /// Shadow for VU0 control registers with no VU-state mapping
+    /// (TPC, CMSAR, FBRST, VPU-STAT — reads 0 = "never busy").
     pub vu0_ctrl: [u32; 32],
     /// The next instruction to execute sits in a branch delay slot.
     next_is_delay: bool,
     /// PC of the instruction currently executing (for diagnostics/exceptions).
     current_pc: u32,
     in_delay: bool,
-    warned_vu0_macro: bool,
 }
 
 impl Default for Cpu {
@@ -59,12 +58,10 @@ impl Cpu {
             sa: 0,
             cop0: Cop0::new(),
             fpu: Fpu::new(),
-            vu0_vf: [[0; 2]; 32],
             vu0_ctrl: [0; 32],
             next_is_delay: false,
             current_pc: 0xBFC0_0000,
             in_delay: false,
-            warned_vu0_macro: false,
         }
     }
 
@@ -209,7 +206,7 @@ impl Cpu {
             0x0F => self.set32(rt, imm << 16),
             0x10 => self.op_cop0(instr, rs, rt, rd, bus),
             0x11 => self.op_cop1(instr, rs, rt, rd, sa),
-            0x12 => self.op_cop2(instr, rs, rt, rd),
+            0x12 => self.op_cop2(instr, rs, rt, rd, bus),
             0x14 => self.branch_cond(self.r64(rs) == self.r64(rt), imm, true),
             0x15 => self.branch_cond(self.r64(rs) != self.r64(rt), imm, true),
             0x16 => self.branch_cond((self.r64(rs) as i64) <= 0, imm, true),
@@ -263,15 +260,18 @@ impl Cpu {
             }
             0x33 => {} // pref
             0x36 => {
+                // LQC2
                 let v = bus.read128(addr(self) & !0xF);
-                self.vu0_vf[rt] = v;
+                if rt != 0 {
+                    bus.vu0.vf[rt] = split128(v);
+                }
             }
             0x37 => {
                 let v = bus.read64(addr(self));
                 self.set64(rt, v);
             }
             0x39 => bus.write32(addr(self), self.fpu.regs[rt].to_bits()),
-            0x3E => bus.write128(addr(self) & !0xF, self.vu0_vf[rt]),
+            0x3E => bus.write128(addr(self) & !0xF, join128(bus.vu0.vf[rt])), // SQC2
             0x3F => bus.write64(addr(self), self.r64(rt)),
             _ => self.unimplemented("opcode", instr),
         }
@@ -643,31 +643,63 @@ impl Cpu {
     }
 
     // --- COP2 (VU0 macro mode) -------------------------------------------
+    // See crate::vu1::Vu1::exec_macro — the VU core does the actual work.
 
-    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize) {
+    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, bus: &mut Bus) {
         match rs {
             0x01 => {
-                let v = self.vu0_vf[rd];
+                // QMFC2
+                let v = join128(bus.vu0.vf[rd]);
                 self.set128(rt, v);
             }
             0x02 => {
-                let v = self.vu0_ctrl[rd];
-                self.set32(rt, v);
+                // CFC2: control registers map onto the VU state.
+                let vu0 = &bus.vu0;
+                let v = match rd {
+                    0..=15 => vu0.vi[rd] as u32,
+                    16 => vu0.status as u32,
+                    17 => vu0.mac as u32,
+                    18 => vu0.clip,
+                    20 => vu0.r & 0x7F_FFFF,
+                    21 => vu0.i.to_bits(),
+                    22 => vu0.q.to_bits(),
+                    _ => self.vu0_ctrl[rd], // TPC/CMSAR/FBRST/VPU-STAT shadow
+                };
+                self.set64(rt, v as i32 as i64 as u64);
             }
-            0x05 => self.vu0_vf[rd] = self.r128(rt),
-            0x06 => self.vu0_ctrl[rd] = self.r32(rt),
-            0x10..=0x1F => {
-                // VU0 macro instructions: shadow-nop until the VUs exist.
-                // Warn once — sync loops execute these millions of times.
-                if !self.warned_vu0_macro {
-                    self.warned_vu0_macro = true;
-                    warn!(
-                        target: "ps2_core::ee::cpu",
-                        pc = format_args!("{:#010x}", self.current_pc),
-                        instr = format_args!("{instr:#010x}"),
-                        "VU0 macro op (nop stub, reported once)"
-                    );
+            0x05 => {
+                // QMTC2 (vf00 stays hardwired).
+                if rd != 0 {
+                    bus.vu0.vf[rd] = split128(self.r128(rt));
                 }
+            }
+            0x06 => {
+                // CTC2
+                let v = self.r32(rt);
+                let vu0 = &mut bus.vu0;
+                match rd {
+                    0 => {}
+                    1..=15 => vu0.vi[rd] = v as u16,
+                    16 => vu0.status = v as u16,
+                    17 => vu0.mac = v as u16,
+                    18 => vu0.clip = v & 0xFF_FFFF,
+                    20 => vu0.r = v & 0x7F_FFFF,
+                    21 => vu0.i = f32::from_bits(v),
+                    22 => vu0.q = f32::from_bits(v),
+                    _ => self.vu0_ctrl[rd] = v,
+                }
+            }
+            0x08 => {
+                // BC2F/BC2T on the (unmodeled) VU0 busy line: never busy.
+                let taken = match rt & 3 {
+                    0 | 2 => true,  // BC2F / BC2FL: condition false = idle
+                    _ => false,     // BC2T / BC2TL
+                };
+                self.branch_cond(taken, instr & 0xFFFF, rt & 2 != 0);
+            }
+            0x10..=0x1F => {
+                let Bus { vu0, gs, gif, .. } = bus;
+                vu0.exec_macro(gs, gif, instr);
             }
             _ => self.unimplemented("COP2", instr),
         }
@@ -940,6 +972,18 @@ impl Cpu {
 
 /// Interleave the 16-bit lanes of two 64-bit halves (pextlh/pextuh shape):
 /// result lanes alternate low-source, high-source.
+/// [u64; 2] halves <-> the per-field u32 layout of a VU float register.
+fn split128(v: [u64; 2]) -> [u32; 4] {
+    [v[0] as u32, (v[0] >> 32) as u32, v[1] as u32, (v[1] >> 32) as u32]
+}
+
+fn join128(v: [u32; 4]) -> [u64; 2] {
+    [
+        v[0] as u64 | (v[1] as u64) << 32,
+        v[2] as u64 | (v[3] as u64) << 32,
+    ]
+}
+
 fn interleave_u16(lo: u64, hi: u64) -> [u64; 2] {
     let mut out = [0u64; 2];
     for i in 0..4 {
