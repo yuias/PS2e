@@ -2027,6 +2027,20 @@ impl Bus {
                 // is about to reboot silently via UDNL: drop in-flight SIF
                 // state so the new kernel starts with clean FIFOs.
                 let cid = read_le::<4>(&self.iop_ram, ((start + 8) & 0x1F_FFFC) as usize) as u32;
+                if cid & 0x8000_0000 != 0 {
+                    let payload: Vec<u32> = (0..6)
+                        .map(|i| {
+                            read_le::<4>(&self.iop_ram, ((start + 16 + i * 4) & 0x1F_FFFC) as usize)
+                                as u32
+                        })
+                        .collect();
+                    debug!(
+                        target: "ps2_core::bus::sifcmd",
+                        cid = format_args!("{cid:#010x}"),
+                        payload = format_args!("{payload:08x?}"),
+                        "EE->IOP command"
+                    );
+                }
                 if cid == 0x8000_0003 {
                     debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
                     self.sif.fifo0.clear();
