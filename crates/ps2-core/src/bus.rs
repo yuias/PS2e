@@ -231,6 +231,163 @@ impl Cdvd {
     }
 }
 
+/// SIO2 (pad/memory-card serial controller) with one digital-capable
+/// DualShock in port 0. A transfer is described by the SEND3 slots
+/// (port in bits 0-1, byte length in bits 8-16); command bytes arrive in
+/// the in-FIFO (PIO or DMA ch11) and responses leave through the
+/// out-FIFO (PIO or DMA ch12). The first command byte selects the
+/// device class: 0x01 pad, 0x81 memory card, 0x21 multitap.
+#[derive(Default)]
+pub struct Sio2 {
+    send3: [u32; 16],
+    fifo_in: Vec<u8>,
+    fifo_out: Vec<u8>,
+    out_pos: usize,
+    ctrl: u32,
+    recv1: u32,
+    /// Buttons currently held, active-high in PS1 bit order
+    /// (SELECT=0, L3, R3, START, UP, RIGHT, DOWN, LEFT,
+    ///  L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE=15).
+    pub buttons: u16,
+    /// Transfer started while the in-FIFO was empty: waiting for DMA ch11
+    /// to deliver the command bytes (the DMAC only moves data once the
+    /// start bit asserts DRQ, so CTRL can legitimately come first).
+    pending: bool,
+    /// DualShock command-0x43 config mode.
+    pad_config: bool,
+    /// Analog mode (command 0x44); adds four stick bytes to polls.
+    pad_analog: bool,
+}
+
+/// RECV1 values SIO2MAN checks after a transfer.
+const SIO2_RECV1_CONNECTED: u32 = 0x1100;
+const SIO2_RECV1_DISCONNECTED: u32 = 0x1D100;
+
+impl Sio2 {
+    /// Execute the queued transfer: walk SEND3, consume the in-FIFO and
+    /// synthesize each sub-transfer's response.
+    fn run_transfer(&mut self) {
+        self.fifo_out.clear();
+        self.out_pos = 0;
+        let mut pos = 0usize;
+        for slot in self.send3 {
+            if slot == 0 {
+                break;
+            }
+            let port = slot & 3;
+            let len = ((slot >> 8) & 0x1FF) as usize;
+            if len == 0 {
+                break;
+            }
+            let end = (pos + len).min(self.fifo_in.len());
+            let cmd: Vec<u8> = self.fifo_in[pos.min(end)..end].to_vec();
+            pos += len;
+            debug!(target: "ps2_core::iop::sio2",
+                port, len, cmd = format_args!("{:02x?}", &cmd[..cmd.len().min(4)]),
+                "sub-transfer");
+            if port == 0 && cmd.first() == Some(&0x01) {
+                self.pad_respond(&cmd, len);
+                self.recv1 = SIO2_RECV1_CONNECTED;
+            } else {
+                // No device: the line floats high, so reads return 0xFF.
+                self.fifo_out.extend(std::iter::repeat(0xFFu8).take(len));
+                self.recv1 = SIO2_RECV1_DISCONNECTED;
+            }
+        }
+        self.fifo_in.clear();
+    }
+
+    fn pad_respond(&mut self, cmd: &[u8], len: usize) {
+        let op = cmd.get(1).copied().unwrap_or(0);
+        let id: u8 = if self.pad_config {
+            0xF3
+        } else if self.pad_analog {
+            0x73
+        } else {
+            0x41
+        };
+        let b = !self.buttons;
+        let mut r = vec![0xFF, id, 0x5A];
+        if self.pad_config {
+            // Config-mode commands: only the transitions matter to us.
+            r.extend([0u8; 6]);
+        } else if op == 0x42 || op == 0x43 {
+            r.extend([b as u8, (b >> 8) as u8]);
+            if self.pad_analog {
+                // Centered sticks: rx, ry, lx, ly.
+                r.extend([0x7F; 4]);
+            }
+        }
+        // Mode changes take effect after the frame that carries them.
+        if op == 0x43 {
+            self.pad_config = cmd.get(3) == Some(&1);
+        } else if self.pad_config && op == 0x44 {
+            self.pad_analog = cmd.get(3) == Some(&1);
+        }
+        r.resize(len, 0);
+        self.fifo_out.extend(r);
+    }
+
+    /// Run a start that was waiting for its DMA-delivered command bytes.
+    /// Returns true when the transfer executed (raises the interrupt).
+    fn dma_in_done(&mut self) -> bool {
+        if self.pending {
+            self.pending = false;
+            self.run_transfer();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn read(&mut self, addr: u32) -> u32 {
+        match addr & 0xFF {
+            0x00..=0x3F => self.send3[((addr >> 2) & 0xF) as usize],
+            0x64 => {
+                let v = self.fifo_out.get(self.out_pos).copied().unwrap_or(0);
+                self.out_pos += 1;
+                v as u32
+            }
+            0x68 => self.ctrl,
+            0x6C => self.recv1,
+            0x70 => 0xF, // RECV2: constant "command OK"
+            0x74 => 0,   // RECV3
+            _ => 0,
+        }
+    }
+
+    /// Returns true when the write completed a transfer (raises the SIO2
+    /// interrupt line).
+    pub fn write(&mut self, addr: u32, v: u32) -> bool {
+        match addr & 0xFF {
+            0x00..=0x3F => self.send3[((addr >> 2) & 0xF) as usize] = v,
+            0x60 => self.fifo_in.push(v as u8),
+            0x68 => {
+                // Bits 2/3 reset the FIFOs — but only honor them without
+                // the start bit: SIO2MAN sets both in one write after DMA
+                // has already loaded the in-FIFO.
+                if v & 0xC != 0 && v & 1 == 0 {
+                    self.fifo_in.clear();
+                    self.fifo_out.clear();
+                    self.out_pos = 0;
+                    self.pending = false;
+                }
+                self.ctrl = v & !1;
+                if v & 1 != 0 {
+                    if self.fifo_in.is_empty() {
+                        self.pending = true;
+                    } else {
+                        self.run_transfer();
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 /// IOP root counter (0-2: 16-bit PS1-style, 3-5: 32-bit).
 #[derive(Default, Clone, Copy)]
 struct IopTimer {
@@ -319,7 +476,10 @@ pub struct Bus {
     pub iop_dma_sif1: IopDmaChannel,
     pub iop_dicr: u32,
     pub iop_dicr2: u32,
+    pub iop_dma_sio2in: IopDmaChannel,
+    pub iop_dma_sio2out: IopDmaChannel,
     pub cdvd: Cdvd,
+    pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
     pub now: u64,
     /// Kernel TTY output captured from the EE SIO TXFIFO (observation only).
@@ -378,7 +538,10 @@ impl Bus {
             iop_dma_sif1: IopDmaChannel::default(),
             iop_dicr: 0,
             iop_dicr2: 0,
+            iop_dma_sio2in: IopDmaChannel::default(),
+            iop_dma_sio2out: IopDmaChannel::default(),
             cdvd: Cdvd::default(),
+            sio2: Sio2::default(),
             now: 0,
             tty_buffer: String::new(),
             tty_line: String::new(),
@@ -1173,6 +1336,11 @@ impl Bus {
 
     /// Raise an IOP DMA completion interrupt: channels 0-6 report through
     /// DICR, 7-13 through DICR2 (enable bits 16+, flag bits 24+).
+    /// IOP BCR: block size in words (low 16) x block count (high 16).
+    fn iop_bcr_bytes(bcr: u32) -> usize {
+        ((bcr & 0xFFFF).max(1) as usize) * ((bcr >> 16).max(1) as usize) * 4
+    }
+
     fn iop_dma_irq(&mut self, ch: u32) {
         let (reg, bit) = if ch < 7 {
             (&mut self.iop_dicr, ch)
@@ -1615,12 +1783,7 @@ impl Bus {
             };
         }
         match addr {
-            // SIO2 (pad/memcard controller): report "no device attached".
-            // CTRL's start bit self-clears on write, RECV1 says disconnected.
-            0x1F80_8264 => 0xFF,    // FIFO out: empty response
-            0x1F80_826C => 0x1D100, // RECV1: no device
-            0x1F80_8270 => 0xF,     // RECV2: constant
-            0x1F80_8274 => 0,       // RECV3
+            0x1F80_8200..=0x1F80_827F => self.sio2.read(addr),
             0x1F80_1070 => self.iop_i_stat,
             0x1F80_1074 => self.iop_i_mask,
             0x1F80_1078 => {
@@ -1638,6 +1801,12 @@ impl Bus {
             0x1F80_1534 => self.iop_dma_sif1.bcr,
             0x1F80_1538 => self.iop_dma_sif1.chcr,
             0x1F80_153C => self.iop_dma_sif1.tadr,
+            0x1F80_1540 => self.iop_dma_sio2in.madr,
+            0x1F80_1544 => self.iop_dma_sio2in.bcr,
+            0x1F80_1548 => self.iop_dma_sio2in.chcr,
+            0x1F80_1550 => self.iop_dma_sio2out.madr,
+            0x1F80_1554 => self.iop_dma_sio2out.bcr,
+            0x1F80_1558 => self.iop_dma_sio2out.chcr,
             0x1F80_10F4 => self.iop_dicr,
             0x1F80_1574 => self.iop_dicr2,
             _ => {
@@ -1669,12 +1838,9 @@ impl Bus {
             return;
         }
         match addr {
-            // SIO2 CTRL: the start bit kicks a transfer and self-clears;
-            // completion raises the SIO2 interrupt.
-            0x1F80_8268 => {
-                write_le::<4>(&mut self.iop_mmio, 0x8268, (v & !1) as u64);
-                if v & 1 != 0 {
-                    trace!(target: "ps2_core::iop::bus", "SIO2 transfer (no device)");
+            0x1F80_8200..=0x1F80_827F => {
+                if self.sio2.write(addr, v) {
+                    // Transfer completion raises the SIO2 interrupt line.
                     self.iop_i_stat |= 1 << 17;
                 }
             }
@@ -1711,6 +1877,42 @@ impl Bus {
                 }
             }
             0x1F80_153C => self.iop_dma_sif1.tadr = v & 0xFF_FFFF,
+            // SIO2 DMA: ch11 feeds the in-FIFO, ch12 drains the out-FIFO.
+            // Transfers complete instantly (the FIFO model has no timing).
+            0x1F80_1540 => self.iop_dma_sio2in.madr = v & 0xFF_FFFF,
+            0x1F80_1544 => self.iop_dma_sio2in.bcr = v,
+            0x1F80_1548 => {
+                self.iop_dma_sio2in.chcr = v & !IOP_CHCR_BUSY;
+                if v & IOP_CHCR_BUSY != 0 {
+                    let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2in.bcr);
+                    let start = (self.iop_dma_sio2in.madr & 0x1F_FFFF) as usize;
+                    for i in 0..bytes {
+                        let b = self.iop_ram[(start + i) % self.iop_ram.len()];
+                        self.sio2.fifo_in.push(b);
+                    }
+                    debug!(target: "ps2_core::iop::sio2", bytes, "DMA in");
+                    if self.sio2.dma_in_done() {
+                        self.iop_i_stat |= 1 << 17;
+                    }
+                    self.iop_dma_irq(11);
+                }
+            }
+            0x1F80_1550 => self.iop_dma_sio2out.madr = v & 0xFF_FFFF,
+            0x1F80_1554 => self.iop_dma_sio2out.bcr = v,
+            0x1F80_1558 => {
+                self.iop_dma_sio2out.chcr = v & !IOP_CHCR_BUSY;
+                if v & IOP_CHCR_BUSY != 0 {
+                    let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2out.bcr);
+                    let start = (self.iop_dma_sio2out.madr & 0x1F_FFFF) as usize;
+                    for i in 0..bytes {
+                        let b = self.sio2.read(0x1F80_8264) as u8;
+                        let len = self.iop_ram.len();
+                        self.iop_ram[(start + i) % len] = b;
+                    }
+                    debug!(target: "ps2_core::iop::sio2", bytes, "DMA out");
+                    self.iop_dma_irq(12);
+                }
+            }
             // DICR/DICR2: enables in bits 16-23, flags (W1C) in bits 24-30.
             0x1F80_10F4 => {
                 self.iop_dicr =
