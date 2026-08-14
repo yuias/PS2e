@@ -20,6 +20,54 @@ struct Args {
     debug_iop: Option<u16>,
     /// Hold execution at the reset vector until a debugger attaches.
     wait_debugger: bool,
+    /// Scripted pad input: (button mask, first cycle, last cycle).
+    presses: Vec<(u16, u64, u64)>,
+}
+
+/// Default hold length for a scripted press, in EE cycles (~0.5 s).
+const PRESS_HOLD: u64 = 150_000_000;
+
+fn pad_button_bit(name: &str) -> Result<u16, String> {
+    Ok(match name {
+        "select" => 0,
+        "l3" => 1,
+        "r3" => 2,
+        "start" => 3,
+        "up" => 4,
+        "right" => 5,
+        "down" => 6,
+        "left" => 7,
+        "l2" => 8,
+        "r2" => 9,
+        "l1" => 10,
+        "r1" => 11,
+        "triangle" => 12,
+        "circle" => 13,
+        "cross" => 14,
+        "square" => 15,
+        _ => return Err(format!("unknown button '{name}'")),
+    })
+}
+
+/// Parse "circle@6000000000" or "down@5e9-5.2e9"-style "<button>@<from>[-<to>]".
+fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
+    let (name, range) = spec
+        .split_once('@')
+        .ok_or_else(|| format!("--press needs <button>@<cycle>, got '{spec}'"))?;
+    let bit = pad_button_bit(name)?;
+    let parse_n = |s: &str| -> Result<u64, String> {
+        s.replace('_', "")
+            .parse()
+            .map_err(|e| format!("bad cycle '{s}': {e}"))
+    };
+    let (from, to) = match range.split_once('-') {
+        Some((a, b)) => (parse_n(a)?, parse_n(b)?),
+        None => {
+            let a = parse_n(range)?;
+            (a, a + PRESS_HOLD)
+        }
+    };
+    Ok((1 << bit, from, to))
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -32,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
         debug_ee: None,
         debug_iop: None,
         wait_debugger: false,
+        presses: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -55,6 +104,9 @@ fn parse_args() -> Result<Args, String> {
                 args.debug_iop = Some(parse_port(it.next().ok_or("--debug-iop needs a port")?)?)
             }
             "--wait-debugger" => args.wait_debugger = true,
+            "--press" => args
+                .presses
+                .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -66,7 +118,9 @@ fn parse_args() -> Result<Args, String> {
                      --screenshot     write the final framebuffer as a BMP\n\
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
-                     --wait-debugger  hold at the reset vector until a debugger attaches"
+                     --wait-debugger  hold at the reset vector until a debugger attaches\n\
+                     --press          hold a pad button, <button>@<cycle>[-<cycle>]\n\
+                     \x20                (circle, cross, up, down, start, ...; repeatable)"
                 );
                 std::process::exit(0);
             }
@@ -151,6 +205,11 @@ fn main() -> ExitCode {
             }
         }
         let n = remaining.min(SLICE);
+        sys.bus.sio2.buttons = args
+            .presses
+            .iter()
+            .filter(|&&(_, from, to)| sys.cycles >= from && sys.cycles < to)
+            .fold(0, |acc, &(mask, _, _)| acc | mask);
         sys.run(n);
         remaining -= n;
         flush_tty(&stdout, &mut sys);
@@ -194,6 +253,8 @@ fn main() -> ExitCode {
         if let Err(e) = std::fs::write(&ee, &sys.bus.ram)
             .and_then(|_| std::fs::write(&iop, &sys.bus.iop_ram))
             .and_then(|_| std::fs::write(&vram, &sys.bus.gs.vram))
+            .and_then(|_| std::fs::write(format!("{dir}/vu1_micro.bin"), &sys.bus.vu1.micro))
+            .and_then(|_| std::fs::write(format!("{dir}/vu1_data.bin"), &sys.bus.vu1.data))
         {
             eprintln!("error: RAM dump failed: {e}");
             return ExitCode::FAILURE;
