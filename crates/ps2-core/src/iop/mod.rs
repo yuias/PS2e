@@ -166,13 +166,18 @@ impl Cpu {
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
 
-        let pending = self.pending_load.take();
+        // Leave the pending load visible during execute: lwl/lwr merge with
+        // it via load_merge_base (hardware forwards the in-flight value).
+        let pending = self.pending_load;
         self.written_reg = 0;
         self.execute(instr, bus);
-        if let Some((reg, v)) = pending
-            && reg != self.written_reg
-        {
-            self.gpr[reg] = v;
+        if let Some((reg, v)) = pending {
+            if self.pending_load == pending {
+                self.pending_load = None;
+            }
+            if reg != self.written_reg {
+                self.gpr[reg] = v;
+            }
         }
     }
 
@@ -422,6 +427,26 @@ mod tests {
         step_iop(&mut sys, 6);
         assert_eq!(sys.iop.gpr[10], 0);
         assert_eq!(sys.iop.gpr[11], 0x55);
+    }
+
+    #[test]
+    fn lwl_lwr_pair_merges_unaligned_word() {
+        // cdvdman copies S-command results with back-to-back lwl/lwr; the
+        // lwr must see the lwl's in-flight value or byte 3 is lost.
+        let mut sys = iop_system(&[
+            0x3C01_0000, // lui $at, 0
+            0x3C09_4433, // lui $t1, 0x4433
+            0x3529_2211, // ori $t1, 0x2211
+            0xAC29_0000, // sw  $t1, 0($at)
+            0x3C0A_8877, // lui $t2, 0x8877
+            0x354A_6655, // ori $t2, 0x6655
+            0xAC2A_0004, // sw  $t2, 4($at)
+            0x8828_0004, // lwl $t0, 4($at)
+            0x9828_0001, // lwr $t0, 1($at)
+            0x0000_0000, // nop (lwr's load delay)
+        ]);
+        step_iop(&mut sys, 10);
+        assert_eq!(sys.iop.gpr[8], 0x5544_3322);
     }
 
     #[test]
