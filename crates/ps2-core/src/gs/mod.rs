@@ -649,16 +649,20 @@ impl Gs {
         let dbx = ((dispfb >> 32) & 0x7FF) as u32;
         let dby = ((dispfb >> 43) & 0x7FF) as u32;
 
+        // INT+FFMD: each field is a half-height buffer; line-double it to
+        // the full display height instead of reading into the next field.
+        let field_double = self.smode2 & 3 == 3;
         let mut out = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
+            let sy = if field_double { y / 2 } else { y };
             for x in 0..w {
                 let (r, g, b) = match psm {
                     PSMCT32 | PSMCT24 => {
-                        let px = self.read_psmct32(fbp, fbw, dbx + x, dby + y);
+                        let px = self.read_psmct32(fbp, fbw, dbx + x, dby + sy);
                         (px as u8, (px >> 8) as u8, (px >> 16) as u8)
                     }
                     PSMCT16 | PSMCT16S => {
-                        let px = self.read_psmct16(fbp, fbw, dbx + x, dby + y);
+                        let px = self.read_psmct16(fbp, fbw, dbx + x, dby + sy);
                         (
                             ((px & 0x1F) << 3) as u8,
                             (((px >> 5) & 0x1F) << 3) as u8,
