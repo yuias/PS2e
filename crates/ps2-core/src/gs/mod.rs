@@ -102,6 +102,10 @@ pub struct Gs {
     pub trxdir: u64,
     trx_x: u32,
     trx_y: u32,
+    /// Partial pixel carried between 64-bit chunks of a packed 24-bit
+    /// IMAGE stream (3 bytes per pixel, no chunk alignment).
+    trx24: [u8; 3],
+    trx24_len: u8,
     /// Q latched by packed-mode ST writes, consumed by packed RGBAQ.
     pub packed_q: u32,
     /// Rising edge into the EE INTC GS line (bit 0).
@@ -155,6 +159,8 @@ impl Gs {
             trxdir: 0,
             trx_x: 0,
             trx_y: 0,
+            trx24: [0; 3],
+            trx24_len: 0,
             packed_q: f32::to_bits(1.0),
             intc_pending: false,
             prims_drawn: 0,
@@ -287,6 +293,7 @@ impl Gs {
                 self.trxdir = v & 3;
                 self.trx_x = 0;
                 self.trx_y = 0;
+                self.trx24_len = 0;
                 if v & 3 == 2 {
                     self.local_copy();
                 }
@@ -450,15 +457,28 @@ impl Gs {
                 32,
             ),
             PSMCT24 => {
-                // Packed 24-bit stream: defer via byte buffer approach —
-                // treat as 32-bit for now (misaligned tail dropped).
-                push(
-                    self,
-                    2,
-                    Box::new(move |gs, x, y, px| gs.write_psmct32(dbp, dbw, x, y, px & 0xFF_FFFF)),
-                    v,
-                    32,
-                )
+                // Packed stream, 3 bytes per pixel with no 64-bit alignment:
+                // carry the partial pixel across chunks.
+                for &b in &v.to_le_bytes() {
+                    self.trx24[self.trx24_len as usize] = b;
+                    self.trx24_len += 1;
+                    if self.trx24_len < 3 {
+                        continue;
+                    }
+                    self.trx24_len = 0;
+                    if self.trx_y >= rrh {
+                        continue;
+                    }
+                    let px = u32::from(self.trx24[0])
+                        | u32::from(self.trx24[1]) << 8
+                        | u32::from(self.trx24[2]) << 16;
+                    self.write_psmct32(dbp, dbw, dsax + self.trx_x, dsay + self.trx_y, px);
+                    self.trx_x += 1;
+                    if self.trx_x >= rrw {
+                        self.trx_x = 0;
+                        self.trx_y += 1;
+                    }
+                }
             }
             PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => push(
                 self,
