@@ -60,11 +60,13 @@ pub struct IopDmaChannel {
 
 const IOP_CHCR_BUSY: u32 = 1 << 24;
 
-/// Minimal CDVD (MECHACON) model: no disc, instant commands. Enough for
-/// the OSD's NVRAM/RTC configuration reads over the S-command interface.
+/// CDVD (MECHACON) model: S commands answer instantly; N commands read
+/// sectors from an optional disc image, streamed from disk one request
+/// at a time (PS2 images are far too large to hold in memory).
 #[derive(Default)]
 pub struct Cdvd {
     n_cmd: u8,
+    n_params: Vec<u8>,
     /// CDVD-internal interrupt flags (reg 0x08, W1C).
     pub istat: u8,
     s_cmd: u8,
@@ -77,6 +79,194 @@ pub struct Cdvd {
     config_pos: usize,
     /// True when the open selected the OSD's area (wire triple [0, 1, n]).
     config_is_osd: bool,
+    /// Disc image (2048-byte sectors), read on demand.
+    pub disc: Option<std::fs::File>,
+    /// Sector data staged for DMA channel 3, and the drain cursor.
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    /// Disc key from N 0x0C, served through the XOR-obfuscated register
+    /// window 0x2020-0x2034 (validity bits at 0x2038, XOR byte at 0x2039,
+    /// decrypt flag at 0x203A).
+    key: [u8; 15],
+    key_flag: u8,
+    key_valid: bool,
+}
+
+/// ISO sector payload size; DVD reads wrap it in a 2064-byte raw sector.
+const ISO_SECTOR: u64 = 2048;
+
+impl Cdvd {
+    /// Execute an N command. CdRead (0x06) and DvdRead (0x08) stage the
+    /// requested sectors into `read_buf` for DMA channel 3.
+    fn n_execute(&mut self) {
+        let cmd = self.n_cmd;
+        let lsn = u32::from_le_bytes([
+            self.n_params.first().copied().unwrap_or(0),
+            self.n_params.get(1).copied().unwrap_or(0),
+            self.n_params.get(2).copied().unwrap_or(0),
+            self.n_params.get(3).copied().unwrap_or(0),
+        ]);
+        let count = u32::from_le_bytes([
+            self.n_params.get(4).copied().unwrap_or(0),
+            self.n_params.get(5).copied().unwrap_or(0),
+            self.n_params.get(6).copied().unwrap_or(0),
+            self.n_params.get(7).copied().unwrap_or(0),
+        ]);
+        match cmd {
+            0x06 | 0x08 => {
+                debug!(target: "ps2_core::iop::cdvd",
+                    cmd = format_args!("{cmd:#04x}"), lsn, count, "disc read");
+                self.read_buf.clear();
+                self.read_pos = 0;
+                let Some(disc) = self.disc.as_mut() else {
+                    return;
+                };
+                use std::io::{Read, Seek, SeekFrom};
+                for i in 0..count.min(4096) {
+                    let mut data = [0u8; ISO_SECTOR as usize];
+                    let ok = disc
+                        .seek(SeekFrom::Start((lsn as u64 + i as u64) * ISO_SECTOR))
+                        .and_then(|_| disc.read_exact(&mut data))
+                        .is_ok();
+                    if !ok {
+                        warn!(target: "ps2_core::iop::cdvd", lsn = lsn + i, "read past end of disc image");
+                    }
+                    if cmd == 0x08 {
+                        // Raw DVD sector: 12-byte ID/IED/CPR header with the
+                        // physical sector number (LBA + 0x30000), 2048 data,
+                        // 4-byte EDC. cdvdman checks the number and strips
+                        // the framing.
+                        let phys = lsn + i + 0x30000;
+                        let mut hdr = [0u8; 12];
+                        hdr[0] = 0x20; // layer 0
+                        hdr[1] = (phys >> 16) as u8;
+                        hdr[2] = (phys >> 8) as u8;
+                        hdr[3] = phys as u8;
+                        self.read_buf.extend_from_slice(&hdr);
+                        self.read_buf.extend_from_slice(&data);
+                        self.read_buf.extend_from_slice(&[0; 4]);
+                    } else {
+                        self.read_buf.extend_from_slice(&data);
+                    }
+                }
+            }
+            // sceCdReadKey: derive the disc key from the boot executable's
+            // serial the way the mechacon does; the OSD recomputes it and
+            // compares before accepting the disc.
+            0x0C => {
+                let arg2 = u32::from(self.n_params.get(3).copied().unwrap_or(0))
+                    | u32::from(self.n_params.get(4).copied().unwrap_or(0)) << 8;
+                let serial = self.disc_serial();
+                self.key = [0; 15];
+                if let Some(s) = serial {
+                    let numbers: u32 = std::str::from_utf8(&s[4..9])
+                        .ok()
+                        .and_then(|d| d.parse().ok())
+                        .unwrap_or(0);
+                    let letters = u32::from(s[3] & 0x7F)
+                        | u32::from(s[2] & 0x7F) << 7
+                        | u32::from(s[1] & 0x7F) << 14
+                        | u32::from(s[0] & 0x7F) << 21;
+                    let key_0_3 = ((numbers & 0x1FC00) >> 10) | ((letters & 0x01FF_FFFF) << 7);
+                    self.key[..4].copy_from_slice(&key_0_3.to_le_bytes());
+                    self.key[4] =
+                        (((numbers & 0x1F) << 3) | ((letters & 0x0E00_0000) >> 25)) as u8;
+                    if arg2 == 75 {
+                        self.key[14] = (((numbers & 0x3E0) >> 2) | 0x04) as u8;
+                    }
+                }
+                self.key_flag = match arg2 {
+                    75 => 0x05,
+                    4246 => {
+                        self.key[..5].copy_from_slice(&[0x07, 0xF7, 0xF2, 0x01, 0x00]);
+                        0x01
+                    }
+                    _ => 0x01,
+                };
+                self.key_valid = true;
+                debug!(target: "ps2_core::iop::cdvd",
+                    arg2,
+                    serial = format_args!("{:?}", serial.map(|s| String::from_utf8_lossy(&s).into_owned())),
+                    key = format_args!("{:02x?}", self.key),
+                    "read disc key");
+            }
+            _ => {
+                debug!(target: "ps2_core::iop::cdvd",
+                    cmd = format_args!("{cmd:#04x}"),
+                    params = format_args!("{:02x?}", self.n_params),
+                    "N command (instant)");
+            }
+        }
+    }
+
+    fn read_sector_raw(&mut self, lsn: u64, buf: &mut [u8]) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(disc) = self.disc.as_mut() else {
+            return false;
+        };
+        disc.seek(SeekFrom::Start(lsn * ISO_SECTOR))
+            .and_then(|_| disc.read_exact(buf))
+            .is_ok()
+    }
+
+    /// Extract the boot serial ("SLPS25918"-style: 4 letters + 5 digits)
+    /// from SYSTEM.CNF via a minimal ISO9660 walk.
+    fn disc_serial(&mut self) -> Option<[u8; 9]> {
+        let mut pvd = [0u8; 2048];
+        if !self.read_sector_raw(16, &mut pvd) || &pvd[1..6] != b"CD001" {
+            return None;
+        }
+        // Root directory record sits at PVD offset 156.
+        let extent = u32::from_le_bytes(pvd[158..162].try_into().unwrap()) as u64;
+        let mut dir = [0u8; 2048];
+        if !self.read_sector_raw(extent, &mut dir) {
+            return None;
+        }
+        let mut off = 0usize;
+        let cnf_extent = loop {
+            if off >= 2048 || dir[off] == 0 {
+                return None;
+            }
+            let len = dir[off] as usize;
+            let name_len = dir[off + 32] as usize;
+            let name = &dir[off + 33..off + 33 + name_len];
+            if name.starts_with(b"SYSTEM.CNF") {
+                break u32::from_le_bytes(dir[off + 2..off + 6].try_into().unwrap()) as u64;
+            }
+            off += len;
+        };
+        let mut cnf = [0u8; 2048];
+        if !self.read_sector_raw(cnf_extent, &mut cnf) {
+            return None;
+        }
+        // BOOT2 = cdrom0:\SLPS_259.18;1 -> 4 letters, then every digit.
+        let text = String::from_utf8_lossy(&cnf);
+        let boot = text.lines().find(|l| l.contains("BOOT2"))?;
+        let path = boot.split(['\\', ':', '/']).last()?;
+        let mut out = [0u8; 9];
+        let mut letters = path.bytes().filter(u8::is_ascii_alphabetic);
+        let mut digits = path.split(';').next()?.bytes().filter(u8::is_ascii_digit);
+        for slot in &mut out[..4] {
+            *slot = letters.next()?;
+        }
+        for slot in &mut out[4..] {
+            *slot = digits.next()?;
+        }
+        Some(out)
+    }
+
+    /// Staged sector bytes not yet drained by DMA channel 3.
+    fn read_remaining(&self) -> usize {
+        self.read_buf.len().saturating_sub(self.read_pos)
+    }
+
+    /// Drain staged sector data for DMA channel 3.
+    fn dma_read(&mut self, out: &mut [u8]) {
+        for b in out.iter_mut() {
+            *b = self.read_buf.get(self.read_pos).copied().unwrap_or(0);
+            self.read_pos += 1;
+        }
+    }
 }
 
 /// A config block on the wire is 15 data bytes plus their sum mod 256;
@@ -201,9 +391,23 @@ impl Cdvd {
             0x05 => 0x40,
             0x06 => 0, // error
             0x08 => self.istat as u32,
-            0x0A => 0, // drive status: stopped
+            // Drive status: spinning with a disc, stopped without.
+            0x0A => {
+                if self.disc.is_some() {
+                    2
+                } else {
+                    0
+                }
+            }
             0x0B => 0,
-            0x0F => 0, // disc type: no disc
+            // Disc type: PS2 DVD (0x14) when an image is loaded.
+            0x0F => {
+                if self.disc.is_some() {
+                    0x14
+                } else {
+                    0
+                }
+            }
             0x16 => self.s_cmd as u32,
             // S status: bit 6 set when the result FIFO is empty.
             0x17 => {
@@ -218,6 +422,21 @@ impl Cdvd {
                 self.s_result_pos += 1;
                 v as u32
             }
+            // Disc key window: three 5-byte banks (0x20-0x24, 0x28-0x2C,
+            // 0x30-0x34), validity bits at 0x38, XOR byte at 0x39.
+            r @ (0x20..=0x24 | 0x28..=0x2C | 0x30..=0x34) => {
+                let i = (r - 0x20 - (r - 0x20) / 8 * 3) as usize;
+                self.key.get(i).copied().unwrap_or(0) as u32
+            }
+            0x38 => {
+                if self.key_valid {
+                    0x07
+                } else {
+                    0
+                }
+            }
+            0x39 => 0,
+            0x3A => self.key_flag as u32,
             _ => 0,
         };
         trace!(target: "ps2_core::iop::cdvd", addr = format_args!("{addr:#04x}"), value = format_args!("{v:#x}"), "read");
@@ -231,9 +450,12 @@ impl Cdvd {
         match addr & 0x3F {
             0x04 => {
                 self.n_cmd = v as u8;
+                self.n_execute();
+                self.n_params.clear();
                 self.istat |= 3; // command complete + data ready
                 return true;
             }
+            0x05 => self.n_params.push(v as u8),
             0x08 => self.istat &= !(v as u8),
             0x16 => {
                 self.s_cmd = v as u8;
@@ -701,9 +923,12 @@ pub struct Bus {
     pub iop_dicr2: u32,
     pub iop_dma_sio2in: IopDmaChannel,
     pub iop_dma_sio2out: IopDmaChannel,
+    pub iop_dma_cdvd: IopDmaChannel,
     /// DMA ch12 armed before the SIO2 transfer produced its response; the
     /// copy runs when the transfer executes (hardware waits on DRQ).
     sio2out_deferred: bool,
+    /// DMA ch3 armed before the CDVD read staged its sectors.
+    cdvd_dma_deferred: bool,
     pub cdvd: Cdvd,
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
@@ -767,7 +992,9 @@ impl Bus {
             iop_dicr2: 0,
             iop_dma_sio2in: IopDmaChannel::default(),
             iop_dma_sio2out: IopDmaChannel::default(),
+            iop_dma_cdvd: IopDmaChannel::default(),
             sio2out_deferred: false,
+            cdvd_dma_deferred: false,
             cdvd: Cdvd::default(),
             sio2: Sio2::default(),
             now: 0,
@@ -1569,6 +1796,22 @@ impl Bus {
         ((bcr & 0xFFFF).max(1) as usize) * ((bcr >> 16).max(1) as usize) * 4
     }
 
+    /// Drain staged CDVD sector data into RAM for DMA ch3.
+    fn do_cdvd_dma(&mut self) {
+        let bytes = Self::iop_bcr_bytes(self.iop_dma_cdvd.bcr);
+        let start = (self.iop_dma_cdvd.madr & 0x1F_FFFF) as usize;
+        let len = self.iop_ram.len();
+        let mut chunk = vec![0u8; bytes];
+        self.cdvd.dma_read(&mut chunk);
+        for (i, b) in chunk.into_iter().enumerate() {
+            self.iop_ram[(start + i) % len] = b;
+        }
+        debug!(target: "ps2_core::iop::cdvd", bytes,
+            madr = format_args!("{:#x}", self.iop_dma_cdvd.madr),
+            "DMA ch3");
+        self.iop_dma_irq(3);
+    }
+
     /// Drain the SIO2 out-FIFO into RAM for DMA ch12.
     fn do_sio2_out(&mut self) {
         let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2out.bcr);
@@ -1980,6 +2223,10 @@ impl Bus {
                 if self.cdvd.write(addr, v) {
                     // N command completion interrupts the IOP (CDVD line).
                     self.iop_i_stat |= 1 << 2;
+                    if self.cdvd_dma_deferred && self.cdvd.read_remaining() > 0 {
+                        self.cdvd_dma_deferred = false;
+                        self.do_cdvd_dma();
+                    }
                 }
             }
             0x1F90_0000..=0x1F90_0FFF => {
@@ -2037,6 +2284,9 @@ impl Bus {
                 self.iop_i_ctrl &= !1;
                 v
             }
+            0x1F80_10B0 => self.iop_dma_cdvd.madr,
+            0x1F80_10B4 => self.iop_dma_cdvd.bcr,
+            0x1F80_10B8 => self.iop_dma_cdvd.chcr,
             // IOP DMA: SIF0 (ch9) and SIF1 (ch10), interrupt control.
             0x1F80_1520 => self.iop_dma_sif0.madr,
             0x1F80_1524 => self.iop_dma_sif0.bcr,
@@ -2097,6 +2347,21 @@ impl Bus {
             0x1F80_1070 => self.iop_i_stat &= v,
             0x1F80_1074 => self.iop_i_mask = v,
             0x1F80_1078 => self.iop_i_ctrl = v,
+            // CDVD DMA (ch3): drain staged sector data into IOP RAM. The
+            // channel is usually armed before the N read command (hardware
+            // paces it with DRQ), so hold the copy until data is staged.
+            0x1F80_10B0 => self.iop_dma_cdvd.madr = v & 0xFF_FFFF,
+            0x1F80_10B4 => self.iop_dma_cdvd.bcr = v,
+            0x1F80_10B8 => {
+                self.iop_dma_cdvd.chcr = v & !IOP_CHCR_BUSY;
+                if v & IOP_CHCR_BUSY != 0 {
+                    if self.cdvd.read_remaining() == 0 {
+                        self.cdvd_dma_deferred = true;
+                    } else {
+                        self.do_cdvd_dma();
+                    }
+                }
+            }
             // SPU2 DMA (ch4 = core 0, ch7 = core 1): no SPU RAM yet, so a
             // kicked transfer completes instantly and only the interrupt
             // matters — libsd blocks on it after every 1 KiB chunk.
