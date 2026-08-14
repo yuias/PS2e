@@ -90,6 +90,11 @@ pub struct Cdvd {
     key: [u8; 15],
     key_flag: u8,
     key_valid: bool,
+    /// DEC-SET (reg 0x3A, written by cdvdman): drive-side decryption of
+    /// DMA'd sector data. Bit 0 = XOR with key[4], bit 1 = rotate right
+    /// by bits 4-6. The PS2 logo area (lsn 0-11) is stored encrypted and
+    /// PS2LOGO refuses to boot the game unless the read decrypts it.
+    dec_set: u8,
 }
 
 /// ISO sector payload size; DVD reads wrap it in a 2064-byte raw sector.
@@ -147,6 +152,18 @@ impl Cdvd {
                         self.read_buf.extend_from_slice(&[0; 4]);
                     } else {
                         self.read_buf.extend_from_slice(&data);
+                    }
+                }
+                if self.dec_set != 0 {
+                    let shift = (self.dec_set >> 4) & 7;
+                    let key4 = self.key[4];
+                    for b in &mut self.read_buf {
+                        if self.dec_set & 1 != 0 {
+                            *b ^= key4;
+                        }
+                        if self.dec_set & 2 != 0 {
+                            *b = b.rotate_right(shift.into());
+                        }
                     }
                 }
             }
@@ -465,6 +482,10 @@ impl Cdvd {
                 self.s_params.clear();
             }
             0x17 => self.s_params.push(v as u8),
+            0x3A => {
+                debug!(target: "ps2_core::iop::cdvd", value = format_args!("{v:#04x}"), "DEC-SET");
+                self.dec_set = v as u8;
+            }
             _ => {}
         }
         false
