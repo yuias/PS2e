@@ -71,12 +71,50 @@ pub struct Cdvd {
     s_params: Vec<u8>,
     s_results: Vec<u8>,
     s_result_pos: usize,
+    /// Config session state (S 0x40 open .. 0x43 close): blocks left to
+    /// serve and the cursor into the synthesized OSD config.
+    config_blocks_left: u8,
+    config_pos: usize,
+    /// True when the open selected the OSD's area (wire triple [0, 1, n]).
+    config_is_osd: bool,
+}
+
+/// A config block on the wire is 15 data bytes plus their sum mod 256;
+/// CDVDMAN verifies the sum and rejects the block before the OSD sees it.
+fn config_block(data: [u8; 15]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..15].copy_from_slice(&data);
+    b[15] = data.iter().fold(0u8, |s, &x| s.wrapping_add(x));
+    b
+}
+
+/// The OSD's config: open(1, 0, 2), i.e. two 15-byte blocks. Block 0 is
+/// passed through uninterpreted; block 1 carries the bit fields. The top
+/// three bits of block 1 byte +0 must be non-zero for the 5-bit language
+/// index in byte +1 to be honoured at all, and that index subscripts an
+/// 8-entry table with NO bounds check — out of range means the OSD holds a
+/// null string table and silently draws nothing.
+fn osd_config_blocks() -> [[u8; 16]; 2] {
+    let block0 = [0u8; 15];
+    let mut block1 = [0u8; 15];
+    block1[0] = 0x20; // generation marker: language index in +1 is live
+    block1[1] = 1; // language: English (0-7 only)
+    // Timezone +540 minutes (JST): 11 bits, low 8 in +3, high 3 in +2.
+    // Byte +2 bit 7 is the "configured" flag: the decoder returns its
+    // inverse, and the OSD runs first-boot setup while that is non-zero.
+    block1[3] = 0x1C;
+    block1[2] = 0x82;
+    [config_block(block0), config_block(block1)]
 }
 
 impl Cdvd {
     /// Execute an S command; fills the result FIFO.
     fn s_execute(&mut self) {
         let cmd = self.s_cmd;
+        debug!(target: "ps2_core::iop::cdvd",
+            cmd = format_args!("{cmd:#04x}"),
+            params = format_args!("{:02x?}", self.s_params),
+            "S command");
         self.s_results.clear();
         self.s_result_pos = 0;
         match cmd {
@@ -86,12 +124,49 @@ impl Cdvd {
                 .extend_from_slice(&[0, 0, 0, 0, 0, 1, 1, 0x25]),
             // Forbid/permit DVD player: canonical result is 5.
             0x15 | 0x16 => self.s_results.push(5),
-            // OpenConfig/WriteConfig/CloseConfig: plain OK.
-            0x40 | 0x42 | 0x43 => self.s_results.push(0),
-            // ReadConfig: one 15-byte block of zeroes. (A fabricated
-            // "already configured" block was tried and made the OSD draw
-            // nothing at all — real NVRAM content semantics still unknown.)
-            0x41 => self.s_results.extend_from_slice(&[0; 15]),
+            // OpenConfig: params are [b, a, count]; the count is the
+            // session's only state. The OSD opens (1, 0, 2) for its config.
+            0x40 => {
+                self.config_blocks_left = self.s_params.get(2).copied().unwrap_or(0);
+                self.config_pos = 0;
+                self.config_is_osd =
+                    self.s_params.first() == Some(&0) && self.s_params.get(1) == Some(&1);
+                self.s_results.push(0);
+            }
+            // ReadConfig: one 16-byte block (15 data + sum) per call. The
+            // OSD's area gets the synthesized "configured" blocks; any other
+            // area reads as zeroes (an all-zero block checksums correctly).
+            0x41 => {
+                let osd = osd_config_blocks();
+                let block = if self.config_is_osd {
+                    osd.get(self.config_pos).copied().unwrap_or([0; 16])
+                } else {
+                    [0; 16]
+                };
+                if self.config_blocks_left > 0 {
+                    self.config_blocks_left -= 1;
+                    self.config_pos += 1;
+                }
+                self.s_results.extend_from_slice(&block);
+            }
+            // WriteConfig: accept and discard the 16-byte block.
+            0x42 => {
+                if self.config_blocks_left > 0 {
+                    self.config_blocks_left -= 1;
+                    self.config_pos += 1;
+                }
+                self.s_results.push(0);
+            }
+            // CloseConfig: ends the session.
+            0x43 => {
+                self.config_blocks_left = 0;
+                self.config_pos = 0;
+                self.s_results.push(0);
+            }
+            // ReadNVM: big-endian [status, data_hi, data_lo]; empty NVRAM.
+            0x0A => self.s_results.extend_from_slice(&[0, 0, 0]),
+            // WriteNVM: accepted.
+            0x0B => self.s_results.push(0),
             // BootCertify: accepted.
             0x1A => self.s_results.push(1),
             // Mecacon version: stat + version bytes.
