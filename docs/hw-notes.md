@@ -232,17 +232,38 @@ returned status has bit 0x01 or 0x80 set.
   0-15 map to vi, 16 status, 17 mac, 18 clip, 20 R, 21 I, 22 Q;
   VPU-STAT (29) must read 0 ("never busy").
 
-## OSD browser render pipeline (open issue)
+## OSD browser render pipeline
 
 The browser scene is a feedback compositor: orbs and a full-res copy
-of the previous screen accumulate in a half-buffer (FBP 0xD2), a
+of the previous screen accumulate in a feedback buffer (FBP 0xD2), a
 full-screen sprite composites it back modulated by the background
 tint, cloud strips (MODULATE of a 128x128 noise texture) draw over
-it, and 2-3 downsample/upsample sprite passes through FBP 0x118 blur
-the result. All passes run and write plausible values per-pixel, but
-the final frame stays ~20x too dim compared to hardware (fade overlay
-constant at A=0x1E, most content ending near black). Unresolved.
-Z-buffer interaction is ruled out (forcing the depth test off changes
-nothing); remaining suspects are blend/alpha precision in the
-feedback loop and the scene possibly holding a "checking devices"
-wait state.
+it, and echo/zoom sprite passes through FBP 0x118 smear the result.
+The clouds and the half-res downsample only run during the entry
+transition; the steady state is the decayed feedback plus the orb
+trail. With no disc and no memory cards the browser shows NO items,
+so the near-black result is (close to) the authentic empty-browser
+look — System Configuration renders its full 3D tower scene through
+the same stack, which rules out a pipeline defect. Z-test was also
+ruled out explicitly (forcing it off changes nothing).
+
+## IOP load-delay pipeline (the "SCP" bug)
+
+cdvdman copies S-command results with back-to-back `lwl`/`lwr` pairs.
+The hardware forwards an in-flight (delay-slot) load to a following
+lwl/lwr on the same register; an emulator that commits or hides the
+pending load before executing the next instruction makes the second
+half of the pair merge with the stale register value and silently
+zeroes one byte per word. Symptom that found it: the OSD's Version
+Information screen showed the console model as "SCP" — the model
+string crossed the SIF as "SCP\0-50\0 00\0\0" (every 4th byte lost).
+Any unaligned IOP memcpy hits the same path.
+
+Related: this BIOS's Version screen reads the model via S command
+0x17 (sceCdReadModelNumber): param = byte offset, result = [stat,
+8 model chars], two calls (offsets 0 and 8). This cdvdman revision
+also has an interrupt-driven S-command engine (a mailbox at ~0x3D81D
++ completion flag polled with DelayThread) and a register-window
+result path (banks 0x2020-0x2034 XOR-obfuscated with 0x2039, valid
+bits in 0x2038) that our FIFO-only model never triggers — worth
+knowing if some path stops getting results.
