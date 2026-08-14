@@ -391,10 +391,12 @@ impl Cdvd {
             0x05 => 0x40,
             0x06 => 0, // error
             0x08 => self.istat as u32,
-            // Drive status: spinning with a disc, stopped without.
+            // Drive status: paused-on-disc when idle, stopped without a
+            // disc. cdvdman's sceCdDiskReady waits for exactly 0x0A
+            // (PAUSE); reporting SPIN forever stalls EELOAD's game boot.
             0x0A => {
                 if self.disc.is_some() {
-                    2
+                    0x0A
                 } else {
                     0
                 }
