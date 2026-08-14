@@ -113,6 +113,8 @@ pub struct Gs {
     /// Statistics for bring-up logging.
     pub prims_drawn: u64,
     pub prims_textured: u64,
+    /// Texture samples per TEX0 PSM, for bring-up logging.
+    pub tex_psm_hist: [u64; 64],
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
 }
@@ -165,6 +167,7 @@ impl Gs {
             intc_pending: false,
             prims_drawn: 0,
             prims_textured: 0,
+            tex_psm_hist: [0; 64],
             warned_regs: [0; 4],
         }
     }
@@ -294,6 +297,18 @@ impl Gs {
                 self.trx_x = 0;
                 self.trx_y = 0;
                 self.trx24_len = 0;
+                debug!(target: "ps2_core::gs",
+                    dir = v & 3,
+                    sbp = self.bitbltbuf & 0x3FFF,
+                    spsm = format_args!("{:#04x}", (self.bitbltbuf >> 24) & 0x3F),
+                    dbp = (self.bitbltbuf >> 32) & 0x3FFF,
+                    dbw = (self.bitbltbuf >> 48) & 0x3F,
+                    dpsm = format_args!("{:#04x}", (self.bitbltbuf >> 56) & 0x3F),
+                    dsax = (self.trxpos >> 32) & 0x7FF,
+                    dsay = (self.trxpos >> 48) & 0x7FF,
+                    rrw = self.trxreg & 0xFFF,
+                    rrh = (self.trxreg >> 32) & 0xFFF,
+                    "TRXDIR");
                 if v & 3 == 2 {
                     self.local_copy();
                 }

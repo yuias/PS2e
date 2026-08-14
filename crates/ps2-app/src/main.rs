@@ -176,6 +176,16 @@ fn main() -> ExitCode {
         d_mask = format_args!("{:#x}", sys.bus.d_mask),
         "run finished"
     );
+    let psms: Vec<String> = sys
+        .bus
+        .gs
+        .tex_psm_hist
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(psm, n)| format!("{psm:#04x}:{n}"))
+        .collect();
+    tracing::info!(psms = psms.join(" "), "texture samples per PSM");
 
     if let Some(dir) = &args.dump {
         let ee = format!("{dir}/ee_ram.bin");

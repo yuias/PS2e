@@ -173,6 +173,7 @@ impl Gs {
         let mut b = frag.b;
         let mut a = frag.a;
         if attrs & (1 << 4) != 0 {
+            self.tex_psm_hist[((ctx.tex0 >> 20) & 0x3F) as usize] += 1;
             let (tr, tg, tb, ta) = self.sample(ctx, attrs, &frag);
             let tfx = (ctx.tex0 >> 35) & 3;
             let tcc = ctx.tex0 & (1 << 34) != 0;
