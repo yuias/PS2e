@@ -115,6 +115,8 @@ pub struct Gs {
     pub prims_textured: u64,
     /// Texture samples per TEX0 PSM, for bring-up logging.
     pub tex_psm_hist: [u64; 64],
+    /// IMAGE transfer formats already reported as unhandled (bit per PSM).
+    warned_trx_psm: u64,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
 }
@@ -168,6 +170,7 @@ impl Gs {
             prims_drawn: 0,
             prims_textured: 0,
             tex_psm_hist: [0; 64],
+            warned_trx_psm: 0,
             warned_regs: [0; 4],
         }
     }
@@ -516,8 +519,34 @@ impl Gs {
                 v,
                 4,
             ),
+            // Index-in-upper-bits formats share the 32-bit pixel's storage
+            // and leave its colour bits alone.
+            PSMT8H => push(
+                self,
+                8,
+                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0xFF00_0000)),
+                v,
+                8,
+            ),
+            PSMT4HL => push(
+                self,
+                16,
+                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0x0F00_0000)),
+                v,
+                4,
+            ),
+            PSMT4HH => push(
+                self,
+                16,
+                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 28, 0xF000_0000)),
+                v,
+                4,
+            ),
             _ => {
-                warn!(target: "ps2_core::gs", dpsm = format_args!("{dpsm:#x}"), "unhandled IMAGE transfer format");
+                if self.warned_trx_psm & (1 << dpsm) == 0 {
+                    self.warned_trx_psm |= 1 << dpsm;
+                    warn!(target: "ps2_core::gs", dpsm = format_args!("{dpsm:#x}"), "unhandled IMAGE transfer format (reported once)");
+                }
             }
         }
     }
@@ -578,6 +607,14 @@ impl Gs {
     pub fn write_psmct32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
         let o = Self::word_off(bp, bw, x, y) * 4;
         self.vram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Replace only the `mask` bits of a 32-bit pixel.
+    #[inline]
+    pub fn write_psmct32_bits(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32, mask: u32) {
+        let o = Self::word_off(bp, bw, x, y) * 4;
+        let cur = u32::from_le_bytes(self.vram[o..o + 4].try_into().unwrap());
+        self.vram[o..o + 4].copy_from_slice(&((cur & !mask) | (v & mask)).to_le_bytes());
     }
 
     #[inline]
