@@ -29,7 +29,6 @@ pub const PSMZ16: u32 = 0x32;
 pub const PSMZ16S: u32 = 0x3A;
 
 /// Per-pixel write callback used by IMAGE transfers.
-type PixelWriter = dyn FnMut(&mut Gs, u32, u32, u32);
 
 /// One vertex as accumulated from register writes.
 #[derive(Clone, Copy, Default)]
@@ -483,7 +482,11 @@ impl Gs {
             return;
         }
         // Consume the 64 bits as pixels in raster order.
-        let push = |gs: &mut Gs, count: u32, mut write: Box<PixelWriter>, data: u64, bits: u32| {
+        fn push(gs: &mut Gs, count: u32, mut write: impl FnMut(&mut Gs, u32, u32, u32), data: u64, bits: u32) {
+            let dsax = ((gs.trxpos >> 32) & 0x7FF) as u32;
+            let dsay = ((gs.trxpos >> 48) & 0x7FF) as u32;
+            let rrw = (gs.trxreg & 0xFFF) as u32;
+            let rrh = ((gs.trxreg >> 32) & 0xFFF) as u32;
             for i in 0..count {
                 if gs.trx_y >= rrh {
                     return;
@@ -496,12 +499,12 @@ impl Gs {
                     gs.trx_y += 1;
                 }
             }
-        };
+        }
         match dpsm {
             PSMCT32 | PSMZ32 => push(
                 self,
                 2,
-                Box::new(move |gs, x, y, px| gs.write_psmct32(dbp, dbw, x, y, px)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct32(dbp, dbw, x, y, px),
                 v,
                 32,
             ),
@@ -532,21 +535,21 @@ impl Gs {
             PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => push(
                 self,
                 4,
-                Box::new(move |gs, x, y, px| gs.write_psmct16(dbp, dbw, x, y, px as u16)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct16(dbp, dbw, x, y, px as u16),
                 v,
                 16,
             ),
             PSMT8 => push(
                 self,
                 8,
-                Box::new(move |gs, x, y, px| gs.write_psmt8(dbp, dbw, x, y, px as u8)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmt8(dbp, dbw, x, y, px as u8),
                 v,
                 8,
             ),
             PSMT4 => push(
                 self,
                 16,
-                Box::new(move |gs, x, y, px| gs.write_psmt4(dbp, dbw, x, y, px as u8)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmt4(dbp, dbw, x, y, px as u8),
                 v,
                 4,
             ),
@@ -555,21 +558,21 @@ impl Gs {
             PSMT8H => push(
                 self,
                 8,
-                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0xFF00_0000)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0xFF00_0000),
                 v,
                 8,
             ),
             PSMT4HL => push(
                 self,
                 16,
-                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0x0F00_0000)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0x0F00_0000),
                 v,
                 4,
             ),
             PSMT4HH => push(
                 self,
                 16,
-                Box::new(move |gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 28, 0xF000_0000)),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 28, 0xF000_0000),
                 v,
                 4,
             ),

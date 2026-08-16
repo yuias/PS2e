@@ -543,7 +543,8 @@ fn px_clip(v: i32) -> i32 {
 #[inline]
 fn wrap(c: i32, mode: u64, size: i32, min: i32, max: i32) -> i32 {
     match mode {
-        0 => c.rem_euclid(size.max(1)),
+        // Texture sizes are powers of two, so REPEAT is a mask.
+        0 => c & (size - 1),
         1 => c.clamp(0, size - 1),
         2 => c.clamp(min, max.max(min)),
         _ => (c & min) | max,
