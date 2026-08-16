@@ -117,6 +117,8 @@ pub struct Gs {
     pub tex_psm_hist: [u64; 64],
     /// IMAGE transfer formats already reported as unhandled (bit per PSM).
     warned_trx_psm: u64,
+    /// Distinct TEX0 values already logged (bring-up aid; capped).
+    seen_tex0: std::collections::HashSet<u64>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
 }
@@ -171,6 +173,7 @@ impl Gs {
             prims_textured: 0,
             tex_psm_hist: [0; 64],
             warned_trx_psm: 0,
+            seen_tex0: std::collections::HashSet::new(),
             warned_regs: [0; 4],
         }
     }
@@ -253,8 +256,10 @@ impl Gs {
                 let z = (v >> 32) as u32;
                 self.vertex_kick(v, z, reg == 0x05);
             }
-            0x06 => self.ctx[0].tex0 = v,
-            0x07 => self.ctx[1].tex0 = v,
+            0x06 | 0x07 => {
+                self.ctx[(reg - 0x06) as usize].tex0 = v;
+                self.log_tex0(v);
+            }
             0x08 => self.ctx[0].clamp = v,
             0x09 => self.ctx[1].clamp = v,
             0x0A => {} // FOG
@@ -265,6 +270,7 @@ impl Gs {
                 let i = (reg - 0x16) as usize;
                 const MASK: u64 = 0xFFFF_FFE0_03F0_0000;
                 self.ctx[i].tex0 = (self.ctx[i].tex0 & !MASK) | (v & MASK);
+                self.log_tex0(self.ctx[i].tex0);
             }
             0x18 => self.ctx[0].xyoffset = v,
             0x19 => self.ctx[1].xyoffset = v,
@@ -311,6 +317,7 @@ impl Gs {
                     dsay = (self.trxpos >> 48) & 0x7FF,
                     rrw = self.trxreg & 0xFFF,
                     rrh = (self.trxreg >> 32) & 0xFFF,
+                    prims = self.prims_drawn,
                     "TRXDIR");
                 if v & 3 == 2 {
                     self.local_copy();
@@ -432,6 +439,27 @@ impl Gs {
                 self.vq_len = 0;
             }
         }
+    }
+
+    /// Log each distinct TEX0 once (decoded), to see what textures a
+    /// program samples without tracing every primitive.
+    fn log_tex0(&mut self, v: u64) {
+        if self.seen_tex0.len() >= 4096 || !self.seen_tex0.insert(v) {
+            return;
+        }
+        debug!(target: "ps2_core::gs::tex",
+            tbp = v & 0x3FFF,
+            tbw = (v >> 14) & 0x3F,
+            psm = format_args!("{:#04x}", (v >> 20) & 0x3F),
+            tw = 1u32 << ((v >> 26) & 0xF),
+            th = 1u32 << ((v >> 30) & 0xF),
+            tcc = (v >> 34) & 1,
+            tfx = (v >> 35) & 3,
+            cbp = (v >> 37) & 0x3FFF,
+            cpsm = format_args!("{:#04x}", (v >> 51) & 0xF),
+            csm = (v >> 55) & 1,
+            csa = (v >> 56) & 0x1F,
+            "TEX0");
     }
 
     // --- transfers -------------------------------------------------------
