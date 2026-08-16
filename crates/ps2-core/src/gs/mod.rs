@@ -119,6 +119,8 @@ pub struct Gs {
     warned_trx_psm: u64,
     /// Distinct TEX0 values already logged (bring-up aid; capped).
     seen_tex0: std::collections::HashSet<u64>,
+    /// Render-target setups already logged, with how many prims were shown.
+    seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
 }
@@ -174,6 +176,7 @@ impl Gs {
             tex_psm_hist: [0; 64],
             warned_trx_psm: 0,
             seen_tex0: std::collections::HashSet::new(),
+            seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
         }
     }

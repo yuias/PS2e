@@ -37,6 +37,62 @@ impl Gs {
         self.prims_drawn += 1;
     }
 
+    /// Bring-up aid: describe each distinct render-target setup once.
+    fn log_target(&mut self, attrs: u64, kind: &str, n: usize) {
+        let ctx = self.ctx[((attrs >> 9) & 1) as usize];
+        let key = ctx.frame ^ ctx.zbuf.rotate_left(13) ^ ctx.test.rotate_left(29) ^ ctx.scissor.rotate_left(43) ^ 0x5A5A;
+        if self.seen_targets.len() >= 4096 && !self.seen_targets.contains_key(&key) {
+            return;
+        }
+        let count = self.seen_targets.entry(key).or_insert(0);
+        if *count >= 4 {
+            return;
+        }
+        *count += 1;
+        let xy = |v: &Vertex| format!("({},{},z={:#x})", v.x as f32 / 16.0, v.y as f32 / 16.0, v.z);
+        let verts: Vec<String> = self.vq[..n].iter().map(xy).collect();
+        tracing::debug!(target: "ps2_core::gs::target",
+            kind,
+            verts = verts.join(" "),
+            prim = format_args!("{:#x}", attrs),
+            tex0 = format_args!("{:#x}", ctx.tex0),
+            fbp = (ctx.frame & 0x1FF) * 32,
+            fbw = (ctx.frame >> 16) & 0x3F,
+            fpsm = format_args!("{:#04x}", (ctx.frame >> 24) & 0x3F),
+            fbmsk = format_args!("{:#010x}", ctx.frame >> 32),
+            zbp = (ctx.zbuf & 0x1FF) * 32,
+            zpsm = format_args!("{:#04x}", (ctx.zbuf >> 24) & 0xF),
+            zmsk = (ctx.zbuf >> 32) & 1,
+            test = format_args!("{:#x}", ctx.test),
+            scissor = format_args!("{}..{} x {}..{}", ctx.scissor & 0x7FF, (ctx.scissor >> 16) & 0x7FF, (ctx.scissor >> 32) & 0x7FF, (ctx.scissor >> 48) & 0x7FF),
+            xyoff = format_args!("{},{}", (ctx.xyoffset & 0xFFFF) >> 4, ((ctx.xyoffset >> 32) & 0xFFFF) >> 4),
+            "render target");
+    }
+
+    /// Bring-up aid: describe small primitives (particles, glyphs) once per
+    /// distinct texture/blend setup.
+    fn log_small_prim(&mut self, kind: &str, attrs: u64, w: i32, h: i32, v0: &Vertex, v1: &Vertex) {
+        let ctx = self.ctx[((attrs >> 9) & 1) as usize];
+        let key = ctx.tex0 ^ (attrs << 1) ^ ctx.alpha.rotate_left(17) ^ ctx.test.rotate_left(40);
+        if self.seen_tex0.len() >= 4096 || !self.seen_tex0.insert(key) {
+            return;
+        }
+        tracing::debug!(target: "ps2_core::gs::small",
+            kind, w, h,
+            tme = (attrs >> 4) & 1,
+            abe = (attrs >> 6) & 1,
+            fst = (attrs >> 8) & 1,
+            tex0 = format_args!("{:#018x}", ctx.tex0),
+            alpha = format_args!("{:#x}", ctx.alpha),
+            test = format_args!("{:#x}", ctx.test),
+            rgba0 = format_args!("{},{},{},{}", v0.r, v0.g, v0.b, v0.a),
+            rgba1 = format_args!("{},{},{},{}", v1.r, v1.g, v1.b, v1.a),
+            uv0 = format_args!("{},{}", v0.u as f32 / 16.0, v0.v as f32 / 16.0),
+            uv1 = format_args!("{},{}", v1.u as f32 / 16.0, v1.v as f32 / 16.0),
+            st0 = format_args!("{},{},{}", v0.s, v0.t, v0.q),
+            "small prim");
+    }
+
     pub(super) fn draw_sprite(&mut self) {
         let v0 = self.vq[0];
         let v1 = self.vq[1];
@@ -53,8 +109,12 @@ impl Gs {
         if tme {
             self.prims_textured += 1;
         }
+        self.log_target(attrs, "sprite", 2);
         let wid = (x1 - x0).max(1) as f32;
         let hei = (y1 - y0).max(1) as f32;
+        if px1 - px0 <= 24 && py1 - py0 <= 24 {
+            self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
+        }
         for py in py0..px_clip(py1) {
             for px in px0..px_clip(px1) {
                 // Interpolate texture coords across the rectangle; color is
@@ -105,6 +165,7 @@ impl Gs {
         if attrs & (1 << 4) != 0 {
             self.prims_textured += 1;
         }
+        self.log_target(attrs, "triangle", 3);
         // 12.4 edge functions; area in 8.8.
         let area = edge(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
         if area == 0 {
@@ -119,6 +180,9 @@ impl Gs {
         let maxx = ((a.x.max(b.x).max(c.x) + 15) >> 4).min(2047);
         let miny = (a.y.min(b.y).min(c.y) >> 4).max(0);
         let maxy = ((a.y.max(b.y).max(c.y) + 15) >> 4).min(2047);
+        if maxx - minx <= 24 && maxy - miny <= 24 {
+            self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
+        }
         let inv_area = 1.0 / area as f32;
         for py in miny..=maxy {
             for px in minx..=maxx {
@@ -270,6 +334,7 @@ impl Gs {
         let psm = ((ctx.frame >> 24) & 0x3F) as u32;
         let fbmsk = (ctx.frame >> 32) as u32;
         let dst = self.read_psmct32(fbp, fbw, x, y);
+
         let (dr, dg, db, da) = (
             (dst & 0xFF) as f32,
             ((dst >> 8) & 0xFF) as f32,
