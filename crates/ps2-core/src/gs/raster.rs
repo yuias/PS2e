@@ -384,61 +384,63 @@ impl Gs {
 
     /// Nearest-neighbour texture sample.
     fn sample(&self, ctx: Context, attrs: u64, frag: &Frag) -> (f32, f32, f32, f32) {
-        let tex0 = ctx.tex0;
-        let tw = 1u32 << ((tex0 >> 26) & 0xF).min(10);
-        let th = 1u32 << ((tex0 >> 30) & 0xF).min(10);
+        let ti = TexInfo::new(&ctx, self.texa);
 
         // FST: UV addressing vs STQ. Texel-space coordinates, fractional.
         let (fu, fv) = if attrs & (1 << 8) != 0 {
             (frag.u, frag.v)
         } else {
             let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
-            (frag.s / q * tw as f32, frag.t / q * th as f32)
+            (frag.s / q * ti.tw as f32, frag.t / q * ti.th as f32)
         };
 
         // TEX1 MMAG selects the magnification filter; minification and
         // mipmaps are not modelled, so it decides for every sample.
-        if (ctx.tex1 >> 5) & 1 == 0 {
-            return self.texel(ctx, fu.floor() as i32, fv.floor() as i32);
-        }
-        let x = fu - 0.5;
-        let y = fv - 0.5;
-        let (x0, y0) = (x.floor(), y.floor());
-        let (fx, fy) = (x - x0, y - y0);
-        let (x0, y0) = (x0 as i32, y0 as i32);
-        let t00 = self.texel(ctx, x0, y0);
-        let t10 = self.texel(ctx, x0 + 1, y0);
-        let t01 = self.texel(ctx, x0, y0 + 1);
-        let t11 = self.texel(ctx, x0 + 1, y0 + 1);
-        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-        let mix = |c: fn(&(f32, f32, f32, f32)) -> f32| {
-            lerp(lerp(c(&t00), c(&t10), fx), lerp(c(&t01), c(&t11), fx), fy)
+        let texel = if (ctx.tex1 >> 5) & 1 == 0 {
+            self.texel(&ti, fu.floor() as i32, fv.floor() as i32)
+        } else {
+            let x = fu - 0.5;
+            let y = fv - 0.5;
+            let (x0, y0) = (x.floor(), y.floor());
+            // Weights in 1/256; exact texel centres skip the blend.
+            let fx = ((x - x0) * 256.0) as u32;
+            let fy = ((y - y0) * 256.0) as u32;
+            let (x0, y0) = (x0 as i32, y0 as i32);
+            if fx == 0 && fy == 0 {
+                self.texel(&ti, x0, y0)
+            } else {
+                let t00 = self.texel(&ti, x0, y0);
+                let t10 = self.texel(&ti, x0 + 1, y0);
+                let t01 = self.texel(&ti, x0, y0 + 1);
+                let t11 = self.texel(&ti, x0 + 1, y0 + 1);
+                let mut out = 0u32;
+                for shift in [0, 8, 16, 24] {
+                    let c = |t: u32| (t >> shift) & 0xFF;
+                    let top = c(t00) * (256 - fx) + c(t10) * fx;
+                    let bottom = c(t01) * (256 - fx) + c(t11) * fx;
+                    let v = (top * (256 - fy) + bottom * fy) >> 16;
+                    out |= v << shift;
+                }
+                out
+            }
         };
-        (mix(|t| t.0), mix(|t| t.1), mix(|t| t.2), mix(|t| t.3))
+        (
+            (texel & 0xFF) as f32,
+            ((texel >> 8) & 0xFF) as f32,
+            ((texel >> 16) & 0xFF) as f32,
+            (texel >> 24) as f32,
+        )
     }
 
-    /// One texel at integer texel coordinates, after CLAMP wrapping.
-    fn texel(&self, ctx: Context, u: i32, v: i32) -> (f32, f32, f32, f32) {
-        let tex0 = ctx.tex0;
-        let tbp = (tex0 & 0x3FFF) as u32;
-        let tbw = ((tex0 >> 14) & 0x3F) as u32;
-        let psm = ((tex0 >> 20) & 0x3F) as u32;
-        let tw = 1u32 << ((tex0 >> 26) & 0xF).min(10);
-        let th = 1u32 << ((tex0 >> 30) & 0xF).min(10);
-
-        // CLAMP register: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat.
-        let wms = ctx.clamp & 3;
-        let wmt = (ctx.clamp >> 2) & 3;
-        let minu = ((ctx.clamp >> 4) & 0x3FF) as i32;
-        let maxu = ((ctx.clamp >> 14) & 0x3FF) as i32;
-        let minv = ((ctx.clamp >> 24) & 0x3FF) as i32;
-        let maxv = ((ctx.clamp >> 34) & 0x3FF) as i32;
-        let u = wrap(u, wms, tw as i32, minu, maxu) as u32;
-        let v = wrap(v, wmt, th as i32, minv, maxv) as u32;
-
-        let texel = match psm {
-            PSMCT32 | PSMCT24 => self.read_psmct32(tbp, tbw, u, v),
-            PSMCT16 | PSMCT16S => expand16(self.read_psmct16(tbp, tbw, u, v), self.texa),
+    /// One RGBA8 texel at integer texel coordinates, after CLAMP wrapping.
+    fn texel(&self, ti: &TexInfo, u: i32, v: i32) -> u32 {
+        let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
+        let v = wrap(v, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
+        let (tbp, tbw, tex0) = (ti.tbp, ti.tbw, ti.tex0);
+        match ti.psm {
+            PSMCT32 => self.read_psmct32(tbp, tbw, u, v),
+            PSMCT24 => (self.read_psmct32(tbp, tbw, u, v) & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
+            PSMCT16 | PSMCT16S => expand16(self.read_psmct16(tbp, tbw, u, v), ti.texa),
             PSMT8 => {
                 let idx = self.read_psmt8(tbp, tbw, u, v);
                 self.clut_lookup(tex0, idx as u32, true)
@@ -460,17 +462,7 @@ impl Gs {
                 self.clut_lookup(tex0, idx, false)
             }
             _ => 0xFF00_FFFF,
-        };
-        let mut ta = ((texel >> 24) & 0xFF) as f32;
-        if psm == PSMCT24 {
-            ta = (self.texa & 0xFF) as f32;
         }
-        (
-            (texel & 0xFF) as f32,
-            ((texel >> 8) & 0xFF) as f32,
-            ((texel >> 16) & 0xFF) as f32,
-            ta,
-        )
     }
 
     /// Look a palette index up through the CLUT buffer.
@@ -495,6 +487,45 @@ impl Gs {
             self.read_psmct32(cbp, 1, x, y)
         } else {
             expand16(self.read_psmct16(cbp, 1, x, y), self.texa)
+        }
+    }
+}
+
+/// TEX0/CLAMP fields decoded once per sample.
+struct TexInfo {
+    tex0: u64,
+    tbp: u32,
+    tbw: u32,
+    psm: u32,
+    tw: u32,
+    th: u32,
+    wms: u64,
+    wmt: u64,
+    minu: i32,
+    maxu: i32,
+    minv: i32,
+    maxv: i32,
+    texa: u64,
+}
+
+impl TexInfo {
+    fn new(ctx: &Context, texa: u64) -> Self {
+        let tex0 = ctx.tex0;
+        // CLAMP register: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat.
+        Self {
+            tex0,
+            tbp: (tex0 & 0x3FFF) as u32,
+            tbw: ((tex0 >> 14) & 0x3F) as u32,
+            psm: ((tex0 >> 20) & 0x3F) as u32,
+            tw: 1u32 << ((tex0 >> 26) & 0xF).min(10),
+            th: 1u32 << ((tex0 >> 30) & 0xF).min(10),
+            wms: ctx.clamp & 3,
+            wmt: (ctx.clamp >> 2) & 3,
+            minu: ((ctx.clamp >> 4) & 0x3FF) as i32,
+            maxu: ((ctx.clamp >> 14) & 0x3FF) as i32,
+            minv: ((ctx.clamp >> 24) & 0x3FF) as i32,
+            maxv: ((ctx.clamp >> 34) & 0x3FF) as i32,
+            texa,
         }
     }
 }

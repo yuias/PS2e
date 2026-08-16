@@ -33,6 +33,8 @@ pub struct Ps2System {
     pub bus: Bus,
     /// Total elapsed EE cycles since reset.
     pub cycles: u64,
+    /// Position within the current video frame, in EE cycles.
+    frame_pos: u64,
 }
 
 impl Ps2System {
@@ -50,6 +52,7 @@ impl Ps2System {
             iop: iop::Cpu::new(),
             bus: Bus::new(bios),
             cycles: 0,
+            frame_pos: 0,
         })
     }
 
@@ -65,11 +68,15 @@ impl Ps2System {
         if self.cycles.is_multiple_of(64) {
             self.bus.tick_timers();
         }
-        let frame_pos = self.cycles % EE_CYCLES_PER_FRAME;
-        if frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
+        // Counted rather than derived with `%`: this runs per instruction.
+        if self.frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
             self.bus.vblank(true);
-        } else if frame_pos == 0 && self.cycles != 0 {
+        } else if self.frame_pos == 0 && self.cycles != 0 {
             self.bus.vblank(false);
+        }
+        self.frame_pos += 1;
+        if self.frame_pos == EE_CYCLES_PER_FRAME {
+            self.frame_pos = 0;
         }
         self.cycles += 1;
     }
