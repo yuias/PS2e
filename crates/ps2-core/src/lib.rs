@@ -10,6 +10,7 @@ pub mod gif;
 pub mod gs;
 pub mod iop;
 pub mod sif;
+pub mod spu2;
 pub mod timers;
 pub mod vif;
 pub mod vu1;

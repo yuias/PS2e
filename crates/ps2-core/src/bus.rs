@@ -7,6 +7,7 @@
 use crate::gif::Gif;
 use crate::gs::Gs;
 use crate::sif::Sif;
+use crate::spu2::Spu2;
 use crate::timers::Timers;
 use crate::vif::Vif;
 use crate::vu1::Vu1;
@@ -915,10 +916,9 @@ pub struct Bus {
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
     pub iop_spad: Box<[u8]>,
-    /// SPU2 register shadow (0x1F900000..0x1F901000). No sound yet: writes
-    /// stick so libsd's read-modify-write sequences behave; STATX always
-    /// reads ready.
-    spu2: Box<[u8]>,
+    pub spu2: Spu2,
+    /// IOP DMA ch4 (SPU2 core 0) and ch7 (core 1).
+    pub iop_dma_spu: [IopDmaChannel; 2],
     /// Shadow storage for IOP MMIO (0x1F801000..0x1F810000), same idea as
     /// the EE shadow.
     iop_mmio: Box<[u8]>,
@@ -995,7 +995,8 @@ impl Bus {
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
-            spu2: vec![0u8; 0x1000].into_boxed_slice(),
+            spu2: Spu2::new(),
+            iop_dma_spu: Default::default(),
             iop_mmio: vec![0u8; 0x10000].into_boxed_slice(),
             iop_i_stat: 0,
             iop_i_mask: 0,
@@ -1554,6 +1555,12 @@ impl Bus {
                 i += 1;
             }
         }
+        for (core, done) in self.spu2.tick(self.now).into_iter().enumerate() {
+            if done {
+                self.iop_dma_spu[core].chcr &= !IOP_CHCR_BUSY;
+                self.iop_dma_irq(if core == 0 { 4 } else { 7 });
+            }
+        }
         self.intc_stat |= self.timers.check_irqs(self.now);
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
@@ -1817,6 +1824,32 @@ impl Bus {
     /// IOP BCR: block size in words (low 16) x block count (high 16).
     fn iop_bcr_bytes(bcr: u32) -> usize {
         ((bcr & 0xFFFF).max(1) as usize) * ((bcr >> 16).max(1) as usize) * 4
+    }
+
+    /// Run a kicked SPU2 DMA (ch4 = core 0, ch7 = core 1) against the SPU2
+    /// model. CHCR bit 0 set = IOP RAM to SPU. The channel stays busy until
+    /// the model's completion time; `tick_timers` retires it.
+    fn do_spu2_dma(&mut self, core: usize) {
+        let ch = &self.iop_dma_spu[core];
+        let bytes = Self::iop_bcr_bytes(ch.bcr);
+        let to_spu = ch.chcr & 1 != 0;
+        let start = (ch.madr & 0x1F_FFFF) as usize;
+        let len = self.iop_ram.len();
+        let mut buf = vec![0u8; bytes];
+        if to_spu {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = self.iop_ram[(start + i) % len];
+            }
+        }
+        self.spu2.dma(core, to_spu, &mut buf, self.now);
+        if !to_spu {
+            for (i, b) in buf.into_iter().enumerate() {
+                self.iop_ram[(start + i) % len] = b;
+            }
+        }
+        if self.spu2.take_irq() {
+            self.iop_i_stat |= 1 << 9;
+        }
     }
 
     /// Drain staged CDVD sector data into RAM for DMA ch3.
@@ -2213,15 +2246,7 @@ impl Bus {
             // ROM1 (DVD player ROM): not present; reads like erased flash so
             // presence/version checks fail instead of "succeeding" with zeros.
             0x1E00_0000..=0x1E3F_FFFF => u32::MAX,
-            0x1F90_0000..=0x1F90_0FFF => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "SPU2 read (shadow)");
-                match addr & 0xFFF {
-                    // Core 0/1 STATX: report transfer-ready so libsd's DMA
-                    // handler doesn't spin on its 16M-iteration timeout.
-                    0x344 | 0x744 => 0x80,
-                    off => read_le::<N>(&self.spu2, off as usize) as u32,
-                }
-            }
+            0x1F90_0000..=0x1F90_0FFF => self.spu2.read::<N>((addr & 0xFFF) as usize),
             0x1FC0_0000..=0x1FFF_FFFF => {
                 read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize) as u32
             }
@@ -2267,8 +2292,10 @@ impl Bus {
                 }
             }
             0x1F90_0000..=0x1F90_0FFF => {
-                trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "SPU2 write (shadow)");
-                write_le::<N>(&mut self.spu2, (addr & 0xFFF) as usize, v as u64);
+                self.spu2.write::<N>((addr & 0xFFF) as usize, v);
+                if self.spu2.take_irq() {
+                    self.iop_i_stat |= 1 << 9;
+                }
             }
             0x1FC0_0000..=0x1FFF_FFFF => {
                 warn!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), "IOP write to BIOS ROM ignored");
@@ -2339,6 +2366,17 @@ impl Bus {
             0x1F80_1550 => self.iop_dma_sio2out.madr,
             0x1F80_1554 => self.iop_dma_sio2out.bcr,
             0x1F80_1558 => self.iop_dma_sio2out.chcr,
+            // SPU2 channels get sub-word accesses (libspu2 writes BCR's
+            // block count with a halfword store at +2).
+            0x1F80_10C0..=0x1F80_10CB | 0x1F80_1500..=0x1F80_150B => {
+                let ch = &self.iop_dma_spu[usize::from(addr >= 0x1F80_1500)];
+                let reg = match addr & 0xC {
+                    0x0 => ch.madr,
+                    0x4 => ch.bcr,
+                    _ => ch.chcr,
+                };
+                extract_sub_word::<N>(reg, addr)
+            }
             0x1F80_10F4 => self.iop_dicr,
             0x1F80_1574 => self.iop_dicr2,
             _ => {
@@ -2399,15 +2437,20 @@ impl Bus {
                     }
                 }
             }
-            // SPU2 DMA (ch4 = core 0, ch7 = core 1): no SPU RAM yet, so a
-            // kicked transfer completes instantly and only the interrupt
-            // matters — libsd blocks on it after every 1 KiB chunk.
-            0x1F80_10C8 | 0x1F80_1508 => {
-                let ch = if addr == 0x1F80_10C8 { 4 } else { 7 };
-                write_le::<4>(&mut self.iop_mmio, (addr & 0xFFFF) as usize, (v & !IOP_CHCR_BUSY) as u64);
-                if v & IOP_CHCR_BUSY != 0 {
-                    debug!(target: "ps2_core::iop::bus", ch, chcr = format_args!("{v:#010x}"), "SPU2 DMA discarded (no SPU RAM yet)");
-                    self.iop_dma_irq(ch);
+            // SPU2 DMA (ch4 = core 0, ch7 = core 1): data moves now, the
+            // completion interrupt fires when the SPU2 model says so.
+            0x1F80_10C0..=0x1F80_10CB | 0x1F80_1500..=0x1F80_150B => {
+                let core = usize::from(addr >= 0x1F80_1500);
+                let ch = &mut self.iop_dma_spu[core];
+                match addr & 0xC {
+                    0x0 => ch.madr = merge_sub_word::<N>(ch.madr, addr, v) & 0xFF_FFFF,
+                    0x4 => ch.bcr = merge_sub_word::<N>(ch.bcr, addr, v),
+                    _ => {
+                        ch.chcr = merge_sub_word::<N>(ch.chcr, addr, v);
+                        if ch.chcr & IOP_CHCR_BUSY != 0 && !self.spu2.dma_busy(core) {
+                            self.do_spu2_dma(core);
+                        }
+                    }
                 }
             }
             0x1F80_1520 => self.iop_dma_sif0.madr = v & 0xFF_FFFF,
@@ -2511,6 +2554,23 @@ fn read_le<const N: usize>(mem: &[u8], offset: usize) -> u64 {
         v |= (mem[offset + i] as u64) << (8 * i);
     }
     v
+}
+
+/// Read `N` bytes of a 32-bit register at the byte lane selected by `addr`.
+#[inline]
+fn extract_sub_word<const N: usize>(reg: u32, addr: u32) -> u32 {
+    let shift = (addr & 3) * 8;
+    let mask = if N >= 4 { u32::MAX } else { (1u32 << (8 * N as u32)) - 1 };
+    (reg >> shift) & mask
+}
+
+/// Merge an `N`-byte write into a 32-bit register at the byte lane selected
+/// by `addr`.
+#[inline]
+fn merge_sub_word<const N: usize>(reg: u32, addr: u32, v: u32) -> u32 {
+    let shift = (addr & 3) * 8;
+    let mask = if N >= 4 { u32::MAX } else { ((1u32 << (8 * N as u32)) - 1) << shift };
+    (reg & !mask) | ((v << shift) & mask)
 }
 
 #[inline]
