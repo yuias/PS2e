@@ -761,3 +761,52 @@ impl Gs {
         (w, h, out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full-screen textured sprite copying one 640x224 buffer into another
+    /// (Amagami's OP does this to build a refraction source).
+    #[test]
+    fn textured_sprite_copies_between_frame_buffers() {
+        let mut gs = Gs::new();
+        for y in 0..224 {
+            for x in 0..640 {
+                gs.write_psmct32(2240, 10, x, y, 0x8060_7080);
+            }
+        }
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 210 | (10 << 16)); // FRAME_1: 6720, fbw 10, PSMCT32
+        gs.write_reg(0x4E, 140 | (1 << 24) | (1 << 32)); // ZBUF_1: 4480, Z24, masked
+        gs.write_reg(0x47, 0x30000); // TEST_1: ZTE, ALWAYS
+        gs.write_reg(0x40, 639 << 16 | 223 << 48); // SCISSOR_1
+        gs.write_reg(0x18, (1728 * 16) | ((1936 * 16) << 32)); // XYOFFSET_1
+        gs.write_reg(0x06, 0x6_2812_88c0); // TEX0_1: 2240, tbw 10, PSMCT24, 1024x256
+        gs.write_reg(0x00, 0x116); // sprite, TME, FST
+        gs.write_reg(0x01, 0x8080_8080); // RGBAQ: unity modulate
+        gs.write_reg(0x03, 0);
+        gs.write_reg(0x05, (1728 * 16) | ((1936 * 16) << 16));
+        gs.write_reg(0x03, (639 * 16 + 8) | ((223 * 16 + 8) << 16));
+        gs.write_reg(0x05, ((1728 + 639) * 16 + 8) | (((1936 + 223) * 16 + 8) << 16));
+        assert_eq!(gs.prims_drawn, 1);
+        assert_eq!(gs.read_psmct32(6720, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
+        assert_eq!(gs.read_psmct32(6720, 10, 0, 0) & 0xFF_FFFF, 0x60_7080);
+
+        // Same copy Z-tested (GEQUAL) at z = 0xFFFFFF against a Z24 buffer
+        // full of garbage upper bytes: a 24-bit compare must pass.
+        for y in 0..224 {
+            for x in 0..640 {
+                gs.write_psmct32(4480, 10, x, y, 0xFF12_3456);
+            }
+        }
+        gs.write_reg(0x4C, 280 | (10 << 16)); // FRAME_1: 8960
+        gs.write_reg(0x47, 0x50000); // TEST_1: ZTE, GEQUAL
+        gs.write_reg(0x03, 0);
+        gs.write_reg(0x05, (1728 * 16) | ((1936 * 16) << 16) | (0xFF_FFFF << 32));
+        gs.write_reg(0x03, (639 * 16 + 8) | ((223 * 16 + 8) << 16));
+        gs.write_reg(0x05, ((1728 + 639) * 16 + 8) | (((1936 + 223) * 16 + 8) << 16) | (0xFF_FFFF << 32));
+        assert_eq!(gs.prims_drawn, 2);
+        assert_eq!(gs.read_psmct32(8960, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
+    }
+}

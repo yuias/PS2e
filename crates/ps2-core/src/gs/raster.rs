@@ -240,19 +240,29 @@ impl Gs {
         let zbp = ((ctx.zbuf & 0x1FF) * 32) as u32;
         let zmsk = ctx.zbuf & (1 << 32) != 0;
         let fbw = ((ctx.frame >> 16) & 0x3F) as u32;
+        // Z buffer depth: PSMZ32 keeps 32 bits, PSMZ24 24, PSMZ16(S) 16;
+        // the upper bits of the stored word belong to whatever else shares
+        // the memory (Amagami parks 8-bit textures over its Z24 buffer).
+        let zmask = match (ctx.zbuf >> 24) & 0xF {
+            0x0 => u32::MAX,
+            0x1 => 0x00FF_FFFF,
+            _ => 0xFFFF,
+        };
         if zte && ztst != 1 {
-            let zcur = self.read_psmct32(zbp, fbw, x, y);
+            let zcur = self.read_psmct32(zbp, fbw, x, y) & zmask;
+            let z = frag.z & zmask;
             let pass = match ztst {
                 0 => false,
-                2 => frag.z >= zcur,
-                _ => frag.z > zcur,
+                2 => z >= zcur,
+                _ => z > zcur,
             };
             if !pass {
                 return;
             }
         }
         if zte && !zmsk {
-            self.write_psmct32(zbp, fbw, x, y, frag.z);
+            let cur = self.read_psmct32(zbp, fbw, x, y);
+            self.write_psmct32(zbp, fbw, x, y, (cur & !zmask) | (frag.z & zmask));
         }
 
         // Destination blend.
