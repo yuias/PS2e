@@ -28,6 +28,8 @@ struct Args {
     memcard: Option<String>,
     /// Disc image (2048-byte-sector ISO), streamed on demand.
     disc: Option<String>,
+    /// Write the SPU2 output (48 kHz stereo) as a WAV file.
+    wav: Option<String>,
 }
 
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
@@ -90,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
         presses: Vec::new(),
         memcard: None,
         disc: None,
+        wav: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -127,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
             "--memcard" => args.memcard = Some(it.next().ok_or("--memcard needs a path")?),
             "--disc" => args.disc = Some(it.next().ok_or("--disc needs a path")?),
+            "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
             "--help" | "-h" => {
                 println!(
                     "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
@@ -143,7 +147,8 @@ fn parse_args() -> Result<Args, String> {
                      --press          hold a pad button, <button>@<cycle>[-<cycle>]\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
-                     --disc           disc image (2048-byte-sector ISO), streamed"
+                     --disc           disc image (2048-byte-sector ISO), streamed
+                     --wav            write the SPU2 output as a 48 kHz stereo WAV"
                 );
                 std::process::exit(0);
             }
@@ -244,6 +249,7 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut remaining = args.cycles;
     let mut debugger_seen = false;
+    let mut audio: Vec<i16> = Vec::new();
     while remaining > 0 {
         // While a debugger is attached (or awaited), it owns execution: the
         // stub runs the system from inside pump() and we only track cycles.
@@ -269,6 +275,11 @@ fn main() -> ExitCode {
         sys.run(n);
         remaining -= n;
         flush_tty(&stdout, &mut sys);
+        if args.wav.is_some() {
+            audio.extend(sys.bus.spu2.take_output());
+        } else {
+            sys.bus.spu2.take_output();
+        }
         if let (Some(every), Some(path)) = (args.screenshot_every, &args.screenshot)
             && sys.cycles / every != (sys.cycles - n) / every
         {
@@ -339,6 +350,14 @@ fn main() -> ExitCode {
         }
         tracing::info!(dir = %dir, "dumped EE/IOP RAM and GS VRAM");
     }
+    if let Some(path) = &args.wav {
+        audio.extend(sys.bus.spu2.take_output());
+        if let Err(e) = write_wav(path, &audio) {
+            eprintln!("error: wav write failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        tracing::info!(path = %path, samples = audio.len() / 2, "wav written");
+    }
     if let Some(path) = &args.screenshot {
         let (w, h, rgba) = sys.framebuffer();
         if let Err(e) = write_bmp(path, w, h, &rgba) {
@@ -366,6 +385,28 @@ fn numbered_path(path: &str, n: u64) -> String {
         Some((stem, ext)) if !stem.is_empty() => format!("{stem}_{n}.{ext}"),
         _ => format!("{path}_{n}"),
     }
+}
+
+/// 16-bit stereo 48 kHz PCM WAV.
+fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&48_000u32.to_le_bytes());
+    out.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, out)
 }
 
 fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
