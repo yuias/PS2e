@@ -2447,7 +2447,7 @@ impl Bus {
                     0x4 => ch.bcr = merge_sub_word::<N>(ch.bcr, addr, v),
                     _ => {
                         ch.chcr = merge_sub_word::<N>(ch.chcr, addr, v);
-                        if ch.chcr & IOP_CHCR_BUSY != 0 && !self.spu2.dma_busy(core) {
+                        if ch.chcr & IOP_CHCR_BUSY != 0 {
                             self.do_spu2_dma(core);
                         }
                     }

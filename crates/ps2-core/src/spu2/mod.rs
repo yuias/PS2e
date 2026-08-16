@@ -1,13 +1,16 @@
 //! SPU2 (sound processor): register file, 2 MiB sound RAM, the transfer
-//! engine (manual STD writes, DMA ch4/ch7, AutoDMA streaming) and the IRQA
-//! interrupt. No voice mixing yet — the point is to give IOP sound drivers
-//! the status bits and completion timing they wait on: libspu2 polls STATX
+//! engine (manual STD writes, DMA ch4/ch7, AutoDMA streaming), the IRQA
+//! interrupt and a 48 kHz mixer for the 2x24 ADPCM voices plus AutoDMA
+//! input. Transfer timing matters as much as data: libspu2 polls STATX
 //! after reset and after transfers, and its AutoDMA streaming re-arms the
 //! DMA from the completion interrupt, so a transfer that completes
 //! instantly turns into an interrupt storm that starves every other IOP
 //! thread.
 
+mod voice;
+
 use tracing::{debug, trace};
+use voice::{Voice, VoiceRegs};
 
 pub const SPU2_RAM_SIZE: usize = 2 * 1024 * 1024;
 
@@ -19,15 +22,30 @@ const EE_CYCLES_PER_DMA_BYTE: u64 = 16;
 const ADMA_BLOCK_BYTES: u64 = 1024;
 const ADMA_BLOCK_SAMPLES: u64 = 256;
 
+const REG_VMIXL: usize = 0x188;
+const REG_VMIXR: usize = 0x190;
+const REG_MMIX: usize = 0x198;
 const REG_ATTR: usize = 0x19A;
 const REG_IRQAH: usize = 0x19C;
 const REG_IRQAL: usize = 0x19E;
 const REG_TSAH: usize = 0x1A8;
 const REG_TSAL: usize = 0x1AA;
+const REG_KON: usize = 0x1A0;
+const REG_KOFF: usize = 0x1A4;
 const REG_STD: usize = 0x1AC;
 const REG_ADMAS: usize = 0x1B0;
+/// Per-voice address block (SSAH/SSAL, LSAXH/LSAXL, NAXH/NAXL), 12 bytes each.
+const REG_VADDR: usize = 0x1C0;
+const REG_ENDX: usize = 0x340;
 const REG_STATX: usize = 0x344;
+/// Per-core volume block: MVOLL/R, EVOLL/R, AVOLL/R, BVOLL/R, MVOLXL/R.
+const REG_MVOL: usize = 0x760;
+const CORE_VOL_STRIDE: usize = 0x28;
 const REG_IRQINFO: usize = 0x7C2;
+
+/// MMIX gates for the dry paths we mix (no reverb): voices and AutoDMA input.
+const MMIX_VOICE_DRY: u16 = 0x0C00;
+const MMIX_INPUT_DRY: u16 = 0x00C0;
 
 /// ATTR transfer modes (bits 5:4); 0 = stop, 1 = manual write.
 const MODE_DMA_WRITE: u16 = 2;
@@ -44,6 +62,9 @@ struct Core {
     adma_half: usize,
     /// IRQA was hit and the flag is latched until IRQ enable is dropped.
     irq_flag: bool,
+    /// AutoDMA input read position (0..0x200 halfwords into the L/R areas).
+    adma_pos: usize,
+    voices: [Voice; 24],
 }
 
 pub struct Spu2 {
@@ -53,6 +74,11 @@ pub struct Spu2 {
     cores: [Core; 2],
     /// Set when the SPU IRQ line should be raised; drained by the bus.
     irq_edge: bool,
+    /// EE cycle of the last mixed output sample.
+    last_sample: u64,
+    /// Mixed output, interleaved stereo 16-bit at 48 kHz; the front-end
+    /// drains it.
+    pub out: Vec<i16>,
 }
 
 impl Default for Spu2 {
@@ -68,7 +94,14 @@ impl Spu2 {
             regs: vec![0u16; 0x800].into_boxed_slice(),
             cores: [Core::default(); 2],
             irq_edge: false,
+            last_sample: 0,
+            out: Vec::new(),
         }
+    }
+
+    /// Take the samples mixed since the last call.
+    pub fn take_output(&mut self) -> Vec<i16> {
+        core::mem::take(&mut self.out)
     }
 
     /// Take the pending SPU IRQ edge (IOP I_STAT bit 9).
@@ -76,8 +109,9 @@ impl Spu2 {
         core::mem::take(&mut self.irq_edge)
     }
 
+    /// Core 1's block mirrors core 0's at +0x400; 0x760.. is global.
     fn core_of(off: usize) -> usize {
-        usize::from(off >= 0x400 && off < 0x800)
+        usize::from((0x400..0x760).contains(&off))
     }
 
     fn reg16(&self, off: usize) -> u16 {
@@ -137,17 +171,37 @@ impl Spu2 {
     }
 
     fn read16(&self, off: usize) -> u16 {
-        match off & 0xFFE {
-            REG_STATX => self.statx(0),
-            o if o == REG_STATX + 0x400 => self.statx(1),
+        let core = Self::core_of(off);
+        let local = (off & 0xFFE) - core * 0x400;
+        match local {
+            // Voice ENVX: live envelope level.
+            0x000..=0x17F if local & 0xF == 0xA => {
+                self.cores[core].voices[local >> 4].level as u16
+            }
+            // NAX: current block address.
+            REG_VADDR..=0x2DF if (local - REG_VADDR) % 12 >= 8 => {
+                let v = (local - REG_VADDR) / 12;
+                let nax = self.cores[core].voices[v].nax;
+                if (local - REG_VADDR) % 12 == 8 { (nax >> 16) as u16 } else { nax as u16 }
+            }
+            REG_ENDX => self.endx(core) as u16,
+            o if o == REG_ENDX + 2 => (self.endx(core) >> 16) as u16,
+            REG_STATX => self.statx(core),
             REG_IRQINFO => self.irqinfo(),
-            o if o == REG_STD || o == REG_STD + 0x400 => {
-                let core = Self::core_of(o);
+            REG_STD => {
                 let hw = self.cores[core].tsa as usize & 0xF_FFFF;
                 u16::from_le_bytes([self.ram[hw * 2], self.ram[hw * 2 + 1]])
             }
             _ => self.reg16(off),
         }
+    }
+
+    fn endx(&self, core: usize) -> u32 {
+        self.cores[core]
+            .voices
+            .iter()
+            .enumerate()
+            .fold(0, |acc, (i, v)| acc | (u32::from(v.endx) << i))
     }
 
     fn write16(&mut self, off: usize, v: u16) {
@@ -178,6 +232,38 @@ impl Spu2 {
                 // reports busy for it.
                 if self.mode(core) != MODE_DMA_READ {
                     self.write_halfword(core, v);
+                }
+            }
+            REG_KON | REG_KOFF | 0x1A2 | 0x1A6 => {
+                let on = local < REG_KOFF;
+                let first = if local & 2 != 0 { 16 } else { 0 };
+                let base = core * 0x400 + REG_VADDR;
+                for i in 0..16 {
+                    let voice = first + i;
+                    if v & (1 << i) == 0 || voice >= 24 {
+                        continue;
+                    }
+                    if on {
+                        let a = base + voice * 12;
+                        let ssa = (u32::from(self.reg16(a) & 0xF) << 16) | u32::from(self.reg16(a + 2));
+                        self.cores[core].voices[voice].key_on(ssa);
+                        trace!(target: "ps2_core::spu2", core, voice, ssa = format_args!("{ssa:#x}"), "key on");
+                    } else {
+                        self.cores[core].voices[voice].key_off();
+                    }
+                }
+            }
+            REG_VADDR..=0x2DF => {
+                self.set_reg16(off, v);
+                let v_idx = (local - REG_VADDR) / 12;
+                let field = (local - REG_VADDR) % 12;
+                if field == 4 || field == 6 {
+                    // LSAX written by software pins the loop point.
+                    let a = core * 0x400 + REG_VADDR + v_idx * 12 + 4;
+                    let lsax = (u32::from(self.reg16(a) & 0xF) << 16) | u32::from(self.reg16(a + 2));
+                    let voice = &mut self.cores[core].voices[v_idx];
+                    voice.lsax = lsax;
+                    voice.lsax_pinned = true;
                 }
             }
             _ => self.set_reg16(off, v),
@@ -237,17 +323,14 @@ impl Spu2 {
         self.reg16(REG_ADMAS + core * 0x400) & (1 << core) != 0
     }
 
-    /// Whether the DMA for `core` is still in flight.
-    pub fn dma_busy(&self, core: usize) -> bool {
-        self.cores[core].dma_due.is_some()
-    }
-
     /// Kick a DMA on `core`: `data` is copied into sound RAM (`to_spu`) or
     /// filled from it. Returns the EE cycle at which the transfer completes;
     /// the caller raises the IOP DMA interrupt then. AutoDMA blocks are
-    /// paced at playback speed, plain transfers at bus speed.
+    /// paced at playback speed, plain transfers at bus speed; a kick while
+    /// the previous transfer is still in flight queues behind it.
     pub fn dma(&mut self, core: usize, to_spu: bool, data: &mut [u8], now: u64) -> u64 {
         let bytes = data.len() as u64;
+        let start_at = self.cores[core].dma_due.map_or(now, |due| due.max(now));
         let due = if to_spu && self.adma_enabled(core) {
             // Each 1 KiB block: 512 bytes left then 512 bytes right, into
             // the core's input area (L 0x2000/R 0x2200 halfwords, +0x400
@@ -262,7 +345,7 @@ impl Spu2 {
             }
             let blocks = bytes.div_ceil(ADMA_BLOCK_BYTES);
             debug!(target: "ps2_core::spu2", core, bytes, "ADMA block(s) queued");
-            now + blocks * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE
+            start_at + blocks * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE
         } else {
             let start = self.cores[core].tsa;
             if to_spu {
@@ -279,14 +362,15 @@ impl Spu2 {
                 }
             }
             debug!(target: "ps2_core::spu2", core, to_spu, bytes, tsa = format_args!("{start:#x}"), "DMA");
-            now + bytes * EE_CYCLES_PER_DMA_BYTE
+            start_at + bytes * EE_CYCLES_PER_DMA_BYTE
         };
         self.cores[core].dma_due = Some(due);
         due
     }
 
-    /// Retire DMAs whose completion time has passed; returns the cores
-    /// whose IOP DMA channel (4 for core 0, 7 for core 1) just finished.
+    /// Retire DMAs whose completion time has passed and mix the output
+    /// samples due by `now`; returns the cores whose IOP DMA channel (4 for
+    /// core 0, 7 for core 1) just finished.
     pub fn tick(&mut self, now: u64) -> [bool; 2] {
         let mut done = [false; 2];
         for (c, core) in self.cores.iter_mut().enumerate() {
@@ -295,7 +379,91 @@ impl Spu2 {
                 done[c] = true;
             }
         }
+        // Bound the catch-up so a long stall cannot freeze us in the mixer.
+        let mut pending = (now.saturating_sub(self.last_sample) / EE_CYCLES_PER_SAMPLE).min(4096);
+        if pending > 0 {
+            self.last_sample = now - now % EE_CYCLES_PER_SAMPLE;
+        }
+        while pending > 0 {
+            self.mix_sample();
+            pending -= 1;
+        }
         done
+    }
+
+    /// Volume register: 15-bit signed when bit 15 is clear; sweep mode
+    /// (bit 15 set) is approximated by full volume.
+    fn volume(v: u16) -> i32 {
+        if v & 0x8000 != 0 { 0x7FFF } else { i32::from((v << 1) as i16) >> 1 }
+    }
+
+    /// One 48 kHz output sample: voices and AutoDMA input per core, master
+    /// volume, core 0 folded into core 1 (its "external input", BVOL).
+    fn mix_sample(&mut self) {
+        let mut core_out = [[0i32; 2]; 2];
+        for c in 0..2 {
+            let base = c * 0x400;
+            let attr = self.attr(c);
+            let mmix = self.reg16(REG_MMIX + base);
+            let irq_enabled = attr & 0x40 != 0;
+            let irqa = self.irqa(c);
+            let vmixl = u32::from(self.reg16(REG_VMIXL + base)) | (u32::from(self.reg16(REG_VMIXL + base + 2)) << 16);
+            let vmixr = u32::from(self.reg16(REG_VMIXR + base)) | (u32::from(self.reg16(REG_VMIXR + base + 2)) << 16);
+            let (mut l, mut r) = (0i32, 0i32);
+            for v in 0..24 {
+                let vb = base + v * 0x10;
+                let regs = VoiceRegs {
+                    pitch: self.reg16(vb + 4),
+                    adsr1: self.reg16(vb + 6),
+                    adsr2: self.reg16(vb + 8),
+                };
+                let (sample, fetched) = {
+                    let Self { ram, cores, .. } = self;
+                    cores[c].voices[v].step(ram, regs)
+                };
+                if fetched && irq_enabled {
+                    // The block just fetched spans nax-8..nax.
+                    let start = self.cores[c].voices[v].nax.wrapping_sub(8) & 0xF_FFFF;
+                    if irqa.wrapping_sub(start) & 0xF_FFFF < 8 && !self.cores[c].irq_flag {
+                        self.cores[c].irq_flag = true;
+                        self.irq_edge = true;
+                        debug!(target: "ps2_core::spu2", core = c, voice = v, addr = format_args!("{irqa:#x}"), "IRQA hit by voice");
+                    }
+                }
+                if sample == 0 || mmix & MMIX_VOICE_DRY == 0 {
+                    continue;
+                }
+                if vmixl & (1 << v) != 0 {
+                    l += (sample * Self::volume(self.reg16(vb))) >> 15;
+                }
+                if vmixr & (1 << v) != 0 {
+                    r += (sample * Self::volume(self.reg16(vb + 2))) >> 15;
+                }
+            }
+            let vol_base = REG_MVOL + c * CORE_VOL_STRIDE;
+            if self.adma_enabled(c) {
+                let pos = self.cores[c].adma_pos;
+                let lb = (0x2000 + (c << 10) + pos) * 2;
+                let rb = lb + 0x400;
+                let il = i32::from(i16::from_le_bytes([self.ram[lb], self.ram[lb + 1]]));
+                let ir = i32::from(i16::from_le_bytes([self.ram[rb], self.ram[rb + 1]]));
+                self.cores[c].adma_pos = (pos + 1) & 0x1FF;
+                if mmix & MMIX_INPUT_DRY != 0 {
+                    l += (il * Self::volume(self.reg16(vol_base + 8))) >> 15;
+                    r += (ir * Self::volume(self.reg16(vol_base + 10))) >> 15;
+                }
+            }
+            let mvoll = Self::volume(self.reg16(vol_base));
+            let mvolr = Self::volume(self.reg16(vol_base + 2));
+            core_out[c] = [(l * mvoll) >> 15, (r * mvolr) >> 15];
+        }
+        let vol_base = REG_MVOL + CORE_VOL_STRIDE;
+        let bvoll = Self::volume(self.reg16(vol_base + 12));
+        let bvolr = Self::volume(self.reg16(vol_base + 14));
+        let l = core_out[1][0] + ((core_out[0][0] * bvoll) >> 15);
+        let r = core_out[1][1] + ((core_out[0][1] * bvolr) >> 15);
+        self.out.push(l.clamp(-0x8000, 0x7FFF) as i16);
+        self.out.push(r.clamp(-0x8000, 0x7FFF) as i16);
     }
 }
 
@@ -343,6 +511,41 @@ mod tests {
         // Dropping IRQ enable clears the flag.
         spu.write::<2>(REG_ATTR + 0x400, 0x8020);
         assert_eq!(spu.read::<2>(REG_IRQINFO), 0);
+    }
+
+    #[test]
+    fn keyed_voice_reaches_the_output() {
+        let mut spu = Spu2::new();
+        // One looping block of constant +0x1000-ish samples at halfword 0x1000.
+        let base = 0x1000 * 2;
+        spu.ram[base] = 0x00; // shift 0, no filter
+        spu.ram[base + 1] = 0x03; // end + repeat
+        for b in &mut spu.ram[base + 2..base + 16] {
+            *b = 0x11;
+        }
+        // Voice 0 of core 0: full volume, unity pitch, instant attack, max
+        // sustain; routed dry to both channels; master volumes up.
+        spu.write::<2>(0x000, 0x3FFF);
+        spu.write::<2>(0x002, 0x3FFF);
+        spu.write::<2>(0x004, 0x1000);
+        spu.write::<2>(0x006, 0x000F);
+        spu.write::<2>(0x008, 0x0000);
+        spu.write::<2>(REG_VADDR, 0);
+        spu.write::<2>(REG_VADDR + 2, 0x1000);
+        spu.write::<2>(REG_VMIXL, 1);
+        spu.write::<2>(REG_VMIXR, 1);
+        spu.write::<2>(REG_MMIX, u32::from(MMIX_VOICE_DRY));
+        spu.write::<2>(REG_MVOL, 0x3FFF);
+        spu.write::<2>(REG_MVOL + 2, 0x3FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 12, 0x3FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 14, 0x3FFF);
+        spu.write::<2>(REG_KON, 1);
+        spu.tick(100 * EE_CYCLES_PER_SAMPLE);
+        let out = spu.take_output();
+        assert_eq!(out.len(), 200);
+        assert!(out[150..].iter().any(|&s| s > 0x100), "{:?}", &out[150..160]);
+        assert_eq!(spu.read::<2>(0x00A) & 0x7FFF, 0x7FFF); // ENVX at sustain
+        assert!(spu.read::<2>(REG_ENDX) & 1 != 0); // looped past the end flag
     }
 
     #[test]
