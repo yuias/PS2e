@@ -15,6 +15,8 @@ struct Args {
     dump: Option<String>,
     /// Write the final framebuffer as a BMP.
     screenshot: Option<String>,
+    /// Also write a numbered BMP next to `screenshot` every N cycles.
+    screenshot_every: Option<u64>,
     /// gdb-remote stub ports for the EE and IOP targets.
     debug_ee: Option<u16>,
     debug_iop: Option<u16>,
@@ -81,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
         log: None,
         dump: None,
         screenshot: None,
+        screenshot_every: None,
         debug_ee: None,
         debug_iop: None,
         wait_debugger: false,
@@ -103,6 +106,15 @@ fn parse_args() -> Result<Args, String> {
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
             "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
             "--screenshot" => args.screenshot = Some(it.next().ok_or("--screenshot needs a path")?),
+            "--screenshot-every" => {
+                args.screenshot_every = Some(
+                    it.next()
+                        .ok_or("--screenshot-every needs a cycle count")?
+                        .replace('_', "")
+                        .parse()
+                        .map_err(|e| format!("bad --screenshot-every: {e}"))?,
+                )
+            }
             "--debug-ee" => {
                 args.debug_ee = Some(parse_port(it.next().ok_or("--debug-ee needs a port")?)?)
             }
@@ -124,6 +136,7 @@ fn parse_args() -> Result<Args, String> {
                      --log            tracing filter, e.g. 'info,ps2_core::tty=debug'\n\
                      --dump           directory for EE/IOP RAM dumps after the run\n\
                      --screenshot     write the final framebuffer as a BMP\n\
+                     --screenshot-every  also write <screenshot>_<n>.bmp every N cycles\n\
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
@@ -256,6 +269,17 @@ fn main() -> ExitCode {
         sys.run(n);
         remaining -= n;
         flush_tty(&stdout, &mut sys);
+        if let (Some(every), Some(path)) = (args.screenshot_every, &args.screenshot)
+            && sys.cycles / every != (sys.cycles - n) / every
+        {
+            let numbered = numbered_path(path, sys.cycles / every);
+            let (w, h, rgba) = sys.framebuffer();
+            if let Err(e) = write_bmp(&numbered, w, h, &rgba) {
+                eprintln!("error: screenshot failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            tracing::info!(path = %numbered, cycles = sys.cycles, "screenshot written");
+        }
     }
 
     tracing::info!(
@@ -336,6 +360,14 @@ fn flush_tty(stdout: &std::io::Stdout, sys: &mut Ps2System) {
 }
 
 /// Minimal 24-bit bottom-up BMP writer.
+/// `foo.bmp` -> `foo_<n>.bmp` (extension-less paths just get the suffix).
+fn numbered_path(path: &str, n: u64) -> String {
+    match path.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}_{n}.{ext}"),
+        _ => format!("{path}_{n}"),
+    }
+}
+
 fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     let row = ((w * 3 + 3) & !3) as usize;
     let data_size = row * h as usize;
