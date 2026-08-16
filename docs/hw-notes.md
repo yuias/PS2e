@@ -353,3 +353,37 @@ also has an interrupt-driven S-command engine (a mailbox at ~0x3D81D
 result path (banks 0x2020-0x2034 XOR-obfuscated with 0x2039, valid
 bits in 0x2038) that our FIFO-only model never triggers — worth
 knowing if some path stops getting results.
+
+## SPU2 transfer engine (what libspu2 / libsd wait on)
+
+SLPS-25918's IOP sound module (`rspu2_driver`, a game-specific IRX
+that embeds libspu2 + libsnd2 rather than LIBSD) polls the SPU2 like
+this (disassembled from IOP RAM, `SPU:T/O [%s]` timeout strings mark
+each wait):
+
+- `SpuInit`: ATTR = 0, then 0x8000, then spin up to 0xF00 reads until
+  `STATX & 0x7FF == 0` ("wait (reset)"). STATX must therefore echo the
+  ATTR mode bits the PS1 way (bits 5:0 = ATTR 5:0, bit 7 = DMA request
+  when a DMA mode is selected, 8/9 = read/write request, 10 = busy) —
+  a constant "ready" value trips the timeout.
+- Manual writes: up to 0x40 bytes are stored to STD (0x1AC) *before*
+  ATTR mode is set to 1, then it spins until `STATX & 0x400` (busy)
+  clears ("wait (SPU2_STATX_WRDY_M)"). So STD writes must land in RAM
+  regardless of the current mode.
+- Plain DMA (ch4 = core 0, ch7 = core 1; DMA regs at 0x1F8010C0 +
+  core*0x440): BCR is written as two halfword stores (`sh 0x10` at
+  +4, block count at +6) — sub-word DMA register access has to work.
+  CHCR = 0x01000201. The completion handler for core 1 spins up to
+  16M reads until `STATX & 0x80` is *set* ("wait (SPU2_STATX_DREQ)"),
+  then clears ATTR bits 5:4 and waits for the readback to show 0.
+- AutoDMA streaming (ADMAS = core bit, 1 KiB blocks: 512 bytes L then
+  512 bytes R into the core's input area at halfword 0x2000 + core<<10,
+  halves alternating): the DMA completion interrupt re-arms the next
+  block from inside the handler. The block is consumed at 48 kHz (256
+  stereo samples = 5.33 ms per KiB), and the completion IRQ must not
+  fire before that — an instant completion turns the handler into an
+  IOP interrupt storm that starves the RPC thread, which is what the
+  "game hangs on its sound-init thread" symptom was.
+- IRQs: intrman 0x24/0x28 (DMA ch4/ch7), 9 (SPU IRQA). libspu2 also
+  toggles ATTR bit 6 to arm/clear the IRQ ("wait (IRQ/ON)" / "IRQ/OFF"
+  read the bit back).
