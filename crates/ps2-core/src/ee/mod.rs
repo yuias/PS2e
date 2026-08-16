@@ -735,6 +735,8 @@ impl Cpu {
             0x21 => self.madd(1, rd, rs, rt, true),
             0x28 => self.op_mmi1(instr, rs, rt, rd),
             0x29 => self.op_mmi3(instr, rs, rt, rd),
+            0x30 => self.pmfhl(rd, sa),
+            0x31 => self.pmthl(rs, sa),
             0x34 => self.per_u16(rd, rt, |v| v << (sa & 15)),
             0x36 => self.per_u16(rd, rt, |v| v >> (sa & 15)),
             0x37 => self.per_u16(rd, rt, |v| ((v as i16) >> (sa & 15)) as u16),
@@ -830,6 +832,19 @@ impl Cpu {
             0x19 => self.lanes_u8(rd, a, b, |x, y| (x as i8).saturating_sub(y as i8) as u8),
             0x1A => self.set128(rd, interleave_u8(b[0], a[0])), // pextlb
             0x1B => self.set128(rd, pack_u8(b, a)),             // ppacb
+            // pext5/ppac5: unpack/pack a 5:5:5:1 pixel per 32-bit lane
+            0x1E => self.per_u32(rd, rt, |v| {
+                ((v & 0x0000_001F) << 3)
+                    | ((v & 0x0000_03E0) << 6)
+                    | ((v & 0x0000_7C00) << 9)
+                    | ((v & 0x0000_8000) << 16)
+            }),
+            0x1F => self.per_u32(rd, rt, |v| {
+                ((v >> 3) & 0x0000_001F)
+                    | ((v >> 6) & 0x0000_03E0)
+                    | ((v >> 9) & 0x0000_7C00)
+                    | ((v >> 16) & 0x0000_8000)
+            }),
             _ => self.unimplemented("MMI0", instr),
         }
     }
@@ -842,6 +857,23 @@ impl Cpu {
             0x01 => self.lanes_u32(rd, a, b, |_, y| (y as i32).unsigned_abs()), // pabsw
             0x02 => self.lanes_u32(rd, a, b, |x, y| ((x == y) as u32).wrapping_neg()), // pceqw
             0x03 => self.lanes_u32(rd, a, b, |x, y| (x as i32).min(y as i32) as u32), // pminw
+            // padsbh: subtract the low halfwords (pipe 0), add the high ones (pipe 1)
+            0x04 => {
+                let mut out = [0u64; 2];
+                for half in 0..2 {
+                    for lane in 0..4 {
+                        let x = (a[half] >> (16 * lane)) as u16;
+                        let y = (b[half] >> (16 * lane)) as u16;
+                        let v = if half == 0 {
+                            x.wrapping_sub(y)
+                        } else {
+                            x.wrapping_add(y)
+                        };
+                        out[half] |= (v as u64) << (16 * lane);
+                    }
+                }
+                self.set128(rd, out);
+            }
             0x05 => self.lanes_u16(rd, a, b, |_, y| (y as i16).unsigned_abs()), // pabsh
             0x06 => self.lanes_u16(rd, a, b, |x, y| ((x == y) as u16).wrapping_neg()), // pceqh
             0x07 => self.lanes_u16(rd, a, b, |x, y| (x as i16).min(y as i16) as u16), // pminh
@@ -887,13 +919,29 @@ impl Cpu {
         let a = self.r128(rs);
         let b = self.r128(rt);
         match sa {
+            0x00 => self.pmaddw(rd, a, b),
+            0x02 => self.shift_vw(rd, a, b, |v, amt| (v << amt) as i32), // psllvw
+            0x03 => self.shift_vw(rd, a, b, |v, amt| (v >> amt) as i32), // psrlvw
+            0x04 => self.pmsubw(rd, a, b),
             0x08 => self.set128(rd, self.hi),      // pmfhi
             0x09 => self.set128(rd, self.lo),      // pmflo
             0x0E => self.set128(rd, [b[0], a[0]]), // pcpyld
             // pinth: interleave rt's lower halfwords with rs's upper ones
             0x0A => self.set128(rd, interleave_u16(b[0], a[1])),
+            0x0C => self.pmultw(rd, a, b),
+            0x0D => self.pdivw(a, b),
+            0x10 => self.pmaddh(rd, a, b),
+            0x11 => self.phmadh(rd, a, b),
             0x12 => self.set128(rd, [a[0] & b[0], a[1] & b[1]]), // pand
             0x13 => self.set128(rd, [a[0] ^ b[0], a[1] ^ b[1]]), // pxor
+            0x14 => self.pmsubh(rd, a, b),
+            0x15 => self.phmsbh(rd, a, b),
+            0x1A => self.set128(rd, perm_h4(b, [2, 1, 0, 3])), // pexeh
+            0x1B => self.set128(rd, perm_h4(b, [3, 2, 1, 0])), // prevh
+            0x1C => self.pmulth(rd, a, b),
+            0x1D => self.pdivbw(a, b),
+            0x1E => self.set128(rd, perm_w4(b, [2, 1, 0, 3])), // pexew
+            0x1F => self.set128(rd, perm_w4(b, [1, 2, 0, 3])), // prot3w
             _ => self.unimplemented("MMI2", instr),
         }
     }
@@ -903,6 +951,8 @@ impl Cpu {
         let a = self.r128(rs);
         let b = self.r128(rt);
         match sa {
+            0x00 => self.pmadduw(rd, a, b),
+            0x03 => self.shift_vw(rd, a, b, |v, amt| (v as i32) >> amt), // psravw
             0x08 => self.hi = a, // pmthi
             0x09 => self.lo = a, // pmtlo
             // pinteh: even halfwords of rs (upper) and rt (lower)
@@ -917,9 +967,12 @@ impl Cpu {
                 }
                 self.set128(rd, out);
             }
+            0x0C => self.pmultuw(rd, a, b),
+            0x0D => self.pdivuw(a, b),
             0x0E => self.set128(rd, [a[1], b[1]]), // pcpyud
             0x12 => self.set128(rd, [a[0] | b[0], a[1] | b[1]]), // por
             0x13 => self.set128(rd, [!(a[0] | b[0]), !(a[1] | b[1])]), // pnor
+            0x1A => self.set128(rd, perm_h4(b, [0, 2, 1, 3])), // pexch
             // pcpyh: replicate the low halfword of each doubleword of rt
             0x1B => {
                 let rep = |v: u64| {
@@ -928,8 +981,281 @@ impl Cpu {
                 };
                 self.set128(rd, [rep(b[0]), rep(b[1])]);
             }
+            0x1E => self.set128(rd, perm_w4(b, [0, 2, 1, 3])), // pexcw
             _ => self.unimplemented("MMI3", instr),
         }
+    }
+
+    // --- MMI word/halfword multiply-accumulate family --------------------
+
+    fn pmfhl(&mut self, rd: usize, sa: u32) {
+        let (lo, hi) = (self.lo, self.hi);
+        let out = match sa {
+            0x00 => [
+                (lo[0] as u32 as u64) | ((hi[0] as u32 as u64) << 32),
+                (lo[1] as u32 as u64) | ((hi[1] as u32 as u64) << 32),
+            ], // lw
+            0x01 => [
+                (lo[0] >> 32) | (hi[0] & 0xFFFF_FFFF_0000_0000),
+                (lo[1] >> 32) | (hi[1] & 0xFFFF_FFFF_0000_0000),
+            ], // uw
+            0x02 => {
+                // slw: saturate each pipe's HI:LO pair into a signed 32-bit lane
+                let sat = |h: u64, l: u64| -> u64 {
+                    let combined = (((h as u32 as u64) << 32) | (l as u32 as u64)) as i64;
+                    if combined >= i32::MAX as i64 {
+                        i32::MAX as i64 as u64
+                    } else if combined <= i32::MIN as i64 {
+                        i32::MIN as i64 as u64
+                    } else {
+                        l as u32 as i32 as i64 as u64
+                    }
+                };
+                [sat(hi[0], lo[0]), sat(hi[1], lo[1])]
+            }
+            0x03 => {
+                // lh: low halfword of each 32-bit LO/HI lane, per pipe
+                let h16lo = |v: u64| v & 0xFFFF;
+                [
+                    h16lo(lo[0])
+                        | (h16lo(lo[0] >> 32) << 16)
+                        | (h16lo(hi[0]) << 32)
+                        | (h16lo(hi[0] >> 32) << 48),
+                    h16lo(lo[1])
+                        | (h16lo(lo[1] >> 32) << 16)
+                        | (h16lo(hi[1]) << 32)
+                        | (h16lo(hi[1] >> 32) << 48),
+                ]
+            }
+            0x04 => {
+                // sh: saturate each 32-bit LO/HI lane into a signed halfword
+                let clamp = |v: u64| -> u64 {
+                    ((v as u32 as i32).clamp(i16::MIN as i32, i16::MAX as i32) as u16) as u64
+                };
+                [
+                    clamp(lo[0]) | (clamp(lo[0] >> 32) << 16) | (clamp(hi[0]) << 32) | (clamp(hi[0] >> 32) << 48),
+                    clamp(lo[1]) | (clamp(lo[1] >> 32) << 16) | (clamp(hi[1]) << 32) | (clamp(hi[1] >> 32) << 48),
+                ]
+            }
+            _ => return, // reserved sa values leave rd untouched
+        };
+        self.set128(rd, out);
+    }
+
+    fn pmthl(&mut self, rs: usize, sa: u32) {
+        if sa != 0 {
+            return; // only the LW variant (sa == 0) is defined
+        }
+        let a = self.r128(rs);
+        self.lo[0] = (self.lo[0] & 0xFFFF_FFFF_0000_0000) | (a[0] as u32 as u64);
+        self.hi[0] = (self.hi[0] & 0xFFFF_FFFF_0000_0000) | (a[0] >> 32);
+        self.lo[1] = (self.lo[1] & 0xFFFF_FFFF_0000_0000) | (a[1] as u32 as u64);
+        self.hi[1] = (self.hi[1] & 0xFFFF_FFFF_0000_0000) | (a[1] >> 32);
+    }
+
+    /// PSLLVW/PSRLVW/PSRAVW: shift rt's words 0 and 2 by rs's matching word
+    /// (masked to 5 bits), sign-extending the 32-bit result into rd's halves.
+    fn shift_vw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2], f: impl Fn(u32, u32) -> i32) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let amt = (a[dd] as u32) & 0x1F;
+            out[dd] = f(b[dd] as u32, amt) as i64 as u64;
+        }
+        self.set128(rd, out);
+    }
+
+    fn pmultw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let prod = (a[dd] as u32 as i32 as i64) * (b[dd] as u32 as i32 as i64);
+            self.lo[dd] = (prod as i32 as i64) as u64;
+            self.hi[dd] = ((prod >> 32) as i32 as i64) as u64;
+            out[dd] = prod as u64;
+        }
+        self.set128(rd, out);
+    }
+
+    fn pmultuw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let prod = (a[dd] as u32 as u64) * (b[dd] as u32 as u64);
+            self.lo[dd] = (prod as u32 as i32 as i64) as u64;
+            self.hi[dd] = ((prod >> 32) as u32 as i32 as i64) as u64;
+            out[dd] = prod;
+        }
+        self.set128(rd, out);
+    }
+
+    /// PMADDW/PMSUBW: reconstruct the pipe's 64-bit accumulator from its
+    /// sign-extended HI/LO halves. Real hardware has an undocumented
+    /// off-by-one quirk near overflow that this simpler accumulate doesn't
+    /// replicate.
+    fn pmaddw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let acc = (((self.hi[dd] as u32 as u64) << 32) | (self.lo[dd] as u32 as u64)) as i64;
+            let prod = (a[dd] as u32 as i32 as i64) * (b[dd] as u32 as i32 as i64);
+            let sum = acc.wrapping_add(prod);
+            self.lo[dd] = (sum as i32 as i64) as u64;
+            self.hi[dd] = ((sum >> 32) as i32 as i64) as u64;
+            out[dd] = sum as u64;
+        }
+        self.set128(rd, out);
+    }
+
+    fn pmsubw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let acc = (((self.hi[dd] as u32 as u64) << 32) | (self.lo[dd] as u32 as u64)) as i64;
+            let prod = (a[dd] as u32 as i32 as i64) * (b[dd] as u32 as i32 as i64);
+            let sum = acc.wrapping_sub(prod);
+            self.lo[dd] = (sum as i32 as i64) as u64;
+            self.hi[dd] = ((sum >> 32) as i32 as i64) as u64;
+            out[dd] = sum as u64;
+        }
+        self.set128(rd, out);
+    }
+
+    fn pmadduw(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut out = [0u64; 2];
+        for dd in 0..2 {
+            let acc = ((self.hi[dd] as u32 as u64) << 32) | (self.lo[dd] as u32 as u64);
+            let prod = (a[dd] as u32 as u64) * (b[dd] as u32 as u64);
+            let sum = acc.wrapping_add(prod);
+            self.lo[dd] = (sum as u32 as i32 as i64) as u64;
+            self.hi[dd] = ((sum >> 32) as u32 as i32 as i64) as u64;
+            out[dd] = sum;
+        }
+        self.set128(rd, out);
+    }
+
+    fn pdivw(&mut self, a: [u64; 2], b: [u64; 2]) {
+        for dd in 0..2 {
+            let n = a[dd] as u32 as i32;
+            let d = b[dd] as u32 as i32;
+            let (q, r) = if d == 0 {
+                (if n >= 0 { -1 } else { 1 }, n)
+            } else if n == i32::MIN && d == -1 {
+                (i32::MIN, 0)
+            } else {
+                (n / d, n % d)
+            };
+            self.lo[dd] = q as i64 as u64;
+            self.hi[dd] = r as i64 as u64;
+        }
+    }
+
+    fn pdivuw(&mut self, a: [u64; 2], b: [u64; 2]) {
+        for dd in 0..2 {
+            let n = a[dd] as u32;
+            let d = b[dd] as u32;
+            let (q, r) = if d != 0 { (n / d, n % d) } else { (u32::MAX, n) };
+            self.lo[dd] = (q as i32 as i64) as u64;
+            self.hi[dd] = (r as i32 as i64) as u64;
+        }
+    }
+
+    /// PDIVBW: rs's four 32-bit words, each divided by rt's low halfword.
+    fn pdivbw(&mut self, a: [u64; 2], b: [u64; 2]) {
+        let divisor = b[0] as u16 as i16 as i32;
+        for n in 0..4 {
+            let half = n / 2;
+            let sub = n % 2;
+            let word = (a[half] >> (32 * sub)) as u32 as i32;
+            let (q, r) = if word == i32::MIN && divisor == -1 {
+                (i32::MIN, 0)
+            } else if divisor != 0 {
+                (word / divisor, word % divisor)
+            } else {
+                (if word >= 0 { -1 } else { 1 }, word)
+            };
+            self.lo[half] = set_word(self.lo[half], sub, q as u32);
+            self.hi[half] = set_word(self.hi[half], sub, r as u32);
+        }
+    }
+
+    /// Shared step for PMULTH/PMADDH/PMSUBH: each of the 8 halfword lanes
+    /// combines the existing HI/LO word (via `combine`) with the rs*rt
+    /// product; rd then takes the lanes at LO[0],HI[0],LO[2],HI[2] (the same
+    /// placement PMFHL.LW would read back).
+    fn ph_multiply_step(
+        &mut self,
+        rd: usize,
+        a: [u64; 2],
+        b: [u64; 2],
+        combine: impl Fn(i32, i32) -> i32,
+    ) {
+        for n in 0..8 {
+            let prod = h16(a, n) * h16(b, n);
+            let half = n / 4;
+            let sub = n % 2;
+            let target = if n % 4 < 2 {
+                &mut self.lo[half]
+            } else {
+                &mut self.hi[half]
+            };
+            let old = (*target >> (32 * sub)) as u32 as i32;
+            *target = set_word(*target, sub, combine(old, prod) as u32);
+        }
+        self.set128(
+            rd,
+            [
+                (self.lo[0] as u32 as u64) | ((self.hi[0] as u32 as u64) << 32),
+                (self.lo[1] as u32 as u64) | ((self.hi[1] as u32 as u64) << 32),
+            ],
+        );
+    }
+
+    fn pmulth(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        self.ph_multiply_step(rd, a, b, |_old, prod| prod);
+    }
+
+    fn pmaddh(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        self.ph_multiply_step(rd, a, b, |old, prod| old.wrapping_add(prod));
+    }
+
+    fn pmsubh(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        self.ph_multiply_step(rd, a, b, |old, prod| old.wrapping_sub(prod));
+    }
+
+    /// PHMADH: horizontal add of adjacent halfword products, per pipe.
+    fn phmadh(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut p = [0i32; 8];
+        for (n, slot) in p.iter_mut().enumerate() {
+            *slot = h16(a, n) * h16(b, n);
+        }
+        self.lo[0] = (p[0].wrapping_add(p[1]) as u32 as u64) | ((p[1] as u32 as u64) << 32);
+        self.hi[0] = (p[2].wrapping_add(p[3]) as u32 as u64) | ((p[3] as u32 as u64) << 32);
+        self.lo[1] = (p[4].wrapping_add(p[5]) as u32 as u64) | ((p[5] as u32 as u64) << 32);
+        self.hi[1] = (p[6].wrapping_add(p[7]) as u32 as u64) | ((p[7] as u32 as u64) << 32);
+        self.set128(
+            rd,
+            [
+                (self.lo[0] as u32 as u64) | ((self.hi[0] as u32 as u64) << 32),
+                (self.lo[1] as u32 as u64) | ((self.hi[1] as u32 as u64) << 32),
+            ],
+        );
+    }
+
+    /// PHMSBH: horizontal subtract of adjacent halfword products, per pipe.
+    /// The odd lane stores `!product` rather than the product itself — an
+    /// undocumented quirk of the real hardware (verified against PCSX2).
+    fn phmsbh(&mut self, rd: usize, a: [u64; 2], b: [u64; 2]) {
+        let mut p = [0i32; 8];
+        for (n, slot) in p.iter_mut().enumerate() {
+            *slot = h16(a, n) * h16(b, n);
+        }
+        self.lo[0] = (p[1].wrapping_sub(p[0]) as u32 as u64) | ((!p[1] as u32 as u64) << 32);
+        self.hi[0] = (p[3].wrapping_sub(p[2]) as u32 as u64) | ((!p[3] as u32 as u64) << 32);
+        self.lo[1] = (p[5].wrapping_sub(p[4]) as u32 as u64) | ((!p[5] as u32 as u64) << 32);
+        self.hi[1] = (p[7].wrapping_sub(p[6]) as u32 as u64) | ((!p[7] as u32 as u64) << 32);
+        self.set128(
+            rd,
+            [
+                (self.lo[0] as u32 as u64) | ((self.hi[0] as u32 as u64) << 32),
+                (self.lo[1] as u32 as u64) | ((self.hi[1] as u32 as u64) << 32),
+            ],
+        );
     }
 
     fn lanes_u32(&mut self, rd: usize, a: [u64; 2], b: [u64; 2], f: impl Fn(u32, u32) -> u32) {
@@ -1018,6 +1344,43 @@ fn pack_u16(b: [u64; 2], a: [u64; 2]) -> [u64; 2] {
         out
     };
     [squeeze(b), squeeze(a)]
+}
+
+/// Sign-extended 16-bit lane `i` (0..7) of a 128-bit MMI register.
+fn h16(v: [u64; 2], i: usize) -> i32 {
+    let half = i / 4;
+    let lane = i % 4;
+    ((v[half] >> (16 * lane)) as u16) as i16 as i32
+}
+
+/// Replace the `sub`-th 32-bit lane (0 or 1) of a 64-bit half with `val`.
+fn set_word(v: u64, sub: usize, val: u32) -> u64 {
+    let shift = 32 * sub;
+    (v & !(0xFFFF_FFFFu64 << shift)) | ((val as u64) << shift)
+}
+
+/// Permute each pipe's four 16-bit lanes independently: out lane `i` takes
+/// source lane `map[i]`, within the same 64-bit half (PEXEH/PREVH/PEXCH).
+fn perm_h4(v: [u64; 2], map: [usize; 4]) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for half in 0..2 {
+        for lane in 0..4 {
+            let x = (v[half] >> (16 * map[lane])) as u16;
+            out[half] |= (x as u64) << (16 * lane);
+        }
+    }
+    out
+}
+
+/// Permute the four 32-bit words spanning the whole 128 bits: out word `i`
+/// takes source word `map[i]` (PEXEW/PROT3W/PEXCW).
+fn perm_w4(v: [u64; 2], map: [usize; 4]) -> [u64; 2] {
+    let word = |i: usize| -> u32 { (v[i / 2] >> (32 * (i % 2))) as u32 };
+    let mut out = [0u64; 2];
+    for i in 0..4 {
+        out[i / 2] |= (word(map[i]) as u64) << (32 * (i % 2));
+    }
+    out
 }
 
 /// ppacb: keep the even 8-bit lanes of each source; rt fills the low half.
@@ -1132,5 +1495,119 @@ mod tests {
         run_ee(&mut sys, 4);
         assert_eq!(sys.ee.lo[0], 0); // div overwrote lo0
         assert_eq!(sys.ee.hi[0], 6);
+    }
+
+    /// Encode an MMI-class R-type instruction: opcode 0x1C, with `funct6`
+    /// selecting the top-level MMI op (or MMI0/1/2/3's dispatch value) and
+    /// `sub_sa` selecting the sub-op within an MMI0/1/2/3 group.
+    fn mmi(rs: usize, rt: usize, rd: usize, sub_sa: u32, funct6: u32) -> u32 {
+        (0x1C << 26)
+            | ((rs as u32) << 21)
+            | ((rt as u32) << 16)
+            | ((rd as u32) << 11)
+            | (sub_sa << 6)
+            | funct6
+    }
+
+    #[test]
+    fn pmfhl_variants() {
+        let mut sys = system_with(&[
+            mmi(0, 0, 8, 0x00, 0x30),  // pmfhl.lw
+            mmi(0, 0, 9, 0x01, 0x30),  // pmfhl.uw
+            mmi(0, 0, 10, 0x03, 0x30), // pmfhl.lh
+        ]);
+        sys.ee.lo = [1 | (2u64 << 32), 5 | (6u64 << 32)];
+        sys.ee.hi = [3 | (4u64 << 32), 7 | (8u64 << 32)];
+        run_ee(&mut sys, 3);
+        assert_eq!(sys.ee.gpr[8], [1 | (3u64 << 32), 5 | (7u64 << 32)]);
+        assert_eq!(sys.ee.gpr[9], [2 | (4u64 << 32), 6 | (8u64 << 32)]);
+        assert_eq!(
+            sys.ee.gpr[10],
+            [
+                1 | (2 << 16) | (3 << 32) | (4u64 << 48),
+                5 | (6 << 16) | (7 << 32) | (8u64 << 48),
+            ]
+        );
+    }
+
+    #[test]
+    fn pmultw_places_hi_lo() {
+        let mut sys = system_with(&[
+            mmi(8, 9, 11, 0x0C, 0x09), // pmultw
+        ]);
+        sys.ee.gpr[8] = [6, 0xFFFF_FFFE]; // word0 = 6, word2 = -2
+        sys.ee.gpr[9] = [7, 5]; // word0 = 7, word2 = 5
+        run_ee(&mut sys, 1);
+        assert_eq!(sys.ee.lo[0], 42);
+        assert_eq!(sys.ee.hi[0], 0);
+        assert_eq!(sys.ee.lo[1], -10i64 as u64);
+        assert_eq!(sys.ee.hi[1], -1i64 as u64);
+        assert_eq!(sys.ee.gpr[11], [42, -10i64 as u64]);
+    }
+
+    #[test]
+    fn pmaddh_hi_lo() {
+        let pack4 = |a: u64, b: u64, c: u64, d: u64| a | (b << 16) | (c << 32) | (d << 48);
+        let mut sys = system_with(&[
+            mmi(8, 9, 12, 0x10, 0x09), // pmaddh
+        ]);
+        sys.ee.gpr[8] = [pack4(1, 2, 3, 4), pack4(5, 6, 7, 8)];
+        sys.ee.gpr[9] = [pack4(10, 20, 30, 40), pack4(50, 60, 70, 80)];
+        run_ee(&mut sys, 1);
+        // HI/LO start at zero, so PMADDH's accumulate reduces to the raw products.
+        assert_eq!(sys.ee.lo[0], 10 | (40u64 << 32));
+        assert_eq!(sys.ee.hi[0], 90 | (160u64 << 32));
+        assert_eq!(sys.ee.lo[1], 250 | (360u64 << 32));
+        assert_eq!(sys.ee.hi[1], 490 | (640u64 << 32));
+        assert_eq!(sys.ee.gpr[12], [10 | (90u64 << 32), 250 | (490u64 << 32)]);
+    }
+
+    #[test]
+    fn pdivw_two_lanes() {
+        let mut sys = system_with(&[
+            mmi(8, 9, 0, 0x0D, 0x09), // pdivw
+        ]);
+        sys.ee.gpr[8] = [17, 0xFFFF_FFF9]; // word0 = 17, word2 = -7
+        sys.ee.gpr[9] = [5, 3]; // word0 = 5, word2 = 3
+        run_ee(&mut sys, 1);
+        assert_eq!(sys.ee.lo[0], 3); // 17 / 5
+        assert_eq!(sys.ee.hi[0], 2); // 17 % 5
+        assert_eq!(sys.ee.lo[1], -2i64 as u64); // -7 / 3 (truncated)
+        assert_eq!(sys.ee.hi[1], -1i64 as u64); // -7 % 3
+    }
+
+    #[test]
+    fn pext5_ppac5_roundtrip() {
+        let mut sys = system_with(&[
+            mmi(0, 9, 11, 0x1E, 0x08), // pext5
+            mmi(0, 11, 12, 0x1F, 0x08), // ppac5
+        ]);
+        sys.ee.gpr[9] = [0xD41F, 0]; // a 5:5:5:1 pixel in the low word
+        run_ee(&mut sys, 2);
+        assert_eq!(sys.ee.gpr[12][0] as u32, 0xD41F);
+    }
+
+    #[test]
+    fn psllvw_psravw() {
+        let mut sys = system_with(&[
+            mmi(8, 9, 13, 0x02, 0x09),  // psllvw
+            mmi(8, 13, 14, 0x03, 0x29), // psravw
+        ]);
+        sys.ee.gpr[8] = [3, 1]; // shift amounts: word0=3, word2=1
+        sys.ee.gpr[9] = [1, 0xFFFF_FFF8]; // values: word0=1, word2=-8
+        run_ee(&mut sys, 2);
+        assert_eq!(sys.ee.gpr[13], [8, -16i64 as u64]); // 1<<3, -8<<1
+        assert_eq!(sys.ee.gpr[14], [1, -8i64 as u64]); // 8>>3, -16>>1 (arithmetic)
+    }
+
+    #[test]
+    fn prevh_permutation() {
+        let pack4 = |a: u64, b: u64, c: u64, d: u64| a | (b << 16) | (c << 32) | (d << 48);
+        let mut sys = system_with(&[
+            mmi(0, 9, 15, 0x1B, 0x09), // prevh
+        ]);
+        sys.ee.gpr[9] = [pack4(1, 2, 3, 4), pack4(5, 6, 7, 8)];
+        run_ee(&mut sys, 1);
+        assert_eq!(sys.ee.gpr[15], [pack4(4, 3, 2, 1), pack4(8, 7, 6, 5)]);
     }
 }
