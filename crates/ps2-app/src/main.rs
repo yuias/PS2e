@@ -344,6 +344,7 @@ fn main() -> ExitCode {
             .and_then(|_| std::fs::write(format!("{dir}/vu1_micro.bin"), &sys.bus.vu1.micro))
             .and_then(|_| std::fs::write(format!("{dir}/vu1_data.bin"), &sys.bus.vu1.data))
             .and_then(|_| std::fs::write(format!("{dir}/spu2_ram.bin"), &sys.bus.spu2.ram))
+            .and_then(|_| std::fs::write(format!("{dir}/spu2_regs.bin"), sys.bus.spu2.regs_bytes()))
         {
             eprintln!("error: RAM dump failed: {e}");
             return ExitCode::FAILURE;

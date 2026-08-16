@@ -38,7 +38,8 @@ const REG_ADMAS: usize = 0x1B0;
 const REG_VADDR: usize = 0x1C0;
 const REG_ENDX: usize = 0x340;
 const REG_STATX: usize = 0x344;
-/// Per-core volume block: MVOLL/R, EVOLL/R, AVOLL/R, BVOLL/R, MVOLXL/R.
+/// Per-core volume block: MVOLL/R, EVOLL/R, AVOLL/R (external input = the
+/// other core's output), BVOLL/R (AutoDMA input), MVOLXL/R.
 const REG_MVOL: usize = 0x760;
 const CORE_VOL_STRIDE: usize = 0x28;
 const REG_IRQINFO: usize = 0x7C2;
@@ -102,6 +103,11 @@ impl Spu2 {
     /// Take the samples mixed since the last call.
     pub fn take_output(&mut self) -> Vec<i16> {
         core::mem::take(&mut self.out)
+    }
+
+    /// Raw register file (halfwords for 0x1F900000..0x1F901000), for dumps.
+    pub fn regs_bytes(&self) -> Vec<u8> {
+        self.regs.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     /// Take the pending SPU IRQ edge (IOP I_STAT bit 9).
@@ -266,6 +272,14 @@ impl Spu2 {
                     voice.lsax_pinned = true;
                 }
             }
+            REG_MMIX | REG_ADMAS | 0x188 | 0x18C | 0x190 | 0x194 => {
+                debug!(target: "ps2_core::spu2", core, reg = format_args!("{local:#x}"), value = format_args!("{v:#06x}"), "mix control");
+                self.set_reg16(off, v);
+            }
+            REG_MVOL..=0x7AF => {
+                debug!(target: "ps2_core::spu2", reg = format_args!("{off:#x}"), value = format_args!("{v:#06x}"), "volume");
+                self.set_reg16(off, v);
+            }
             _ => self.set_reg16(off, v),
         }
     }
@@ -391,14 +405,19 @@ impl Spu2 {
         done
     }
 
-    /// Volume register: 15-bit signed when bit 15 is clear; sweep mode
-    /// (bit 15 set) is approximated by full volume.
+    /// Voice/master volume register: 15-bit signed (0x3FFF = max) when bit
+    /// 15 is clear; sweep mode (bit 15 set) is approximated by full volume.
     fn volume(v: u16) -> i32 {
-        if v & 0x8000 != 0 { 0x7FFF } else { i32::from((v << 1) as i16) >> 1 }
+        if v & 0x8000 != 0 { 0x7FFF } else { i32::from((v << 1) as i16) }
+    }
+
+    /// EVOL/AVOL/BVOL are plain signed 16-bit (0x7FFF = max).
+    fn volume16(v: u16) -> i32 {
+        i32::from(v as i16)
     }
 
     /// One 48 kHz output sample: voices and AutoDMA input per core, master
-    /// volume, core 0 folded into core 1 (its "external input", BVOL).
+    /// volume, core 0 folded into core 1 (its "external input", AVOL).
     fn mix_sample(&mut self) {
         let mut core_out = [[0i32; 2]; 2];
         for c in 0..2 {
@@ -449,8 +468,8 @@ impl Spu2 {
                 let ir = i32::from(i16::from_le_bytes([self.ram[rb], self.ram[rb + 1]]));
                 self.cores[c].adma_pos = (pos + 1) & 0x1FF;
                 if mmix & MMIX_INPUT_DRY != 0 {
-                    l += (il * Self::volume(self.reg16(vol_base + 8))) >> 15;
-                    r += (ir * Self::volume(self.reg16(vol_base + 10))) >> 15;
+                    l += (il * Self::volume16(self.reg16(vol_base + 12))) >> 15;
+                    r += (ir * Self::volume16(self.reg16(vol_base + 14))) >> 15;
                 }
             }
             let mvoll = Self::volume(self.reg16(vol_base));
@@ -458,10 +477,10 @@ impl Spu2 {
             core_out[c] = [(l * mvoll) >> 15, (r * mvolr) >> 15];
         }
         let vol_base = REG_MVOL + CORE_VOL_STRIDE;
-        let bvoll = Self::volume(self.reg16(vol_base + 12));
-        let bvolr = Self::volume(self.reg16(vol_base + 14));
-        let l = core_out[1][0] + ((core_out[0][0] * bvoll) >> 15);
-        let r = core_out[1][1] + ((core_out[0][1] * bvolr) >> 15);
+        let avoll = Self::volume16(self.reg16(vol_base + 8));
+        let avolr = Self::volume16(self.reg16(vol_base + 10));
+        let l = core_out[1][0] + ((core_out[0][0] * avoll) >> 15);
+        let r = core_out[1][1] + ((core_out[0][1] * avolr) >> 15);
         self.out.push(l.clamp(-0x8000, 0x7FFF) as i16);
         self.out.push(r.clamp(-0x8000, 0x7FFF) as i16);
     }
@@ -537,8 +556,8 @@ mod tests {
         spu.write::<2>(REG_MMIX, u32::from(MMIX_VOICE_DRY));
         spu.write::<2>(REG_MVOL, 0x3FFF);
         spu.write::<2>(REG_MVOL + 2, 0x3FFF);
-        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 12, 0x3FFF);
-        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 14, 0x3FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 8, 0x7FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 10, 0x7FFF);
         spu.write::<2>(REG_KON, 1);
         spu.tick(100 * EE_CYCLES_PER_SAMPLE);
         let out = spu.take_output();
