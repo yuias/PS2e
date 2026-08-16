@@ -385,22 +385,46 @@ impl Gs {
     /// Nearest-neighbour texture sample.
     fn sample(&self, ctx: Context, attrs: u64, frag: &Frag) -> (f32, f32, f32, f32) {
         let tex0 = ctx.tex0;
+        let tw = 1u32 << ((tex0 >> 26) & 0xF).min(10);
+        let th = 1u32 << ((tex0 >> 30) & 0xF).min(10);
+
+        // FST: UV addressing vs STQ. Texel-space coordinates, fractional.
+        let (fu, fv) = if attrs & (1 << 8) != 0 {
+            (frag.u, frag.v)
+        } else {
+            let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
+            (frag.s / q * tw as f32, frag.t / q * th as f32)
+        };
+
+        // TEX1 MMAG selects the magnification filter; minification and
+        // mipmaps are not modelled, so it decides for every sample.
+        if (ctx.tex1 >> 5) & 1 == 0 {
+            return self.texel(ctx, fu.floor() as i32, fv.floor() as i32);
+        }
+        let x = fu - 0.5;
+        let y = fv - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let t00 = self.texel(ctx, x0, y0);
+        let t10 = self.texel(ctx, x0 + 1, y0);
+        let t01 = self.texel(ctx, x0, y0 + 1);
+        let t11 = self.texel(ctx, x0 + 1, y0 + 1);
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let mix = |c: fn(&(f32, f32, f32, f32)) -> f32| {
+            lerp(lerp(c(&t00), c(&t10), fx), lerp(c(&t01), c(&t11), fx), fy)
+        };
+        (mix(|t| t.0), mix(|t| t.1), mix(|t| t.2), mix(|t| t.3))
+    }
+
+    /// One texel at integer texel coordinates, after CLAMP wrapping.
+    fn texel(&self, ctx: Context, u: i32, v: i32) -> (f32, f32, f32, f32) {
+        let tex0 = ctx.tex0;
         let tbp = (tex0 & 0x3FFF) as u32;
         let tbw = ((tex0 >> 14) & 0x3F) as u32;
         let psm = ((tex0 >> 20) & 0x3F) as u32;
         let tw = 1u32 << ((tex0 >> 26) & 0xF).min(10);
         let th = 1u32 << ((tex0 >> 30) & 0xF).min(10);
-
-        // FST: UV addressing vs STQ.
-        let (mut u, mut v) = if attrs & (1 << 8) != 0 {
-            (frag.u as i32, frag.v as i32)
-        } else {
-            let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
-            (
-                (frag.s / q * tw as f32) as i32,
-                (frag.t / q * th as f32) as i32,
-            )
-        };
 
         // CLAMP register: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat.
         let wms = ctx.clamp & 3;
@@ -409,9 +433,8 @@ impl Gs {
         let maxu = ((ctx.clamp >> 14) & 0x3FF) as i32;
         let minv = ((ctx.clamp >> 24) & 0x3FF) as i32;
         let maxv = ((ctx.clamp >> 34) & 0x3FF) as i32;
-        u = wrap(u, wms, tw as i32, minu, maxu);
-        v = wrap(v, wmt, th as i32, minv, maxv);
-        let (u, v) = (u as u32, v as u32);
+        let u = wrap(u, wms, tw as i32, minu, maxu) as u32;
+        let v = wrap(v, wmt, th as i32, minv, maxv) as u32;
 
         let texel = match psm {
             PSMCT32 | PSMCT24 => self.read_psmct32(tbp, tbw, u, v),
