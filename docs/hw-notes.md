@@ -387,3 +387,20 @@ each wait):
 - IRQs: intrman 0x24/0x28 (DMA ch4/ch7), 9 (SPU IRQA). libspu2 also
   toggles ATTR bit 6 to arm/clear the IRQ ("wait (IRQ/ON)" / "IRQ/OFF"
   read the bit back).
+
+## GS notes from Amagami (SLPS-25918)
+
+- Its OP parks the 8-bit movie textures (PSMT8, bp 4480, dbw 10/8,
+  re-uploaded every frame with a fresh 16x16 CSM1 CLUT) on top of the
+  Z buffer (ZBUF bp 4480, PSMZ24, ZMSK=1) and still Z-tests full-screen
+  copies at z = 0xFFFFFF with GEQUAL. Only a 24-bit compare passes:
+  the upper byte of each word holds texture data.
+- "NOW LOADING" text and its spinner are drawn from the display
+  buffer's alpha plane: PSMT8H IMAGE uploads into bp 0 (dbw 10) at
+  (0,0), CLUT re-uploaded to bp 10108 before each draw.
+- 640x224 field buffers at bp 0 / 2240 (double buffered), extra
+  buffers at 6720 / 8960 filled early by full-screen textured sprite
+  copies of 2240 (a crossfade capture: at that moment 2240 still holds
+  the PS2 logo). During the OP the particle triangles sample 6720/8960
+  and 0/2240 (refraction look-ups with STQ) plus small PSMCT16/32
+  textures at bp 11552/11488/11456/12384/12320.
