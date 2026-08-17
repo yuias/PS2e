@@ -969,6 +969,10 @@ pub struct Bus {
     ee_tlb: [(u32, u32, u32, u32); 48],
     /// (vaddr page | 1) -> phys page; 0 = invalid slot.
     tlb_cache: Box<[(u32, u32)]>,
+    /// Instruction-fetch page cache: virtual page tag and its RAM offset
+    /// (tag 1 never matches an aligned page).
+    fetch_tag: u32,
+    fetch_base: usize,
     /// Deferred EE DMAC completion interrupts: (D_STAT bit, due cycle).
     /// Data moves instantly but completion must not fire inside the very
     /// instruction that started the transfer.
@@ -1029,6 +1033,8 @@ impl Bus {
             warned_unmapped: HashSet::new(),
             ee_tlb: [(0, 0, 0, 0); 48],
             tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
+            fetch_tag: 1,
+            fetch_base: 0,
             dma_irq_queue: Vec::new(),
         }
     }
@@ -1043,6 +1049,7 @@ impl Bus {
         if idx < 48 {
             self.ee_tlb[idx] = (mask, hi, lo0, lo1);
             self.tlb_cache.fill((0, 0));
+            self.fetch_tag = 1;
         }
     }
 
@@ -1141,9 +1148,19 @@ impl Bus {
         self.write::<8>(vaddr + 8, v[1]);
     }
 
-    /// Instruction fetch: same path as data reads for now.
+    /// Instruction fetch: RAM pages hit a one-entry page cache; anything
+    /// else (BIOS, unmapped) takes the data-read path.
     #[inline]
     pub fn fetch32(&mut self, vaddr: u32) -> u32 {
+        if vaddr & !0xFFF == self.fetch_tag {
+            return read_le::<4>(&self.ram, self.fetch_base + (vaddr & 0xFFF) as usize) as u32;
+        }
+        let addr = self.translate(vaddr);
+        if (addr as usize) < RAM_SIZE {
+            self.fetch_tag = vaddr & !0xFFF;
+            self.fetch_base = (addr & !0xFFF) as usize;
+            return read_le::<4>(&self.ram, addr as usize) as u32;
+        }
         self.read32(vaddr)
     }
 
@@ -2557,11 +2574,10 @@ impl Bus {
 
 #[inline]
 fn read_le<const N: usize>(mem: &[u8], offset: usize) -> u64 {
-    let mut v = 0u64;
-    for i in 0..N {
-        v |= (mem[offset + i] as u64) << (8 * i);
-    }
-    v
+    // One bounds check and one load, instead of a byte loop.
+    let mut b = [0u8; 8];
+    b[..N].copy_from_slice(&mem[offset..offset + N]);
+    u64::from_le_bytes(b)
 }
 
 /// Read `N` bytes of a 32-bit register at the byte lane selected by `addr`.
@@ -2583,9 +2599,7 @@ fn merge_sub_word<const N: usize>(reg: u32, addr: u32, v: u32) -> u32 {
 
 #[inline]
 fn write_le<const N: usize>(mem: &mut [u8], offset: usize, v: u64) {
-    for i in 0..N {
-        mem[offset + i] = (v >> (8 * i)) as u8;
-    }
+    mem[offset..offset + N].copy_from_slice(&v.to_le_bytes()[..N]);
 }
 
 #[cfg(test)]
