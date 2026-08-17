@@ -977,6 +977,10 @@ pub struct Bus {
     pub(crate) dirty_code_writes: Vec<u32>,
     /// A TLB rewrite invalidated every recompiled block.
     pub(crate) jit_flush_needed: bool,
+    /// Addresses of `ram` and `code_pages` for the recompiler's inline RAM
+    /// fast paths (the boxes never move; kept as integers so Bus stays Send).
+    pub(crate) ram_ptr: usize,
+    pub(crate) code_pages_ptr: usize,
     /// Instruction-fetch page cache: virtual page tag and its RAM offset
     /// (tag 1 never matches an aligned page).
     fetch_tag: u32,
@@ -994,7 +998,7 @@ impl Bus {
         // DMAC ENABLER resets to 0x1201; the BIOS uses it as a board-revision
         // key into its RDRAM configuration table during InitRDRAM.
         write_le::<4>(&mut mmio, 0xF590, 0x1201);
-        Self {
+        let mut bus = Self {
             ram: vec![0u8; RAM_SIZE].into_boxed_slice(),
             bios: bios.into_boxed_slice(),
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
@@ -1044,10 +1048,15 @@ impl Bus {
             code_pages: vec![false; RAM_SIZE >> 12].into_boxed_slice(),
             dirty_code_writes: Vec::new(),
             jit_flush_needed: false,
+            ram_ptr: 0,
+            code_pages_ptr: 0,
             fetch_tag: 1,
             fetch_base: 0,
             dma_irq_queue: Vec::new(),
-        }
+        };
+        bus.ram_ptr = bus.ram.as_mut_ptr() as usize;
+        bus.code_pages_ptr = bus.code_pages.as_ptr() as usize;
+        bus
     }
 
     /// Queue an EE DMAC completion interrupt a little into the future.

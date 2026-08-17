@@ -184,7 +184,13 @@ impl Ps2System {
                 && let Some(jit) = &mut self.jit
             {
                 self.bus.now = self.cycles;
-                let n = jit.run(&mut self.ee, &mut self.bus);
+                // Linked blocks run until about this many cycles retired;
+                // the IOP, timers and vblank then catch up. Longer chains
+                // amortise the dispatcher, shorter ones keep the cores
+                // closer in step.
+                const CHAIN_BUDGET: u64 = 128;
+                let budget = (target - self.cycles).min(CHAIN_BUDGET) as u32;
+                let n = jit.run(&mut self.ee, &mut self.bus, budget);
                 self.advance(n as u64);
                 continue;
             }

@@ -15,7 +15,7 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, x64::X64Relocation};
 use super::super::fpu::Fpu;
 use super::super::Cpu;
 use super::helpers as h;
-use crate::bus::Bus;
+use crate::bus::{Bus, RAM_SIZE};
 use crate::vu1::Vu1;
 
 pub type Ops = VecAssembler<X64Relocation>;
@@ -863,8 +863,51 @@ fn emit_addr(ops: &mut Ops, rs: u32, simm: i32) {
     );
 }
 
+/// With eax = virtual address: if it is plain RAM (kuseg below 32 MiB,
+/// or kseg0/kseg1 mapping there), leave rdx = host address of the byte
+/// and fall through; otherwise jump to `slow`. Clobbers ecx, rdx.
+fn emit_ram_fast_path(ops: &mut Ops, slow: dynasmrt::DynamicLabel) {
+    let ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov ecx, eax
+        ; shr ecx, 29 // segment: 0 = low kuseg, 4 = kseg0, 5 = kseg1
+        ; mov edx, eax
+        ; and edx, 0x1FFF_FFFF
+        ; cmp edx, RAM_SIZE as i32
+        ; jae =>slow
+        ; test ecx, ecx
+        ; jz =>ok
+        ; cmp ecx, 4
+        ; je =>ok
+        ; cmp ecx, 5
+        ; jne =>slow
+        ; =>ok
+        ; add rdx, QWORD [r12 + (offset_of!(Bus, ram_ptr) as i32)]
+    );
+}
+
 fn emit_load(ops: &mut Ops, op: u32, rs: u32, rt: u32, simm: i32) {
     emit_addr(ops, rs, simm);
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_ram_fast_path(ops, slow);
+    // Fast path: load straight from host RAM, already extended.
+    match op {
+        0x20 => dynasm!(ops ; .arch x64 ; movsx rax, BYTE [rdx]),
+        0x24 => dynasm!(ops ; .arch x64 ; movzx eax, BYTE [rdx]),
+        0x21 => dynasm!(ops ; .arch x64 ; movsx rax, WORD [rdx]),
+        0x25 => dynasm!(ops ; .arch x64 ; movzx eax, WORD [rdx]),
+        0x23 => dynasm!(ops ; .arch x64 ; movsxd rax, DWORD [rdx]),
+        0x27 | 0x31 => dynasm!(ops ; .arch x64 ; mov eax, DWORD [rdx]),
+        0x37 => dynasm!(ops ; .arch x64 ; mov rax, QWORD [rdx]),
+        _ => unreachable!(),
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; jmp =>done
+        ; =>slow
+    );
     let (helper, ext): (usize, fn(&mut Ops)) = match op {
         0x20 => (h::rd8 as *const () as usize, |o| dynasm!(o ; .arch x64 ; movsx rax, al)),
         0x24 => (h::rd8 as *const () as usize, |o| dynasm!(o ; .arch x64 ; movzx eax, al)),
@@ -877,19 +920,55 @@ fn emit_load(ops: &mut Ops, op: u32, rs: u32, rt: u32, simm: i32) {
         _ => unreachable!(),
     };
     call_bus_addr(ops, helper);
+    ext(ops);
+    dynasm!(ops ; .arch x64 ; =>done);
     if op == 0x31 {
         let ft = rt;
         dynasm!(ops ; .arch x64 ; mov DWORD [rbx + fpr(ft)], eax);
         return;
     }
     if rt != 0 {
-        ext(ops);
         dynasm!(ops ; .arch x64 ; mov QWORD [rbx + gpr(rt)], rax);
     }
 }
 
 fn emit_store(ops: &mut Ops, op: u32, rs: u32, rt: u32, simm: i32) {
     emit_addr(ops, rs, simm);
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_ram_fast_path(ops, slow);
+    // Fast path only when no recompiled code lives on the page (the slow
+    // path records the write for invalidation).
+    dynasm!(ops
+        ; .arch x64
+        ; mov ecx, eax
+        ; and ecx, 0x1FFF_FFFF
+        ; shr ecx, 12
+        ; mov r8, QWORD [r12 + (offset_of!(Bus, code_pages_ptr) as i32)]
+        ; cmp BYTE [r8 + rcx], 0
+        ; jne =>slow
+    );
+    if op == 0x39 {
+        dynasm!(ops
+            ; .arch x64
+            ; mov ecx, DWORD [rbx + fpr(rt)]
+            ; mov DWORD [rdx], ecx
+        );
+    } else {
+        load64_rcx(ops, rt);
+        match op {
+            0x28 => dynasm!(ops ; .arch x64 ; mov BYTE [rdx], cl),
+            0x29 => dynasm!(ops ; .arch x64 ; mov WORD [rdx], cx),
+            0x2B => dynasm!(ops ; .arch x64 ; mov DWORD [rdx], ecx),
+            0x3F => dynasm!(ops ; .arch x64 ; mov QWORD [rdx], rcx),
+            _ => unreachable!(),
+        }
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; jmp =>done
+        ; =>slow
+    );
     // Value into rcx (helpers take it as the third argument).
     if op == 0x39 {
         dynasm!(ops ; .arch x64 ; mov ecx, DWORD [rbx + fpr(rt)]);
@@ -904,6 +983,7 @@ fn emit_store(ops: &mut Ops, op: u32, rs: u32, rt: u32, simm: i32) {
         _ => unreachable!(),
     };
     call_bus_addr_val(ops, helper);
+    dynasm!(ops ; .arch x64 ; =>done);
 }
 
 // --- calling convention plumbing ---------------------------------------
@@ -1055,35 +1135,87 @@ fn call_bus_addr_ptr(ops: &mut Ops, f: usize, off: i32) {
     );
 }
 
-/// After the delay slot of a branch: resolve it, write pc/next_pc and exit
-/// with `count` cycles. `fallthrough` is the address after the delay slot.
-pub fn emit_branch_end(ops: &mut Ops, kind: BranchKind, fallthrough: u32, count: u32, idle: bool) {
-    let taken = |ops: &mut Ops, target: Option<u32>| {
-        match target {
-            Some(t) => dynasm!(ops
-                ; .arch x64
-                ; mov DWORD [rbx + pc_off()], t as i32
-                ; mov DWORD [rbx + next_pc_off()], t.wrapping_add(4) as i32
-            ),
-            None => dynasm!(ops
-                ; .arch x64
-                ; mov DWORD [rbx + pc_off()], r14d
-                ; lea eax, [r14 + 4]
-                ; mov DWORD [rbx + next_pc_off()], eax
-            ),
-        }
-        if idle {
-            dynasm!(ops ; .arch x64 ; mov BYTE [rbx + idle_off()], 1);
-        }
+/// Exit sequences. Every exit adds the block's retired count to the cycle
+/// counter (r15) first. Constant targets go through a link cell: an
+/// indirect jump whose cell holds either the target block's body (once
+/// compiled and linked) or this block's own slow path, which stores pc and
+/// returns to the dispatcher.
+pub struct Exits<'a> {
+    pub jit: &'a mut super::Jit,
+    /// (cell index, target pc, offset of the slow path in this block).
+    pub links: Vec<(usize, u32, usize)>,
+}
+
+impl Exits<'_> {
+    /// Exit to constant `target` after `count` retired cycles.
+    pub fn to(&mut self, ops: &mut Ops, target: u32, count: u32) {
+        let (idx, cell) = self.jit.link_cell();
         dynasm!(ops
             ; .arch x64
-            ; mov eax, count as i32
+            ; add r15d, count as i32
+            ; mov rax, QWORD cell as i64
+            ; jmp QWORD [rax]
+        );
+        self.links.push((idx, target, ops.offset().0));
+        dynasm!(ops
+            ; .arch x64
+            ; mov DWORD [rbx + pc_off()], target as i32
+            ; mov DWORD [rbx + next_pc_off()], target.wrapping_add(4) as i32
+            ; mov eax, r15d
             ; jmp ->epilogue
         );
-    };
+    }
+
+    /// Exit to `target` without linking (idle loop: the dispatcher must see
+    /// the flag).
+    pub fn to_unlinked(&mut self, ops: &mut Ops, target: u32, count: u32) {
+        dynasm!(ops
+            ; .arch x64
+            ; add r15d, count as i32
+            ; mov DWORD [rbx + pc_off()], target as i32
+            ; mov DWORD [rbx + next_pc_off()], target.wrapping_add(4) as i32
+            ; mov eax, r15d
+            ; jmp ->epilogue
+        );
+    }
+
+    /// Exit to the address in r14d.
+    pub fn to_reg(&mut self, ops: &mut Ops, count: u32) {
+        dynasm!(ops
+            ; .arch x64
+            ; add r15d, count as i32
+            ; mov DWORD [rbx + pc_off()], r14d
+            ; lea eax, [r14 + 4]
+            ; mov DWORD [rbx + next_pc_off()], eax
+            ; mov eax, r15d
+            ; jmp ->epilogue
+        );
+    }
+
+    /// Exit with pc already stored by an interpreted instruction.
+    pub fn to_stored(&mut self, ops: &mut Ops, count: u32) {
+        dynasm!(ops
+            ; .arch x64
+            ; add r15d, count as i32
+            ; mov eax, r15d
+            ; jmp ->epilogue
+        );
+    }
+}
+
+/// After the delay slot of a branch: resolve it and exit with `count`
+/// cycles. `fallthrough` is the address after the delay slot.
+pub fn emit_branch_end(ops: &mut Ops, kind: BranchKind, fallthrough: u32, count: u32, idle: bool, exits: &mut Exits) {
     match kind {
-        BranchKind::Jump(t) => taken(ops, Some(t)),
-        BranchKind::JumpReg => taken(ops, None),
+        BranchKind::Jump(t) => {
+            if idle {
+                dynasm!(ops ; .arch x64 ; mov BYTE [rbx + idle_off()], 1);
+                exits.to_unlinked(ops, t, count);
+            } else {
+                exits.to(ops, t, count);
+            }
+        }
+        BranchKind::JumpReg => exits.to_reg(ops, count),
         BranchKind::Cond { target, .. } => {
             let not_taken = ops.new_dynamic_label();
             dynasm!(ops
@@ -1091,31 +1223,26 @@ pub fn emit_branch_end(ops: &mut Ops, kind: BranchKind, fallthrough: u32, count:
                 ; test r13d, r13d
                 ; jz =>not_taken
             );
-            taken(ops, Some(target));
-            dynasm!(ops
-                ; .arch x64
-                ; =>not_taken
-                ; mov DWORD [rbx + pc_off()], fallthrough as i32
-                ; mov DWORD [rbx + next_pc_off()], fallthrough.wrapping_add(4) as i32
-                ; mov eax, count as i32
-                ; jmp ->epilogue
-            );
+            if idle {
+                dynasm!(ops ; .arch x64 ; mov BYTE [rbx + idle_off()], 1);
+                exits.to_unlinked(ops, target, count);
+            } else {
+                exits.to(ops, target, count);
+            }
+            dynasm!(ops ; .arch x64 ; =>not_taken);
+            exits.to(ops, fallthrough, count);
         }
     }
 }
 
 /// Likely branch not taken: skip the delay slot, continue after it.
-pub fn emit_likely_skip(ops: &mut Ops, fallthrough: u32, count: u32) -> dynasmrt::DynamicLabel {
+pub fn emit_likely_skip(ops: &mut Ops, fallthrough: u32, count: u32, exits: &mut Exits) {
     let taken = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
         ; test r13d, r13d
         ; jnz =>taken
-        ; mov DWORD [rbx + pc_off()], fallthrough as i32
-        ; mov DWORD [rbx + next_pc_off()], fallthrough.wrapping_add(4) as i32
-        ; mov eax, count as i32
-        ; jmp ->epilogue
-        ; =>taken
     );
-    taken
+    exits.to(ops, fallthrough, count);
+    dynasm!(ops ; .arch x64 ; =>taken);
 }

@@ -28,8 +28,9 @@ use super::Cpu;
 use crate::bus::{Bus, RAM_SIZE};
 use arena::Arena;
 
-/// Native block entry: (cpu, bus) -> instructions retired.
-type Entry = unsafe extern "C" fn(*mut Cpu, *mut Bus) -> u32;
+/// Native block entry: (cpu, bus, cycle budget) -> cycles retired by the
+/// chain of linked blocks that ran.
+type Entry = unsafe extern "C" fn(*mut Cpu, *mut Bus, u32) -> u32;
 
 /// Code arena size; when full, every block is dropped and it starts over.
 const ARENA_BYTES: usize = 64 << 20;
@@ -37,12 +38,19 @@ const ARENA_BYTES: usize = 64 << 20;
 const MAX_BLOCK: usize = 64;
 /// Direct-mapped lookup entries (indexed by pc >> 2).
 const LOOKUP_ENTRIES: usize = 1 << 16;
+/// Link cells (one per constant-target exit); the cache is flushed when
+/// they run out.
+const LINK_CELLS: usize = 1 << 20;
 
 struct Block {
     pc: u32,
     entry: Entry,
+    /// Address of the body (after the prologue): where linked jumps land.
+    body: u64,
     /// Physical byte range the block was translated from (RAM blocks).
     phys: Option<(u32, u32)>,
+    /// Link cells currently pointing at this block's body.
+    incoming: Vec<usize>,
     valid: bool,
 }
 
@@ -54,6 +62,13 @@ pub struct Jit {
     lookup: Box<[u32]>,
     /// RAM page -> blocks translated from it.
     page_blocks: Vec<Vec<u32>>,
+    /// Link cells: jump targets read by block exits (see `emit::Exits`).
+    cells: Box<[u64]>,
+    /// Each cell's own slow path, restored when its target goes away.
+    cell_slow: Box<[u64]>,
+    cells_used: usize,
+    /// Cells waiting for a block at this pc to be compiled.
+    pending_links: HashMap<u32, Vec<usize>>,
     pub blocks_compiled: u64,
     pub blocks_invalidated: u64,
     pub blocks_run: u64,
@@ -68,6 +83,10 @@ impl Jit {
             by_pc: HashMap::new(),
             lookup: vec![0u32; LOOKUP_ENTRIES].into_boxed_slice(),
             page_blocks: vec![Vec::new(); RAM_SIZE >> 12],
+            cells: vec![0u64; LINK_CELLS].into_boxed_slice(),
+            cell_slow: vec![0u64; LINK_CELLS].into_boxed_slice(),
+            cells_used: 0,
+            pending_links: HashMap::new(),
             blocks_compiled: 0,
             blocks_invalidated: 0,
             blocks_run: 0,
@@ -75,10 +94,11 @@ impl Jit {
         })
     }
 
-    /// Execute from the current PC: one translated block, or one
+    /// Execute from the current PC: a chain of linked blocks until about
+    /// `budget` cycles have retired (a block may overshoot), or one
     /// interpreter step when the CPU is mid-branch or has an interrupt to
     /// take. Returns the EE cycles consumed (>= 1).
-    pub fn run(&mut self, cpu: &mut Cpu, bus: &mut Bus) -> u32 {
+    pub fn run(&mut self, cpu: &mut Cpu, bus: &mut Bus, budget: u32) -> u32 {
         if bus.jit_flush_needed {
             bus.jit_flush_needed = false;
             self.flush(bus);
@@ -102,7 +122,7 @@ impl Jit {
         // SAFETY: `entry` is a complete block in our arena; the pointers are
         // exclusively ours for the call and the block only touches the CPU
         // and bus through the helpers below.
-        let mut n = unsafe { entry(cpu as *mut Cpu, bus as *mut Bus) };
+        let mut n = unsafe { entry(cpu as *mut Cpu, bus as *mut Bus, budget.max(1)) };
         // A diverting instruction (branch, exception, idle loop) leaves the
         // interpreter's delay-slot state behind; let it finish the branch.
         while cpu.next_is_delay {
@@ -146,6 +166,13 @@ impl Jit {
                         b.valid = false;
                         self.by_pc.remove(&b.pc);
                         self.blocks_invalidated += 1;
+                        // Anything linked here goes back to its slow path
+                        // and waits for a recompile at this pc.
+                        let (pc, incoming) = (b.pc, std::mem::take(&mut b.incoming));
+                        for &c in &incoming {
+                            self.cells[c] = self.cell_slow[c];
+                        }
+                        self.pending_links.entry(pc).or_default().extend(incoming);
                     }
                     _ => any_left = true,
                 }
@@ -168,18 +195,37 @@ impl Jit {
         }
         bus.code_pages.fill(false);
         bus.dirty_code_writes.clear();
+        self.cells_used = 0;
+        self.pending_links.clear();
+    }
+
+    /// Allocate a link cell; returns (index, address).
+    fn link_cell(&mut self) -> (usize, u64) {
+        let idx = self.cells_used;
+        self.cells_used += 1;
+        (idx, &self.cells[idx] as *const u64 as u64)
     }
 
     fn compile(&mut self, pc: u32, bus: &mut Bus) -> Entry {
         // Generous upper bound per block; reset the arena rather than fail.
-        if self.arena.remaining() < 64 * 1024 {
+        if self.arena.remaining() < 64 * 1024 || self.cells_used + 256 > LINK_CELLS {
             self.flush(bus);
         }
-        let mut ops = VecAssembler::<X64Relocation>::new(self.arena.next_addr());
+        let base = self.arena.next_addr();
+        let mut ops = VecAssembler::<X64Relocation>::new(base);
         emit_prologue(&mut ops);
+        // Body: linked jumps land here; leave when the cycle budget is used.
+        let body_off = ops.offset().0;
+        let budget_exit = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch x64
+            ; cmp r15d, ebp
+            ; jae =>budget_exit
+        );
+        let mut exits = emit::Exits { jit: self, links: Vec::new() };
 
         // (label, cycles retired) for interpreter calls that diverted.
-        let mut exits: Vec<(dynasmrt::DynamicLabel, u32)> = Vec::with_capacity(MAX_BLOCK);
+        let mut interp_exits: Vec<(dynasmrt::DynamicLabel, u32)> = Vec::with_capacity(MAX_BLOCK);
         let mut addr = pc;
         let mut count = 0u32;
         loop {
@@ -196,56 +242,55 @@ impl Jit {
                 count += 1;
                 let ds_addr = addr.wrapping_add(4);
                 if let emit::BranchKind::Cond { likely: true, .. } = kind {
-                    emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), count);
+                    emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), count, &mut exits);
                 }
                 if let emit::Emitted::Interp = emit::emit(&mut ops, ds_addr, next) {
-                    self.emit_interp(&mut ops, ds_addr, next, count + 1, &mut exits);
+                    emit_interp(&mut ops, ds_addr, next, count + 1, &mut interp_exits);
                 }
                 count += 1;
                 let idle = is_idle_loop(bus, addr, instr, next);
-                emit::emit_branch_end(&mut ops, kind, ds_addr.wrapping_add(4), count, idle);
+                emit::emit_branch_end(&mut ops, kind, ds_addr.wrapping_add(4), count, idle, &mut exits);
                 break;
             }
             if let emit::Emitted::Interp = emitted {
-                self.emit_interp(&mut ops, addr, instr, count + 1, &mut exits);
+                emit_interp(&mut ops, addr, instr, count + 1, &mut interp_exits);
                 emitted = emit::Emitted::Plain;
             }
             let _ = emitted;
             count += 1;
             let control = is_control_flow(instr);
             addr = addr.wrapping_add(4);
-            if control || count as usize >= MAX_BLOCK || addr & 0xFFF == 0 {
-                // Fell off the end: pc/next_pc were left by the last
-                // interpreted instruction, or must be written here.
-                if !control {
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov DWORD [rbx + emit::pc_off()], addr as i32
-                        ; mov DWORD [rbx + emit::next_pc_off()], addr.wrapping_add(4) as i32
-                    );
-                }
-                dynasm!(ops
-                    ; .arch x64
-                    ; mov eax, count as i32
-                    ; jmp ->epilogue
-                );
+            if control {
+                // pc/next_pc were left by the interpreted instruction.
+                exits.to_stored(&mut ops, count);
+                break;
+            }
+            if count as usize >= MAX_BLOCK || addr & 0xFFF == 0 {
+                exits.to(&mut ops, addr, count);
                 break;
             }
         }
-        for (label, retired) in &exits {
-            dynasm!(ops
-                ; .arch x64
-                ; =>*label
-                ; mov eax, *retired as i32
-                ; jmp ->epilogue
-            );
+        for (label, retired) in &interp_exits {
+            dynasm!(ops ; .arch x64 ; =>*label);
+            exits.to_stored(&mut ops, *retired);
         }
+        dynasm!(ops
+            ; .arch x64
+            ; =>budget_exit
+            ; mov DWORD [rbx + emit::pc_off()], pc as i32
+            ; mov DWORD [rbx + emit::next_pc_off()], pc.wrapping_add(4) as i32
+            ; mov eax, r15d
+            ; jmp ->epilogue
+        );
         emit_epilogue(&mut ops);
+        let links = exits.links;
 
         let code = ops.finalize().expect("dynasm assembly failed");
         let ptr = self.arena.place(&code);
+        debug_assert_eq!(ptr as usize, base);
         // SAFETY: the bytes at ptr are the function assembled above.
         let entry: Entry = unsafe { std::mem::transmute(ptr) };
+        let body = (base + body_off) as u64;
 
         // Track the RAM range the block reads its code from, for
         // invalidation on write. ROM/other blocks are never invalidated.
@@ -261,32 +306,55 @@ impl Jit {
                 bus.code_pages[p as usize] = true;
             }
         }
-        self.blocks.push(Block { pc, entry, phys, valid: true });
+        self.blocks.push(Block { pc, entry, body, phys, incoming: Vec::new(), valid: true });
         self.by_pc.insert(pc, idx);
         self.lookup[((pc >> 2) as usize) & (LOOKUP_ENTRIES - 1)] = idx + 1;
         self.blocks_compiled += 1;
+
+        // Wire this block's exits to compiled targets (or park them), and
+        // point exits parked on this pc at the new body.
+        for (cell, target, slow_off) in links {
+            let slow = (base + slow_off) as u64;
+            self.cell_slow[cell] = slow;
+            match self.by_pc.get(&target).map(|&i| i as usize) {
+                Some(t) if self.blocks[t].valid => {
+                    self.cells[cell] = self.blocks[t].body;
+                    self.blocks[t].incoming.push(cell);
+                }
+                _ => {
+                    self.cells[cell] = slow;
+                    self.pending_links.entry(target).or_default().push(cell);
+                }
+            }
+        }
+        if let Some(waiting) = self.pending_links.remove(&pc) {
+            for cell in waiting {
+                self.cells[cell] = body;
+                self.blocks[idx as usize].incoming.push(cell);
+            }
+        }
         entry
     }
 
-    /// Call the interpreter for one instruction; exit the block with
-    /// `retired` cycles if it diverted control.
-    fn emit_interp(
-        &self,
-        ops: &mut emit::Ops,
-        addr: u32,
-        instr: u32,
-        retired: u32,
-        exits: &mut Vec<(dynasmrt::DynamicLabel, u32)>,
-    ) {
-        let exit = ops.new_dynamic_label();
-        emit_call4(ops, interp_one as *const () as usize, addr, instr);
-        dynasm!(ops
-            ; .arch x64
-            ; test eax, eax
-            ; jnz =>exit
-        );
-        exits.push((exit, retired));
-    }
+}
+
+/// Call the interpreter for one instruction; exit the block with
+/// `retired` cycles if it diverted control.
+fn emit_interp(
+    ops: &mut emit::Ops,
+    addr: u32,
+    instr: u32,
+    retired: u32,
+    exits: &mut Vec<(dynasmrt::DynamicLabel, u32)>,
+) {
+    let exit = ops.new_dynamic_label();
+    emit_call4(ops, interp_one as *const () as usize, addr, instr);
+    dynasm!(ops
+        ; .arch x64
+        ; test eax, eax
+        ; jnz =>exit
+    );
+    exits.push((exit, retired));
 }
 
 /// The kernel idle thread: `beq $0,$0` backwards over nothing but nops
@@ -381,7 +449,8 @@ fn emit_call4(ops: &mut VecAssembler<X64Relocation>, f: usize, a2: u32, a3: u32)
 }
 
 /// Save callee-saved registers, keep the stack 16-aligned with 32 bytes of
-/// shadow space (Windows needs it, SysV does not mind), rbx = cpu, r12 = bus.
+/// shadow space (Windows needs it, SysV does not mind); rbx = cpu, r12 =
+/// bus, ebp = cycle budget, r15 = cycles retired so far.
 fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
     dynasm!(ops
         ; .arch x64
@@ -398,13 +467,16 @@ fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
         ; .arch x64
         ; mov rbx, rcx
         ; mov r12, rdx
+        ; mov ebp, r8d
     );
     #[cfg(not(windows))]
     dynasm!(ops
         ; .arch x64
         ; mov rbx, rdi
         ; mov r12, rsi
+        ; mov ebp, edx
     );
+    dynasm!(ops ; .arch x64 ; xor r15d, r15d);
 }
 
 fn emit_epilogue(ops: &mut VecAssembler<X64Relocation>) {
