@@ -28,3 +28,8 @@ assets/
 
 # Claude Code
 .claude/
+
+# Local bring-up artifacts
+dumps/
+shots/
+__pycache__/
