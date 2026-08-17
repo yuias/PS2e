@@ -80,18 +80,28 @@ Planned crates:
 
 ```
 ps2-core/src/
-├── lib.rs        # Ps2System: EE + IOP interleave (8:1), vblank scheduling
-├── bus.rs        # Both memory maps, MMIO dispatch, SIF DMA pump, INTC/DMAC/IOP-DMA state
+├── lib.rs        # Ps2System: EE + IOP interleave (8:1), vblank scheduling, idle skipping
+├── bus.rs        # Both memory maps, MMIO dispatch, EE/IOP DMA, INTC/DMAC, CDVD, SIO2, TLB
 ├── sif.rs        # SIF mailboxes/flags/control + SIF0/SIF1 FIFOs
 ├── timers.rs     # EE timers (lazy counts, compare interrupts)
+├── gif.rs        # GIF tag parser (packed/reglist/image) feeding the GS
+├── vif.rs        # VIF1 command parser and UNPACK expansion into VU1 memory
+├── vu1.rs        # VU micro interpreter (also serves VU0 macro mode)
+├── prof.rs       # `profile` feature: TSC scopes, instruction/PC histograms
 ├── ee/
-│   ├── mod.rs    # R5900 interpreter (128-bit GPRs, MMI, branch delay slots)
+│   ├── mod.rs    # R5900 interpreter (128-bit GPRs, MMI, COP2 macro, branch delay slots)
 │   ├── cop0.rs   # Status/Cause/EPC, exceptions, ERET, interrupt gating
 │   └── fpu.rs    # COP1 (non-IEEE single-precision; host f32 approximation for now)
-└── iop/
-    └── mod.rs    # R3000A interpreter (load delay slots, PS1-style COP0)
+├── iop/
+│   └── mod.rs    # R3000A interpreter (load delay slots, PS1-style COP0)
+├── gs/
+│   ├── mod.rs    # Registers, vertex kick, IMAGE/local transfers, VRAM accessors, scanout
+│   ├── layout.rs # Hardware page/block/column addressing for every pixel format
+│   └── raster.rs # Triangle/sprite rasterization, texture sampling, tests, blending
+└── spu2/
+    ├── mod.rs    # Registers, transfer engine, ADMA, mixer
+    └── voice.rs  # ADPCM decode, ADSR envelopes
 ```
 
-Planned: `gs/`, `vu/`, `dmac/` (full 10-channel), `gif/`, `vif/`, `ipu/`,
-`cdvd/`, `spu2/`, `scheduler` (event-driven for VBlank-class events only;
-everything else catch-up ticks, as in PS1e).
+Not yet split out: `ipu/` (absent), a full 10-channel `dmac/` (channels live in
+`bus.rs`), and an event scheduler (everything is catch-up ticks today).
