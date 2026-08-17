@@ -48,9 +48,12 @@ impl Cop0 {
         }
     }
 
-    pub fn read(&self, reg: usize, cycles: u64) -> u32 {
+    /// Register read; `int0`/`int1` are the live INT0/INT1 lines merged into
+    /// Cause.IP2/IP3 (they are not stored, see [`Cop0::interrupt_pending`]).
+    pub fn read(&self, reg: usize, cycles: u64, int0: bool, int1: bool) -> u32 {
         match reg {
             9 => cycles as u32, // Count follows the CPU cycle counter
+            CAUSE => self.regs[CAUSE] | ((int0 as u32) << 10) | ((int1 as u32) << 11),
             _ => self.regs[reg],
         }
     }
@@ -94,7 +97,8 @@ impl Cop0 {
 
     /// Enter a general exception; returns the handler vector address.
     pub fn enter_exception(&mut self, code: u32, pc: u32, in_delay_slot: bool) -> u32 {
-        let cause = (code & 0x1F) << 2;
+        // ExcCode and BD are rewritten; the software IP0/IP1 bits persist.
+        let cause = (self.regs[CAUSE] & 0x300) | ((code & 0x1F) << 2);
         if in_delay_slot {
             self.regs[CAUSE] = cause | (1 << 31);
             self.regs[EPC] = pc.wrapping_sub(4);
@@ -116,18 +120,22 @@ impl Cop0 {
         }
     }
 
-    /// Update the external interrupt pending bits (Cause.IP2/IP3, level
-    /// triggered) and report whether an interrupt should be taken.
-    pub fn interrupt_pending(&mut self, int0: bool, int1: bool) -> bool {
-        let cause =
-            (self.regs[CAUSE] & !(0b11 << 10)) | ((int0 as u32) << 10) | ((int1 as u32) << 11);
-        self.regs[CAUSE] = cause;
+    /// Whether an interrupt should be taken given the live INT0/INT1 lines
+    /// (level triggered, merged into Cause.IP2/IP3 on read rather than
+    /// stored: this runs every step, so the common no-interrupt case must
+    /// stay a few loads).
+    #[inline]
+    pub fn interrupt_pending(&self, int0: bool, int1: bool) -> bool {
+        let ip = ((int0 as u32) << 10) | ((int1 as u32) << 11) | (self.regs[CAUSE] & 0x300);
+        if ip == 0 {
+            return false;
+        }
         let status = self.regs[STATUS];
         // IE, EIE set; EXL, ERL clear.
         if status & 1 == 0 || status & STATUS_EIE == 0 || status & (STATUS_EXL | STATUS_ERL) != 0 {
             return false;
         }
-        (status >> 8) & (cause >> 8) & 0xFF != 0
+        (status >> 8) & (ip >> 8) & 0xFF != 0
     }
 
     /// ERET: return address. ERL selects ErrorEPC; otherwise EPC is used

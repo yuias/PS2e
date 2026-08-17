@@ -93,7 +93,10 @@ pub fn read(sys: &Ps2System, t: Target, i: usize) -> u64 {
                 33 => c.lo[0],
                 34 => c.hi[0],
                 35 => c.cop0.regs[BADVADDR] as u64,
-                36 => c.cop0.regs[ee_cop0::CAUSE] as u64,
+                36 => c
+                    .cop0
+                    .read(ee_cop0::CAUSE, sys.cycles, sys.bus.ee_int0_pending(), sys.bus.ee_int1_pending())
+                    as u64,
                 37 => c.pc as u64,
                 _ => 0,
             }

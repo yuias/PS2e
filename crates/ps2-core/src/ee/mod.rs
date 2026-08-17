@@ -175,10 +175,10 @@ impl Cpu {
 
     // --- main loop -------------------------------------------------------
 
-    /// Whether an interrupt would be taken at the next step (also refreshes
-    /// the CAUSE IP bits). Used to end an idle-loop skip.
+    /// Whether an interrupt would be taken at the next step. Also used to
+    /// end an idle-loop skip.
     #[inline]
-    pub fn interrupt_pending(&mut self, bus: &Bus) -> bool {
+    pub fn interrupt_pending(&self, bus: &Bus) -> bool {
         self.cop0
             .interrupt_pending(bus.ee_int0_pending(), bus.ee_int1_pending())
     }
@@ -558,7 +558,7 @@ impl Cpu {
     fn op_cop0(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, bus: &mut Bus) {
         match rs {
             0x00 => {
-                let v = self.cop0.read(rd, bus.now);
+                let v = self.cop0.read(rd, bus.now, bus.ee_int0_pending(), bus.ee_int1_pending());
                 self.set32(rt, v);
             }
             0x04 => {
