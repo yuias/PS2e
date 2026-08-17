@@ -3,7 +3,33 @@
 //! native frames; the dispatcher guarantees the pointees are live and not
 //! otherwise borrowed for the duration of the block.
 
+use super::super::Cpu;
 use crate::bus::Bus;
+
+/// mfc0: needs the cycle counter and live interrupt lines.
+pub extern "C" fn cop0_read(cpu: *mut Cpu, bus: *mut Bus, rd: u32) -> u32 {
+    // SAFETY: see module docs.
+    unsafe {
+        let bus = &mut *bus;
+        (*cpu).cop0.read(rd as usize, bus.now, bus.ee_int0_pending(), bus.ee_int1_pending())
+    }
+}
+
+/// MMI (128-bit multimedia) instruction, straight to the interpreter's
+/// handler: none of them divert control.
+pub extern "C" fn mmi(cpu: *mut Cpu, instr: u32) {
+    let (rs, rt, rd, sa) = ((instr >> 21) & 31, (instr >> 16) & 31, (instr >> 11) & 31, (instr >> 6) & 31);
+    // SAFETY: see module docs.
+    unsafe { (*cpu).op_mmi(instr, rs as usize, rt as usize, rd as usize, sa) }
+}
+
+/// COP2 macro instruction other than bc2 (VU0 register moves and micro
+/// ops), straight to the interpreter's handler.
+pub extern "C" fn cop2(cpu: *mut Cpu, bus: *mut Bus, instr: u32) {
+    let (rs, rt, rd) = ((instr >> 21) & 31, (instr >> 16) & 31, (instr >> 11) & 31);
+    // SAFETY: see module docs.
+    unsafe { (*cpu).op_cop2(instr, rs as usize, rt as usize, rd as usize, &mut *bus) }
+}
 
 pub extern "C" fn rd8(bus: *mut Bus, addr: u32) -> u64 {
     // SAFETY: see module docs.

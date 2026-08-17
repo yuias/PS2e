@@ -149,6 +149,10 @@ pub fn emit(ops: &mut Ops, addr: u32, instr: u32) -> Emitted {
         0x28..=0x2B | 0x3F | 0x39 => "store",
         0x1E | 0x1F | 0x36 | 0x3E => "quad",
         0x11 => "cop1",
+        0x10 if rs == 0 => "cop0",
+        0x12 if rs != 0x08 => "cop2",
+        0x1C => "mmi",
+        0x2F => "imm", // cache: no-op
         _ => return Emitted::Interp,
     };
     if !native(group) {
@@ -158,6 +162,20 @@ pub fn emit(ops: &mut Ops, addr: u32, instr: u32) -> Emitted {
         0x00 => emit_special(ops, addr, instr, rs, rt, rd, sa),
         0x01 => emit_regimm(ops, addr, instr, rs, rt, branch_target),
         0x11 => emit_cop1(ops, instr, rs, rt, rd, sa as u32, branch_target),
+        // mfc0
+        0x10 => {
+            call_cpu_bus_arg(ops, h::cop0_read as *const () as usize, rd);
+            store32(ops, rt);
+            Emitted::Plain
+        }
+        // COP2 macro ops (not bc2): the interpreter's handler, without the
+        // per-instruction bookkeeping of a full fallback.
+        0x12 => {
+            call_cpu_bus_arg(ops, h::cop2 as *const () as usize, instr);
+            Emitted::Plain
+        }
+        0x1C => emit_mmi(ops, instr, rs, rt, rd),
+        0x2F => Emitted::Plain,
         // j / jal
         0x02 | 0x03 => {
             let target = (addr.wrapping_add(4) & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
@@ -586,26 +604,14 @@ fn emit_special(ops: &mut Ops, addr: u32, instr: u32, rs: u32, rt: u32, rd: u32,
             dynasm!(ops ; .arch x64 ; mov QWORD [rbx + lo(0)], rax);
             Emitted::Plain
         }
-        // mult / multu: LO/HI get the sign-extended halves; rd gets LO.
+        // mult / multu
         0x18 | 0x19 => {
-            dynasm!(ops
-                ; .arch x64
-                ; mov eax, DWORD [rbx + gpr(rs)]
-                ; mov ecx, DWORD [rbx + gpr(rt)]
-            );
-            if instr & 0x3F == 0x18 {
-                dynasm!(ops ; .arch x64 ; imul ecx);
-            } else {
-                dynasm!(ops ; .arch x64 ; mul ecx);
-            }
-            dynasm!(ops
-                ; .arch x64
-                ; movsxd rax, eax
-                ; movsxd rdx, edx
-                ; mov QWORD [rbx + lo(0)], rax
-                ; mov QWORD [rbx + hi(0)], rdx
-            );
-            store64(ops, rd);
+            emit_mult(ops, rs, rt, rd, 0, instr & 0x3F == 0x18);
+            Emitted::Plain
+        }
+        // div / divu
+        0x1A | 0x1B => {
+            emit_div(ops, rs, rt, 0, instr & 0x3F == 0x1A);
             Emitted::Plain
         }
         // dsllv / dsrlv / dsrav
@@ -709,6 +715,118 @@ fn emit_special(ops: &mut Ops, addr: u32, instr: u32, rs: u32, rt: u32, rd: u32,
         }
         _ => Emitted::Interp,
     }
+}
+
+/// MMI: pipe-1 HI/LO moves, mult1/div1 natively; the 128-bit multimedia
+/// ops through the interpreter's handler.
+fn emit_mmi(ops: &mut Ops, instr: u32, rs: u32, rt: u32, rd: u32) -> Emitted {
+    match instr & 0x3F {
+        0x10 => {
+            dynasm!(ops ; .arch x64 ; mov rax, QWORD [rbx + hi(1)]);
+            store64(ops, rd);
+        }
+        0x11 => {
+            load64(ops, rs);
+            dynasm!(ops ; .arch x64 ; mov QWORD [rbx + hi(1)], rax);
+        }
+        0x12 => {
+            dynasm!(ops ; .arch x64 ; mov rax, QWORD [rbx + lo(1)]);
+            store64(ops, rd);
+        }
+        0x13 => {
+            load64(ops, rs);
+            dynasm!(ops ; .arch x64 ; mov QWORD [rbx + lo(1)], rax);
+        }
+        0x18 | 0x19 => emit_mult(ops, rs, rt, rd, 1, instr & 0x3F == 0x18),
+        0x1A | 0x1B => emit_div(ops, rs, rt, 1, instr & 0x3F == 0x1A),
+        _ => call_cpu_arg(ops, h::mmi as *const () as usize, instr),
+    }
+    Emitted::Plain
+}
+
+/// mult/multu: LO/HI get the sign-extended halves; rd gets LO.
+fn emit_mult(ops: &mut Ops, rs: u32, rt: u32, rd: u32, pipe: usize, signed: bool) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov eax, DWORD [rbx + gpr(rs)]
+        ; mov ecx, DWORD [rbx + gpr(rt)]
+    );
+    if signed {
+        dynasm!(ops ; .arch x64 ; imul ecx);
+    } else {
+        dynasm!(ops ; .arch x64 ; mul ecx);
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; movsxd rax, eax
+        ; movsxd rdx, edx
+        ; mov QWORD [rbx + lo(pipe)], rax
+        ; mov QWORD [rbx + hi(pipe)], rdx
+    );
+    store64(ops, rd);
+}
+
+/// div/divu with the interpreter's special cases: division by zero gives
+/// LO = -1 (unsigned) or ±1 by the sign of the dividend (signed) and HI =
+/// dividend; MIN / -1 gives MIN, 0.
+fn emit_div(ops: &mut Ops, rs: u32, rt: u32, pipe: usize, signed: bool) {
+    let done = ops.new_dynamic_label();
+    let by_zero = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov eax, DWORD [rbx + gpr(rs)]
+        ; mov ecx, DWORD [rbx + gpr(rt)]
+        ; test ecx, ecx
+        ; jz =>by_zero
+    );
+    if signed {
+        let divide = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch x64
+            ; cmp ecx, -1
+            ; jne =>divide
+            ; cmp eax, 0x8000_0000u32 as i32
+            ; jne =>divide
+            ; xor edx, edx // MIN / -1: quotient MIN (already in eax), remainder 0
+            ; jmp =>done
+            ; =>divide
+            ; cdq
+            ; idiv ecx
+            ; jmp =>done
+        );
+    } else {
+        dynasm!(ops
+            ; .arch x64
+            ; xor edx, edx
+            ; div ecx
+            ; jmp =>done
+        );
+    }
+    dynasm!(ops ; .arch x64 ; =>by_zero);
+    if signed {
+        // quotient: -1 if dividend >= 0 else 1
+        dynasm!(ops
+            ; .arch x64
+            ; mov edx, eax
+            ; sar eax, 31
+            ; not eax
+            ; or eax, 1 // -1 for a non-negative dividend, 1 otherwise
+        );
+    } else {
+        dynasm!(ops
+            ; .arch x64
+            ; mov edx, eax
+            ; mov eax, -1
+        );
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; =>done
+        ; movsxd rax, eax
+        ; movsxd rdx, edx
+        ; mov QWORD [rbx + lo(pipe)], rax
+        ; mov QWORD [rbx + hi(pipe)], rdx
+    );
 }
 
 fn emit_regimm(ops: &mut Ops, addr: u32, _instr: u32, rs: u32, rt: u32, target: u32) -> Emitted {
@@ -849,6 +967,50 @@ fn call_bus_addr_busptr(ops: &mut Ops, f: usize, off: i32) {
         ; lea rdx, [r12 + off]
         ; mov esi, eax
         ; mov rdi, r12
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, QWORD f as i64
+        ; call rax
+    );
+}
+
+/// Call `f(cpu, bus, arg)`; result in eax.
+fn call_cpu_bus_arg(ops: &mut Ops, f: usize, arg: u32) {
+    #[cfg(windows)]
+    dynasm!(ops
+        ; .arch x64
+        ; mov rcx, rbx
+        ; mov rdx, r12
+        ; mov r8d, arg as i32
+    );
+    #[cfg(not(windows))]
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, rbx
+        ; mov rsi, r12
+        ; mov edx, arg as i32
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, QWORD f as i64
+        ; call rax
+    );
+}
+
+/// Call `f(cpu, arg)`.
+fn call_cpu_arg(ops: &mut Ops, f: usize, arg: u32) {
+    #[cfg(windows)]
+    dynasm!(ops
+        ; .arch x64
+        ; mov rcx, rbx
+        ; mov edx, arg as i32
+    );
+    #[cfg(not(windows))]
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, rbx
+        ; mov esi, arg as i32
     );
     dynasm!(ops
         ; .arch x64

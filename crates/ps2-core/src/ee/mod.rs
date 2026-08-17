@@ -708,7 +708,7 @@ impl Cpu {
     // --- COP2 (VU0 macro mode) -------------------------------------------
     // See crate::vu1::Vu1::exec_macro — the VU core does the actual work.
 
-    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, bus: &mut Bus) {
+    pub(super) fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, bus: &mut Bus) {
         match rs {
             0x01 => {
                 // QMFC2
@@ -770,7 +770,7 @@ impl Cpu {
 
     // --- MMI -------------------------------------------------------------
 
-    fn op_mmi(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, sa: u32) {
+    pub(super) fn op_mmi(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, sa: u32) {
         match instr & 0x3F {
             0x00 => self.madd(0, rd, rs, rt, false),
             0x01 => self.madd(0, rd, rs, rt, true),
