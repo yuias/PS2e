@@ -407,7 +407,11 @@ impl Gs {
             fbw: ((ctx.frame >> 16) & 0x3F) as u32,
             fb24: ((ctx.frame >> 24) & 0x3F) as u32 == PSMCT24,
             fbmsk: (ctx.frame >> 32) as u32,
-            alpha: ctx.alpha,
+            blend_a: (ctx.alpha & 3) as u8,
+            blend_b: ((ctx.alpha >> 2) & 3) as u8,
+            blend_c: ((ctx.alpha >> 4) & 3) as u8,
+            blend_d: ((ctx.alpha >> 6) & 3) as u8,
+            blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
         }
     }
 
@@ -433,6 +437,7 @@ impl Gs {
     fn shade_row_px(&mut self, pipe: &PixelPipe, row: &Row, x: u32, frag: Frag, texel: u32) {
         let y = row.y;
         self.pixels_shaded += 1;
+        // TODO(perf): keep this and tex_psm_hist per primitive.
         #[cfg(feature = "profile")]
         {
             let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
@@ -527,32 +532,35 @@ impl Gs {
         let dst = self.rd32(fb_off);
 
         if pipe.abe {
-            let (dr, dg, db, da) = (
-                (dst & 0xFF) as i32,
-                ((dst >> 8) & 0xFF) as i32,
-                ((dst >> 16) & 0xFF) as i32,
-                (dst >> 24) as i32,
-            );
-            // ALPHA: Cv = ((A - B) * C >> 7) + D.
-            let al = pipe.alpha;
-            let sel = |k: u64, s: u32, d: i32| -> i32 {
-                match k & 3 {
-                    0 => s as i32,
-                    1 => d,
+            // ALPHA: Cv = ((A - B) * C >> 7) + D, on three 21-bit lanes of a
+            // u64 (R at 0, G at 21, B at 42). With the identity
+            // floor(((A-B)*C + 128*D) / 128) = ((A-B)*C >> 7) + D and a
+            // per-lane bias of 2^16 the lanes stay positive and disjoint;
+            // each lane then decodes to (lane >> 7) - 512, clamped to 8 bits.
+            let src = spread21(r | (g << 8) | (b << 16));
+            let dstc = spread21(dst & 0xFF_FFFF);
+            let pick = |k: u8| -> u64 {
+                match k {
+                    0 => src,
+                    1 => dstc,
                     _ => 0,
                 }
             };
-            let ca = (sel(al, r, dr), sel(al, g, dg), sel(al, b, db));
-            let cb = (sel(al >> 2, r, dr), sel(al >> 2, g, dg), sel(al >> 2, b, db));
-            let alpha = match (al >> 4) & 3 {
-                0 => a as i32,
-                1 => da,
-                _ => ((al >> 32) & 0xFF) as i32,
+            let alpha = match pipe.blend_c {
+                0 => a as u64,
+                1 => (dst >> 24) as u64,
+                _ => pipe.blend_fix as u64,
             };
-            let cd = (sel(al >> 6, r, dr), sel(al >> 6, g, dg), sel(al >> 6, b, db));
-            r = ((((ca.0 - cb.0) * alpha) >> 7) + cd.0).clamp(0, 255) as u32;
-            g = ((((ca.1 - cb.1) * alpha) >> 7) + cd.1).clamp(0, 255) as u32;
-            b = ((((ca.2 - cb.2) * alpha) >> 7) + cd.2).clamp(0, 255) as u32;
+            const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
+            let x = pick(pipe.blend_a) * alpha + pick(pipe.blend_d) * 128 + BIAS
+                - pick(pipe.blend_b) * alpha;
+            let lane = |sh: u32| -> u32 {
+                let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
+                v.clamp(0, 255) as u32
+            };
+            r = lane(0);
+            g = lane(21);
+            b = lane(42);
         }
 
         let out = r | (g << 8) | (b << 16) | (a.min(255) << 24);
@@ -713,7 +721,13 @@ struct PixelPipe {
     fbw: u32,
     fb24: bool,
     fbmsk: u32,
-    alpha: u64,
+    /// ALPHA register selectors (0 = source, 1 = destination, 2 = zero /
+    /// FIX for `blend_c`) and the FIX value.
+    blend_a: u8,
+    blend_b: u8,
+    blend_c: u8,
+    blend_d: u8,
+    blend_fix: u32,
 }
 
 /// TEX0/CLAMP fields decoded once per primitive.
@@ -838,6 +852,12 @@ fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
     let rb = ((a & 0x00FF_00FF) * inv + (b & 0x00FF_00FF) * w) >> 8;
     let ga = ((a >> 8) & 0x00FF_00FF) * inv + ((b >> 8) & 0x00FF_00FF) * w;
     (rb & 0x00FF_00FF) | (ga & 0xFF00_FF00)
+}
+
+/// RGB8 (R low) into three 21-bit lanes of a u64.
+#[inline(always)]
+fn spread21(c: u32) -> u64 {
+    (c & 0xFF) as u64 | (((c >> 8) & 0xFF) as u64) << 21 | (((c >> 16) & 0xFF) as u64) << 42
 }
 
 /// `f32::floor` as an integer, without the libm call the SSE2 baseline
