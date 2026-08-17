@@ -73,7 +73,11 @@ impl Ps2System {
         // approximation come later.
         if self.cycles.is_multiple_of(EE_PER_IOP) {
             let _g = prof::scope(prof::Slot::Iop);
-            self.iop.step(&mut self.bus);
+            // Same idle-loop skip as the EE, for the IOP kernel's `j .`.
+            if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
+                self.iop.idle = false;
+                self.iop.step(&mut self.bus);
+            }
             event = true;
         }
         if self.cycles.is_multiple_of(64) {

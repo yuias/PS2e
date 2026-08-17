@@ -131,6 +131,7 @@ pub fn write(sys: &mut Ps2System, t: Target, i: usize, v: u64) {
                 37 => {
                     c.pc = v as u32;
                     c.next_pc = (v as u32).wrapping_add(4);
+                    c.idle = false;
                 }
                 _ => {}
             }
@@ -148,6 +149,7 @@ pub fn write(sys: &mut Ps2System, t: Target, i: usize, v: u64) {
                 37 => {
                     c.pc = v;
                     c.next_pc = v.wrapping_add(4);
+                    c.idle = false;
                 }
                 _ => {}
             }

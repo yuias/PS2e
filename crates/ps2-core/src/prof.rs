@@ -119,6 +119,28 @@ fn pcs() -> &'static [AtomicU64] {
     PCS.get_or_init(|| (0..(32 << 20) / 4).map(|_| AtomicU64::new(0)).collect())
 }
 
+#[cfg(feature = "profile")]
+static IOP_PCS: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+#[cfg(feature = "profile")]
+fn iop_pcs() -> &'static [AtomicU64] {
+    IOP_PCS.get_or_init(|| (0..(2 << 20) / 4).map(|_| AtomicU64::new(0)).collect())
+}
+
+/// Record one IOP instruction (RAM addresses only) for the profile report.
+#[inline(always)]
+pub fn count_iop(pc: u32) {
+    #[cfg(feature = "profile")]
+    {
+        if pc & 0x1FE0_0000 == 0 {
+            iop_pcs()[((pc & 0x1F_FFFF) >> 2) as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        let _ = pc;
+    }
+}
+
 /// Record one EE instruction for the profile report.
 #[inline(always)]
 pub fn count_ee(pc: u32, instr: u32) {
@@ -186,6 +208,16 @@ pub fn report() -> Option<String> {
         for (k, n) in pcs.iter().take(40) {
             out.push_str(&format!("  {:#09x} {:5.1}%
 ", k << 2, *n as f64 * 100.0 / total_ops as f64));
+        }
+        let mut ipcs: Vec<(usize, u64)> =
+            iop_pcs().iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
+        let iop_total: u64 = ipcs.iter().map(|&(_, n)| n).sum::<u64>().max(1);
+        ipcs.sort_by(|a, b| b.1.cmp(&a.1));
+        out.push_str(&format!("IOP instructions in RAM: {iop_total}; hot words:
+"));
+        for (k, n) in ipcs.iter().take(24) {
+            out.push_str(&format!("  {:#09x} {:5.1}%
+", k << 2, *n as f64 * 100.0 / iop_total as f64));
         }
         Some(out)
     }

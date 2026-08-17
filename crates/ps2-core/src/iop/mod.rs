@@ -38,6 +38,10 @@ pub struct Cpu {
     next_is_delay: bool,
     current_pc: u32,
     in_delay: bool,
+    /// Spinning on `j .` / `nop` (the kernel idle thread): only an interrupt
+    /// can move it, so [`crate::Ps2System`] skips IOP steps until one is
+    /// pending.
+    pub idle: bool,
 }
 
 impl Default for Cpu {
@@ -65,6 +69,7 @@ impl Cpu {
             pending_load: None,
             written_reg: 0,
             next_is_delay: false,
+            idle: false,
             current_pc: 0xBFC0_0000,
             in_delay: false,
         }
@@ -148,12 +153,17 @@ impl Cpu {
         self.cop0[STATUS] & STATUS_ISC != 0
     }
 
-    pub fn step(&mut self, bus: &mut Bus) {
-        // Interrupt check: IEc and any unmasked pending line.
-        if self.cop0[STATUS] & STATUS_IEC != 0
+    /// Whether an interrupt would be taken at the next step (IEc, IM bit 10
+    /// and an unmasked pending line). Used to end an idle-loop skip.
+    #[inline]
+    pub fn interrupt_pending(&self, bus: &Bus) -> bool {
+        self.cop0[STATUS] & STATUS_IEC != 0
             && self.cop0[STATUS] & (1 << 10) != 0
             && bus.iop_irq_pending()
-        {
+    }
+
+    pub fn step(&mut self, bus: &mut Bus) {
+        if self.interrupt_pending(bus) {
             self.cop0[CAUSE] = (self.cop0[CAUSE] & !0xFF) | (1 << 10);
             self.in_delay = self.next_is_delay;
             self.current_pc = self.pc;
@@ -163,6 +173,7 @@ impl Cpu {
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;
         let instr = bus.iop_read32(self.pc);
+        crate::prof::count_iop(self.pc);
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
 
@@ -267,7 +278,14 @@ impl Cpu {
                 }
                 self.branch_cond(taken, imm);
             }
-            0x02 => self.branch_to((self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2)),
+            0x02 => {
+                let target = (self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
+                self.branch_to(target);
+                // `j .` with a nop delay slot is the kernel idle thread.
+                if target == self.current_pc && bus.iop_read32(self.pc) == 0 {
+                    self.idle = true;
+                }
+            }
             0x03 => {
                 self.set_reg(31, self.next_pc);
                 self.branch_to((self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2));
