@@ -61,7 +61,7 @@ fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
     let (name, range) = spec
         .split_once('@')
         .ok_or_else(|| format!("--press needs <button>@<cycle>, got '{spec}'"))?;
-    let mask = pad::bit_by_name(name)?;
+    let mask = pad::mask_by_name(name)?;
     let parse_n = |s: &str| -> Result<u64, String> {
         s.replace('_', "")
             .parse()

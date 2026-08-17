@@ -22,8 +22,8 @@ pub const CIRCLE: u16 = 1 << 13;
 pub const CROSS: u16 = 1 << 14;
 pub const SQUARE: u16 = 1 << 15;
 
-/// Button bit by `--press` script name (lowercase).
-pub fn bit_by_name(name: &str) -> Result<u16, String> {
+/// Button mask by `--press` script name (lowercase).
+pub fn mask_by_name(name: &str) -> Result<u16, String> {
     Ok(match name {
         "select" => SELECT,
         "l3" => L3,
