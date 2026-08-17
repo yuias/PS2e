@@ -3,13 +3,35 @@ name = "ps2-app"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Native front-end for ps2-core (headless CLI for now)"
+description = "Native front-end for ps2-core: headless CLI plus an eframe/wgpu window"
 
 [dependencies]
 ps2-core = { path = "../ps2-core" }
 ps2-debug = { path = "../ps2-debug" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# default features off: drops the glow (OpenGL) renderer and accesskit,
+# and lets us pick wgpu backends explicitly below.
+eframe = { version = "0.32", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "wayland", # Linux targets only; no cost on Windows
+    "x11",     # Linux targets only; no cost on Windows
+] }
+cpal = "0.16"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+# One native wgpu backend per OS keeps naga's shader translators to a single
+# target language. Excludes gles/webgpu everywhere.
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["dx12", "wgsl"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["vulkan", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["metal", "wgsl"] }
 
 [features]
 # Print a TSC-based subsystem time breakdown at exit.

@@ -1,19 +1,40 @@
-//! Headless front-end: boot a BIOS, run for N cycles, stream kernel TTY
-//! output to stdout. The egui + wgpu UI arrives with the GS milestone.
+//! Native front-end for ps2-core.
+//!
+//! `--cycles N` runs headless and exits: this is the bring-up workflow used
+//! for BIOS/game analysis (screenshots, `--press` scripting, `--wav`,
+//! `--dump`, `--debug-ee`/`--debug-iop` gdb-remote stubs). Without
+//! `--cycles` (or with an explicit `--window`) it opens an eframe/wgpu
+//! window instead: the emulator runs on a worker thread paced against the
+//! audio buffer, and the UI is a thin client over published snapshots (see
+//! [`emu`]).
+//!
+//! `--debug-ee`/`--debug-iop` open LLDB/GDB gdb-remote stubs in both modes;
+//! `--wait-debugger` additionally holds execution at reset until a debugger
+//! attaches.
+
+mod audio;
+mod config;
+mod emu;
+mod pad;
+mod ui;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ps2_core::Ps2System;
 use tracing_subscriber::EnvFilter;
 
 struct Args {
-    bios: String,
-    cycles: u64,
+    bios: Option<String>,
+    /// Headless when set; windowed run control ignores it.
+    cycles: Option<u64>,
+    /// Force windowed mode even when `--cycles` is also given.
+    window: bool,
     log: Option<String>,
-    /// Directory to dump EE/IOP RAM into after the run (bring-up aid).
+    /// Directory to dump EE/IOP RAM into after a headless run.
     dump: Option<String>,
-    /// Write the final framebuffer as a BMP.
+    /// Write the final framebuffer as a BMP (headless only).
     screenshot: Option<String>,
     /// Also write a numbered BMP next to `screenshot` every N cycles.
     screenshot_every: Option<u64>,
@@ -22,47 +43,25 @@ struct Args {
     debug_iop: Option<u16>,
     /// Hold execution at the reset vector until a debugger attaches.
     wait_debugger: bool,
-    /// Scripted pad input: (button mask, first cycle, last cycle).
+    /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
     memcard: Option<String>,
     /// Disc image (2048-byte-sector ISO), streamed on demand.
     disc: Option<String>,
-    /// Write the SPU2 output (48 kHz stereo) as a WAV file.
+    /// Write the SPU2 output (48 kHz stereo) as a WAV file (headless only).
     wav: Option<String>,
 }
 
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
 const PRESS_HOLD: u64 = 150_000_000;
 
-fn pad_button_bit(name: &str) -> Result<u16, String> {
-    Ok(match name {
-        "select" => 0,
-        "l3" => 1,
-        "r3" => 2,
-        "start" => 3,
-        "up" => 4,
-        "right" => 5,
-        "down" => 6,
-        "left" => 7,
-        "l2" => 8,
-        "r2" => 9,
-        "l1" => 10,
-        "r1" => 11,
-        "triangle" => 12,
-        "circle" => 13,
-        "cross" => 14,
-        "square" => 15,
-        _ => return Err(format!("unknown button '{name}'")),
-    })
-}
-
 /// Parse "circle@6000000000" or "down@5e9-5.2e9"-style "<button>@<from>[-<to>]".
 fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
     let (name, range) = spec
         .split_once('@')
         .ok_or_else(|| format!("--press needs <button>@<cycle>, got '{spec}'"))?;
-    let bit = pad_button_bit(name)?;
+    let bit = pad::bit_by_name(name)?;
     let parse_n = |s: &str| -> Result<u64, String> {
         s.replace('_', "")
             .parse()
@@ -80,8 +79,9 @@ fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
-        bios: "assets/SCPH-50000.bin".to_string(),
-        cycles: 500_000_000,
+        bios: None,
+        cycles: None,
+        window: false,
         log: None,
         dump: None,
         screenshot: None,
@@ -97,15 +97,17 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--bios" => args.bios = it.next().ok_or("--bios needs a path")?,
+            "--bios" => args.bios = Some(it.next().ok_or("--bios needs a path")?),
             "--cycles" => {
-                args.cycles = it
-                    .next()
-                    .ok_or("--cycles needs a number")?
-                    .replace('_', "")
-                    .parse()
-                    .map_err(|e| format!("bad --cycles: {e}"))?;
+                args.cycles = Some(
+                    it.next()
+                        .ok_or("--cycles needs a number")?
+                        .replace('_', "")
+                        .parse()
+                        .map_err(|e| format!("bad --cycles: {e}"))?,
+                );
             }
+            "--window" => args.window = true,
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
             "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
             "--screenshot" => args.screenshot = Some(it.next().ok_or("--screenshot needs a path")?),
@@ -133,22 +135,26 @@ fn parse_args() -> Result<Args, String> {
             "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ps2-app [--bios <path>] [--cycles <n>] [--log <filter>]\n\
+                    "usage: ps2-app [--bios <path>] [--cycles <n>] [--window] [--log <filter>]\n\
+                     \n\
+                     With no --cycles (or with --window), opens a window; otherwise runs\n\
+                     headless for the given number of EE cycles and exits.\n\
                      \n\
                      --bios           BIOS image (default assets/SCPH-50000.bin)\n\
-                     --cycles         EE cycles to run (default 500_000_000)\n\
+                     --cycles         EE cycles to run headlessly, then exit\n\
+                     --window         open a window even when --cycles is given\n\
                      --log            tracing filter, e.g. 'info,ps2_core::tty=debug'\n\
-                     --dump           directory for EE/IOP RAM dumps after the run\n\
-                     --screenshot     write the final framebuffer as a BMP\n\
+                     --dump           directory for EE/IOP RAM dumps after a headless run\n\
+                     --screenshot     write the final framebuffer as a BMP (headless)\n\
                      --screenshot-every  also write <screenshot>_<n>.bmp every N cycles\n\
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
-                     --press          hold a pad button, <button>@<cycle>[-<cycle>]\n\
+                     --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
-                     --disc           disc image (2048-byte-sector ISO), streamed
-                     --wav            write the SPU2 output as a 48 kHz stereo WAV"
+                     --disc           disc image (2048-byte-sector ISO), streamed\n\
+                     --wav            write the SPU2 output as a 48 kHz stereo WAV (headless)"
                 );
                 std::process::exit(0);
             }
@@ -183,14 +189,22 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let bios = match std::fs::read(&args.bios) {
+    let (cfg, cfg_path) = config::Config::load();
+    let windowed = args.window || args.cycles.is_none();
+
+    let bios_path = args
+        .bios
+        .clone()
+        .or_else(|| cfg.bios.as_ref().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "assets/SCPH-50000.bin".to_string());
+    let bios = match std::fs::read(&bios_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cannot read BIOS '{}': {e}", args.bios);
+            eprintln!("error: cannot read BIOS '{bios_path}': {e}");
             return ExitCode::FAILURE;
         }
     };
-    let mut sys = match Ps2System::new(bios) {
+    let mut sys = match Ps2System::new(bios.clone()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -198,7 +212,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut debugger = match (args.debug_ee, args.debug_iop) {
+    let debugger = match (args.debug_ee, args.debug_iop) {
         (None, None) => None,
         (ee, iop) => match ps2_debug::DebugServer::bind(ee, iop) {
             Ok(d) => Some(d),
@@ -222,32 +236,102 @@ fn main() -> ExitCode {
         }
     }
 
-    if let Some(path) = &args.memcard {
+    // Headless keeps its original semantics: a card is only loaded/persisted
+    // when `--memcard` is given. Windowed mode always mounts one (falling
+    // back to the config's default location) so play sessions save by
+    // default.
+    let memcard_path: Option<PathBuf> = if windowed {
+        Some(
+            args.memcard
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.memcard_path(cfg_path.as_ref())),
+        )
+    } else {
+        args.memcard.clone().map(PathBuf::from)
+    };
+    if let Some(path) = &memcard_path {
         match std::fs::read(path) {
             Ok(img) if img.len() == sys.bus.sio2.memcard.data.len() => {
                 sys.bus.sio2.memcard.data.copy_from_slice(&img);
-                tracing::info!(path = %path, "memory card image loaded");
+                tracing::info!(path = %path.display(), "memory card image loaded");
             }
             Ok(img) => {
                 eprintln!(
-                    "error: memcard '{path}' has {} bytes, expected {}",
+                    "error: memcard '{}' has {} bytes, expected {}",
+                    path.display(),
                     img.len(),
                     sys.bus.sio2.memcard.data.len()
                 );
                 return ExitCode::FAILURE;
             }
             Err(_) => {
-                tracing::info!(path = %path, "memcard image missing, starting blank");
+                tracing::info!(path = %path.display(), "memcard image missing, starting blank");
             }
         }
     }
 
-    tracing::info!(bios = %args.bios, cycles = args.cycles, "booting");
+    if windowed {
+        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path)
+    } else {
+        run_headless(sys, &args, debugger, memcard_path)
+    }
+}
+
+fn run_windowed(
+    sys: Ps2System,
+    bios: Vec<u8>,
+    args: Args,
+    cfg: config::Config,
+    cfg_path: Option<PathBuf>,
+    debugger: Option<ps2_debug::DebugServer>,
+    memcard_path: Option<PathBuf>,
+) -> ExitCode {
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 640.0])
+            .with_title("PS2e"),
+        ..Default::default()
+    };
+    let wait_debugger = args.wait_debugger;
+    let result = eframe::run_native(
+        "PS2e",
+        options,
+        Box::new(move |cc| {
+            let worker_cfg = emu::WorkerConfig {
+                bios,
+                memcard_path,
+                debugger,
+                wait_debugger,
+                volume: cfg.volume,
+            };
+            let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
+            Ok(Box::new(ui::App::new(emu, cfg, cfg_path)))
+        }),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_headless(
+    mut sys: Ps2System,
+    args: &Args,
+    mut debugger: Option<ps2_debug::DebugServer>,
+    memcard_path: Option<PathBuf>,
+) -> ExitCode {
+    let cycles = args.cycles.expect("headless mode requires --cycles");
+    tracing::info!(bios = ?args.bios, cycles, "booting");
 
     // Run in slices so TTY output streams out as it appears.
     const SLICE: u64 = 1_000_000;
     let stdout = std::io::stdout();
-    let mut remaining = args.cycles;
+    let mut remaining = cycles;
     let mut debugger_seen = false;
     let mut audio: Vec<i16> = Vec::new();
     while remaining > 0 {
@@ -328,14 +412,14 @@ fn main() -> ExitCode {
         eprintln!("{report}");
     }
 
-    if let Some(path) = &args.memcard
+    if let Some(path) = &memcard_path
         && sys.bus.sio2.memcard.dirty
     {
         if let Err(e) = std::fs::write(path, &sys.bus.sio2.memcard.data) {
             eprintln!("error: memcard save failed: {e}");
             return ExitCode::FAILURE;
         }
-        tracing::info!(path = %path, "memory card image saved");
+        tracing::info!(path = %path.display(), "memory card image saved");
     }
 
     if let Some(dir) = &args.dump {
@@ -383,7 +467,16 @@ fn flush_tty(stdout: &std::io::Stdout, sys: &mut Ps2System) {
     }
 }
 
-/// Minimal 24-bit bottom-up BMP writer.
+/// Write already-drained TTY text to stdout. Used by the windowed worker
+/// thread, which reacquires the stdout handle each call (cheap: it is a
+/// thin wrapper over the process-wide handle, not a fresh open).
+pub(crate) fn print_tty(text: &str) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
 /// `foo.bmp` -> `foo_<n>.bmp` (extension-less paths just get the suffix).
 fn numbered_path(path: &str, n: u64) -> String {
     match path.rsplit_once('.') {
@@ -414,7 +507,8 @@ fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+/// Minimal 24-bit bottom-up BMP writer.
+pub(crate) fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     let row = ((w * 3 + 3) & !3) as usize;
     let data_size = row * h as usize;
     let mut out = Vec::with_capacity(54 + data_size);
