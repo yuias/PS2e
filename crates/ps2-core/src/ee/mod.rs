@@ -190,6 +190,7 @@ impl Cpu {
         self.next_is_delay = false;
         self.pc = addr.wrapping_add(4);
         self.next_pc = addr.wrapping_add(8);
+        crate::prof::count_ee(addr, instr);
         self.execute(instr, bus);
         self.next_is_delay || self.pc != addr.wrapping_add(4) || self.idle
     }

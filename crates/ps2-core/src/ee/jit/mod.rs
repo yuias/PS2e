@@ -16,6 +16,8 @@
 //! translated code on write and the dispatcher drops their blocks.
 
 mod arena;
+mod emit;
+mod helpers;
 
 use std::collections::HashMap;
 
@@ -154,40 +156,65 @@ impl Jit {
         let mut ops = VecAssembler::<X64Relocation>::new(self.arena.next_addr());
         emit_prologue(&mut ops);
 
-        let mut exits: Vec<dynasmrt::DynamicLabel> = Vec::with_capacity(MAX_BLOCK);
+        // (label, cycles retired) for interpreter calls that diverted.
+        let mut exits: Vec<(dynasmrt::DynamicLabel, u32)> = Vec::with_capacity(MAX_BLOCK);
         let mut addr = pc;
         let mut count = 0u32;
         loop {
             let instr = bus.fetch32(addr);
-            // Every instruction goes through the interpreter for now; the
-            // helper reports whether control was diverted (branch taken,
-            // likely-branch skip, exception, idle loop) and the block exits.
-            let exit = ops.new_dynamic_label();
-            emit_call4(&mut ops, interp_one as *const () as usize, addr, instr);
-            dynasm!(ops
-                ; .arch x64
-                ; test eax, eax
-                ; jnz =>exit
-            );
-            exits.push(exit);
+            let next = bus.fetch32(addr.wrapping_add(4));
+            // A control-flow instruction in the delay slot is undefined
+            // behaviour on MIPS; leave such branches to the interpreter.
+            let mut emitted = if is_control_flow(instr) && is_control_flow(next) {
+                emit::Emitted::Interp
+            } else {
+                emit::emit(&mut ops, addr, instr)
+            };
+            if let emit::Emitted::Branch(kind) = emitted {
+                count += 1;
+                let ds_addr = addr.wrapping_add(4);
+                if let emit::BranchKind::Cond { likely: true, .. } = kind {
+                    emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), count);
+                }
+                if let emit::Emitted::Interp = emit::emit(&mut ops, ds_addr, next) {
+                    self.emit_interp(&mut ops, ds_addr, next, count + 1, &mut exits);
+                }
+                count += 1;
+                let idle = is_idle_loop(bus, addr, instr, next);
+                emit::emit_branch_end(&mut ops, kind, ds_addr.wrapping_add(4), count, idle);
+                break;
+            }
+            if let emit::Emitted::Interp = emitted {
+                self.emit_interp(&mut ops, addr, instr, count + 1, &mut exits);
+                emitted = emit::Emitted::Plain;
+            }
+            let _ = emitted;
             count += 1;
+            let control = is_control_flow(instr);
             addr = addr.wrapping_add(4);
-            if is_control_flow(instr) || count as usize >= MAX_BLOCK || addr & 0xFFF == 0 {
+            if control || count as usize >= MAX_BLOCK || addr & 0xFFF == 0 {
+                // Fell off the end: pc/next_pc were left by the last
+                // interpreted instruction, or must be written here.
+                if !control {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov DWORD [rbx + emit::pc_off()], addr as i32
+                        ; mov DWORD [rbx + emit::next_pc_off()], addr.wrapping_add(4) as i32
+                    );
+                }
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov eax, count as i32
+                    ; jmp ->epilogue
+                );
                 break;
             }
         }
-        // Fell off the end: all `count` instructions retired.
-        dynasm!(ops
-            ; .arch x64
-            ; mov eax, count as i32
-            ; jmp ->epilogue
-        );
-        // Diverted after instruction i: i + 1 retired.
-        for (i, exit) in exits.iter().enumerate() {
+        for (label, retired) in &exits {
             dynasm!(ops
                 ; .arch x64
-                ; =>*exit
-                ; mov eax, (i + 1) as i32
+                ; =>*label
+                ; mov eax, *retired as i32
                 ; jmp ->epilogue
             );
         }
@@ -200,12 +227,8 @@ impl Jit {
 
         // Track the RAM pages the block reads its code from, for
         // invalidation on write. ROM/other blocks are never invalidated.
-        let mut pages = [None, None];
-        for (i, a) in [pc, addr.wrapping_sub(4)].iter().enumerate() {
-            if let Some(p) = bus.ram_page_of(*a) {
-                pages[i] = Some(p);
-            }
-        }
+        let last = pc.wrapping_add((count.max(1) - 1) * 4);
+        let mut pages = [bus.ram_page_of(pc), bus.ram_page_of(last)];
         if pages[1] == pages[0] {
             pages[1] = None;
         }
@@ -220,20 +243,57 @@ impl Jit {
         self.blocks_compiled += 1;
         entry
     }
+
+    /// Call the interpreter for one instruction; exit the block with
+    /// `retired` cycles if it diverted control.
+    fn emit_interp(
+        &self,
+        ops: &mut emit::Ops,
+        addr: u32,
+        instr: u32,
+        retired: u32,
+        exits: &mut Vec<(dynasmrt::DynamicLabel, u32)>,
+    ) {
+        let exit = ops.new_dynamic_label();
+        emit_call4(ops, interp_one as *const () as usize, addr, instr);
+        dynasm!(ops
+            ; .arch x64
+            ; test eax, eax
+            ; jnz =>exit
+        );
+        exits.push((exit, retired));
+    }
+}
+
+/// The kernel idle thread: `beq $0,$0` backwards over nothing but nops
+/// (delay slot included), as the interpreter's `check_idle_loop` sees it.
+fn is_idle_loop(bus: &mut Bus, addr: u32, instr: u32, delay_slot: u32) -> bool {
+    if instr >> 26 != 0x04 || (instr >> 16) & 0x3FF != 0 || delay_slot != 0 {
+        return false;
+    }
+    let off = ((instr & 0xFFFF) as u16 as i16 as i32) << 2;
+    let target = addr.wrapping_add(4).wrapping_add(off as u32);
+    if target > addr || addr - target > 64 {
+        return false;
+    }
+    (target..addr).step_by(4).all(|a| bus.fetch32(a) == 0)
 }
 
 /// Instructions after which a block must end: anything that may change PC
 /// other than by falling through.
 fn is_control_flow(instr: u32) -> bool {
+    let rs = (instr >> 21) & 0x1F;
     match instr >> 26 {
         // SPECIAL: jr, jalr, syscall, break, traps.
         0x00 => matches!(instr & 0x3F, 0x08 | 0x09 | 0x0C | 0x0D | 0x30..=0x36),
         // REGIMM branches (0x00-0x03, 0x10-0x13); j/jal, beq..bgtz, likely.
         0x01 => matches!((instr >> 16) & 0x1F, 0x00..=0x03 | 0x10..=0x13),
         0x02..=0x07 | 0x14..=0x17 => true,
-        // COP0 (eret, tlb*), COP1 (bc1), COP2 (bc2) — treat every COP op
-        // as a possible diversion.
-        0x10 | 0x11 | 0x12 => true,
+        // COP0: bc0, the TLB/eret group, and mtc0 (Status/Cause writes may
+        // unmask an interrupt: end the block so it is taken promptly).
+        0x10 => matches!(rs, 0x04 | 0x08 | 0x10..=0x1F),
+        // COP1 bc1, COP2 bc2.
+        0x11 | 0x12 => rs == 0x08,
         _ => false,
     }
 }
