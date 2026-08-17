@@ -52,15 +52,17 @@ const MMIX_INPUT_DRY: u16 = 0x00C0;
 const MODE_DMA_WRITE: u16 = 2;
 const MODE_DMA_READ: u16 = 3;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct Core {
     /// Halfword address the next transferred halfword lands at; latched
     /// from TSA when the address is written and advanced by transfers.
     tsa: u32,
     /// EE cycle at which the in-flight DMA completes (`None` when idle).
     dma_due: Option<u64>,
-    /// AutoDMA half currently being filled (blocks alternate 0/1).
-    adma_half: usize,
+    /// AutoDMA blocks waiting for a free ring half (see [`Spu2::dma`]).
+    adma_pending: std::collections::VecDeque<Vec<u8>>,
+    /// Ring halves holding data not yet played out.
+    adma_filled: [bool; 2],
     /// IRQA was hit and the flag is latched until IRQ enable is dropped.
     irq_flag: bool,
     /// AutoDMA input read position (0..0x200 halfwords into the L/R areas).
@@ -93,7 +95,7 @@ impl Spu2 {
         Self {
             ram: vec![0u8; SPU2_RAM_SIZE].into_boxed_slice(),
             regs: vec![0u16; 0x800].into_boxed_slice(),
-            cores: [Core::default(); 2],
+            cores: [Core::default(), Core::default()],
             irq_edge: false,
             last_sample: 0,
             out: Vec::new(),
@@ -337,6 +339,29 @@ impl Spu2 {
         self.reg16(REG_ADMAS + core * 0x400) & (1 << core) != 0
     }
 
+    /// Move pending AutoDMA blocks into free ring halves: the half the read
+    /// position is not in first, so a fresh stream starts within 256
+    /// samples, then whichever half playback has left.
+    fn adma_fill(&mut self, core: usize) {
+        let playing = self.cores[core].adma_pos >> 8;
+        for half in [playing ^ 1, playing] {
+            if self.cores[core].adma_filled[half] {
+                continue;
+            }
+            let Some(block) = self.cores[core].adma_pending.pop_front() else {
+                return;
+            };
+            // 1 KiB block: 512 bytes left then 512 bytes right, into the
+            // core's input area (L 0x2000/R 0x2200 halfwords, +0x400 for
+            // core 1).
+            let base = (0x2000 + (core << 10) + half * 0x100) * 2;
+            let (l, r) = block.split_at(block.len().min(512));
+            self.ram[base..base + l.len()].copy_from_slice(l);
+            self.ram[base + 0x400..base + 0x400 + r.len()].copy_from_slice(r);
+            self.cores[core].adma_filled[half] = true;
+        }
+    }
+
     /// Kick a DMA on `core`: `data` is copied into sound RAM (`to_spu`) or
     /// filled from it. Returns the EE cycle at which the transfer completes;
     /// the caller raises the IOP DMA interrupt then. AutoDMA blocks are
@@ -349,14 +374,14 @@ impl Spu2 {
             // Each 1 KiB block: 512 bytes left then 512 bytes right, into
             // the core's input area (L 0x2000/R 0x2200 halfwords, +0x400
             // for core 1), alternating buffer halves.
+            // Blocks land in the ring as halves free up (the hardware
+            // transfers behind the read position); writing them all at kick
+            // time overwrote the half being played and clicked every 512
+            // samples. See `adma_fill`.
             for block in data.chunks(ADMA_BLOCK_BYTES as usize) {
-                let half = self.cores[core].adma_half;
-                let base = (0x2000 + (core << 10) + half * 0x100) * 2;
-                let (l, r) = block.split_at(block.len().min(512));
-                self.ram[base..base + l.len()].copy_from_slice(l);
-                self.ram[base + 0x400..base + 0x400 + r.len()].copy_from_slice(r);
-                self.cores[core].adma_half ^= 1;
+                self.cores[core].adma_pending.push_back(block.to_vec());
             }
+            self.adma_fill(core);
             let blocks = bytes.div_ceil(ADMA_BLOCK_BYTES);
             debug!(target: "ps2_core::spu2", core, bytes, "ADMA block(s) queued");
             start_at + blocks * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE
@@ -466,7 +491,13 @@ impl Spu2 {
                 let rb = lb + 0x400;
                 let il = i32::from(i16::from_le_bytes([self.ram[lb], self.ram[lb + 1]]));
                 let ir = i32::from(i16::from_le_bytes([self.ram[rb], self.ram[rb + 1]]));
-                self.cores[c].adma_pos = (pos + 1) & 0x1FF;
+                let next = (pos + 1) & 0x1FF;
+                self.cores[c].adma_pos = next;
+                if next & 0xFF == 0 {
+                    // Left a half: it can take the next queued block.
+                    self.cores[c].adma_filled[pos >> 8] = false;
+                    self.adma_fill(c);
+                }
                 if mmix & MMIX_INPUT_DRY != 0 {
                     l += (il * Self::volume16(self.reg16(vol_base + 12))) >> 15;
                     r += (ir * Self::volume16(self.reg16(vol_base + 14))) >> 15;
