@@ -209,7 +209,7 @@ impl GsFront {
                 let _ = reply.send(gs.framebuffer());
             }
             Cmd::Vram(reply) => {
-                let _ = reply.send(gs.vram.clone());
+                let _ = reply.send(gs.canvas.to_vec());
             }
             Cmd::Stats(reply) => {
                 let _ = reply.send(Stats::of(gs));
@@ -353,7 +353,7 @@ impl GsFront {
     /// Copy of VRAM, as of everything written so far.
     pub fn vram(&mut self) -> Box<[u8]> {
         if let Some(gs) = &self.inline {
-            return gs.vram.clone();
+            return gs.canvas.to_vec();
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.push(Cmd::Vram(tx));

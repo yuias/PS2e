@@ -7,6 +7,7 @@ description = "Platform-independent PS2 emulator core (wasm-safe)"
 
 [dependencies]
 tracing = "0.1"
+rayon = { version = "1", optional = true }
 dynasm = { version = "3", optional = true }
 dynasmrt = { version = "3", optional = true }
 
@@ -21,6 +22,6 @@ default = []
 # TSC-based subsystem time accounting (see prof.rs).
 profile = []
 # Run the GS renderer on a worker thread (native only; wasm keeps it inline).
-threads = []
+threads = ["dep:rayon"]
 # x86-64 dynamic recompiler for the EE (native only).
 jit = ["dep:dynasm", "dep:dynasmrt", "dep:windows-sys", "dep:libc"]

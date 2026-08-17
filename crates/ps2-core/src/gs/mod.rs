@@ -11,8 +11,11 @@ mod raster;
 
 use tracing::{debug, trace, warn};
 
+mod canvas;
 pub mod front;
 mod layout;
+
+pub use canvas::Canvas;
 
 pub use front::{Frame, GsFront, Stats};
 
@@ -68,7 +71,8 @@ pub struct Context {
 }
 
 pub struct Gs {
-    pub vram: Box<[u8]>,
+    /// Local memory, shareable with rasterizer worker threads.
+    pub canvas: Canvas,
     // Privileged registers.
     pub pmode: u64,
     pub smode1: u64,
@@ -122,8 +126,10 @@ pub struct Gs {
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
-    /// Decoded texture rows for the sprite fast path (see raster.rs).
-    tex_rows: [TexRow; 2],
+    /// Rasterizer scratch for the GS thread and for the worker-pool bands
+    /// (see raster.rs; empty pool = never split).
+    scratch: raster::Scratch,
+    pool: Vec<raster::Scratch>,
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
     woven_dims: (u32, u32),
@@ -145,7 +151,7 @@ impl Default for Gs {
 impl Gs {
     pub fn new() -> Self {
         Self {
-            vram: vec![0u8; VRAM_SIZE].into_boxed_slice(),
+            canvas: Canvas::new(),
             pmode: 0,
             smode1: 0,
             smode2: 0,
@@ -185,7 +191,12 @@ impl Gs {
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
-            tex_rows: [TexRow::default(), TexRow::default()],
+            scratch: raster::Scratch::default(),
+            pool: if cfg!(feature = "threads") {
+                (0..4).map(|_| raster::Scratch::default()).collect()
+            } else {
+                Vec::new()
+            },
             woven: Vec::new(),
             woven_dims: (0, 0),
             clut: Box::new([0; 512]),
@@ -617,91 +628,51 @@ impl Gs {
         }
     }
 
-    // --- VRAM accessors --------------------------------------------------
-    // Base pointers are 256-byte blocks; buffer width in 64-pixel units. The
-    // hardware layout lives in `layout`.
-
-    #[inline(always)]
-    fn rd32(&self, o: usize) -> u32 {
-        u32::from_le_bytes(self.vram[o..o + 4].try_into().unwrap())
-    }
-    #[inline(always)]
-    fn wr32(&mut self, o: usize, v: u32) {
-        self.vram[o..o + 4].copy_from_slice(&v.to_le_bytes());
-    }
+    // --- VRAM accessors (see `Canvas`) -----------------------------------
 
     #[inline]
     pub fn write_psmct32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
-        self.wr32(layout::addr32(bp, bw, x, y, false), v);
+        self.canvas.write_psmct32(bp, bw, x, y, v);
     }
-
-    /// Replace only the `mask` bits of a 32-bit pixel.
     #[inline]
     pub fn write_psmct32_bits(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32, mask: u32) {
-        let o = layout::addr32(bp, bw, x, y, false);
-        let cur = self.rd32(o);
-        self.wr32(o, (cur & !mask) | (v & mask));
+        self.canvas.write_psmct32_bits(bp, bw, x, y, v, mask);
     }
-
     #[inline]
     pub fn read_psmct32(&self, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
-        self.rd32(layout::addr32(bp, bw, x, y, false))
+        self.canvas.read_psmct32(bp, bw, x, y)
     }
-
-    /// PSMZ32/PSMZ24 word (Z buffers use their own block order).
     #[inline]
     pub fn write_psmz32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
-        self.wr32(layout::addr32(bp, bw, x, y, true), v);
+        self.canvas.write_psmz32(bp, bw, x, y, v);
     }
-
     #[inline]
     pub fn read_psmz32(&self, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
-        self.rd32(layout::addr32(bp, bw, x, y, true))
+        self.canvas.read_psmz32(bp, bw, x, y)
     }
-
-    /// 16-bit pixel in any of PSMCT16/16S/PSMZ16/16S (`psm` picks the block order).
     #[inline]
     pub fn write_psmct16(&mut self, bp: u32, bw: u32, x: u32, y: u32, psm: u32, v: u16) {
-        let o = layout::addr16(bp, bw, x, y, psm & 8 != 0, psm & 0x30 != 0);
-        self.vram[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        self.canvas.write_psmct16(bp, bw, x, y, psm, v);
     }
-
     #[inline]
     pub fn read_psmct16(&self, bp: u32, bw: u32, x: u32, y: u32, psm: u32) -> u16 {
-        let o = layout::addr16(bp, bw, x, y, psm & 8 != 0, psm & 0x30 != 0);
-        u16::from_le_bytes(self.vram[o..o + 2].try_into().unwrap())
+        self.canvas.read_psmct16(bp, bw, x, y, psm)
     }
-
     #[inline]
     pub fn write_psmt8(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u8) {
-        self.vram[layout::addr8(bp, bw, x, y)] = v;
+        self.canvas.write_psmt8(bp, bw, x, y, v);
     }
-
     #[inline]
     pub fn read_psmt8(&self, bp: u32, bw: u32, x: u32, y: u32) -> u8 {
-        self.vram[layout::addr8(bp, bw, x, y)]
+        self.canvas.read_psmt8(bp, bw, x, y)
     }
-
     #[inline]
     pub fn write_psmt4(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u8) {
-        let idx = layout::addr4(bp, bw, x, y);
-        let o = idx >> 1;
-        if idx & 1 == 0 {
-            self.vram[o] = (self.vram[o] & 0xF0) | (v & 0xF);
-        } else {
-            self.vram[o] = (self.vram[o] & 0x0F) | (v << 4);
-        }
+        self.canvas.write_psmt4(bp, bw, x, y, v);
     }
-
     #[inline]
     pub fn read_psmt4(&self, bp: u32, bw: u32, x: u32, y: u32) -> u8 {
-        let idx = layout::addr4(bp, bw, x, y);
-        let o = idx >> 1;
-        if idx & 1 == 0 {
-            self.vram[o] & 0xF
-        } else {
-            self.vram[o] >> 4
-        }
+        self.canvas.read_psmt4(bp, bw, x, y)
     }
 
     // --- scanout ---------------------------------------------------------
