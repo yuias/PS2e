@@ -108,6 +108,29 @@ pub fn scope(slot: Slot) -> Guard {
     }
 }
 
+/// EE instruction mix (major opcode, plus function for SPECIAL/MMI) and a
+/// coarse PC histogram (64 Ki buckets of one word each) to find hot loops.
+#[cfg(feature = "profile")]
+static OPS: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+#[cfg(feature = "profile")]
+static PCS: [AtomicU64; 65536] = [const { AtomicU64::new(0) }; 65536];
+
+/// Record one EE instruction for the profile report.
+#[inline(always)]
+pub fn count_ee(pc: u32, instr: u32) {
+    #[cfg(feature = "profile")]
+    {
+        let op = instr >> 26;
+        let key = if op == 0 || op == 0x1C { (op << 6) | (instr & 0x3F) } else { op << 6 };
+        OPS[key as usize].fetch_add(1, Ordering::Relaxed);
+        PCS[((pc >> 2) & 0xFFFF) as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        let _ = (pc, instr);
+    }
+}
+
 /// Human-readable breakdown, or `None` when profiling is compiled out.
 pub fn report() -> Option<String> {
     #[cfg(not(feature = "profile"))]
@@ -132,6 +155,25 @@ pub fn report() -> Option<String> {
                 c[i],
                 t[i] as f64 / c[i].max(1) as f64,
             ));
+        }
+        let mut ops: Vec<(usize, u64)> =
+            OPS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
+        let total_ops: u64 = ops.iter().map(|&(_, n)| n).sum::<u64>().max(1);
+        ops.sort_by(|a, b| b.1.cmp(&a.1));
+        out.push_str("EE instruction mix (op<<6|funct for SPECIAL/MMI):
+");
+        for (k, n) in ops.iter().take(24) {
+            out.push_str(&format!("  {:#05x} {:5.1}%
+", k, *n as f64 * 100.0 / total_ops as f64));
+        }
+        let mut pcs: Vec<(usize, u64)> =
+            PCS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
+        pcs.sort_by(|a, b| b.1.cmp(&a.1));
+        out.push_str("EE hot words (pc & 0x3fffc):
+");
+        for (k, n) in pcs.iter().take(24) {
+            out.push_str(&format!("  {:#07x} {:5.1}%
+", k << 2, *n as f64 * 100.0 / total_ops as f64));
         }
         Some(out)
     }
