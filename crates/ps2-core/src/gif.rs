@@ -1,7 +1,7 @@
 //! GIF: unpacks GIFtag streams (PATH3 / DMA channel 2) into GS register
 //! writes. PACKED, REGLIST and IMAGE modes.
 
-use crate::gs::Gs;
+use crate::gs::GsFront;
 use tracing::{trace, warn};
 
 #[derive(Default)]
@@ -15,11 +15,16 @@ pub struct Gif {
     flg: u32,
     /// PRIM data supplied by the tag (PRE bit).
     eop: bool,
+    /// Q latched by packed-mode ST writes, consumed by packed RGBAQ.
+    packed_q: u32,
 }
 
 impl Gif {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            packed_q: f32::to_bits(1.0),
+            ..Self::default()
+        }
     }
 
     pub fn idle(&self) -> bool {
@@ -47,7 +52,7 @@ impl Gif {
     }
 
     /// Feed one quadword from DMA.
-    pub fn process(&mut self, gs: &mut Gs, lo: u64, hi: u64) {
+    pub fn process(&mut self, gs: &mut GsFront, lo: u64, hi: u64) {
         if self.nloop == 0 {
             // GIFtag.
             self.nloop = (lo & 0x7FFF) as u32;
@@ -110,7 +115,7 @@ impl Gif {
         }
     }
 
-    fn write_packed(&mut self, gs: &mut Gs, desc: u32, lo: u64, hi: u64) {
+    fn write_packed(&mut self, gs: &mut GsFront, desc: u32, lo: u64, hi: u64) {
         match desc {
             0x0 => gs.write_reg(0x00, lo & 0x7FF), // PRIM
             0x1 => {
@@ -119,7 +124,7 @@ impl Gif {
                 let g = (lo >> 32) & 0xFF;
                 let b = hi & 0xFF;
                 let a = (hi >> 32) & 0xFF;
-                let q = gs.packed_q as u64;
+                let q = self.packed_q as u64;
                 gs.write_reg(
                     0x01,
                     r | (g << 8) | (b << 16) | (a << 24) | ((q & 0xFFFF_FFFF) << 32),
@@ -127,7 +132,7 @@ impl Gif {
             }
             0x2 => {
                 // ST: also latches Q for the next RGBAQ.
-                gs.packed_q = (hi & 0xFFFF_FFFF) as u32;
+                self.packed_q = (hi & 0xFFFF_FFFF) as u32;
                 gs.write_reg(0x02, lo);
             }
             0x3 => {

@@ -43,6 +43,8 @@ struct Args {
     debug_iop: Option<u16>,
     /// Hold execution at the reset vector until a debugger attaches.
     wait_debugger: bool,
+    /// Run the GS renderer on the emulation thread instead of its worker.
+    gs_inline: bool,
     /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
@@ -89,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
         debug_ee: None,
         debug_iop: None,
         wait_debugger: false,
+        gs_inline: false,
         presses: Vec::new(),
         memcard: None,
         disc: None,
@@ -127,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
                 args.debug_iop = Some(parse_port(it.next().ok_or("--debug-iop needs a port")?)?)
             }
             "--wait-debugger" => args.wait_debugger = true,
+            "--gs-inline" => args.gs_inline = true,
             "--press" => args
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
@@ -150,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
+                     --gs-inline      render on the emulation thread (no GS worker)\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
@@ -204,7 +209,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sys = match Ps2System::new(bios.clone()) {
+    let mut sys = match Ps2System::new_with(bios.clone(), !args.gs_inline) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -377,19 +382,20 @@ fn run_headless(
         }
     }
 
+    let gs = sys.bus.gs.stats();
     tracing::info!(
         cycles = sys.cycles,
-        prims = sys.bus.gs.prims_drawn,
-        prims_tex = sys.bus.gs.prims_textured,
-        pixels = sys.bus.gs.pixels_shaded,
+        prims = gs.prims_drawn,
+        prims_tex = gs.prims_textured,
+        pixels = gs.pixels_shaded,
         pmode = format_args!("{:#x}", sys.bus.gs.pmode),
         dispfb1 = format_args!("{:#x}", sys.bus.gs.dispfb1),
         dispfb2 = format_args!("{:#x}", sys.bus.gs.dispfb2),
-        frame0 = format_args!("{:#x}", sys.bus.gs.ctx[0].frame),
-        frame1 = format_args!("{:#x}", sys.bus.gs.ctx[1].frame),
-        zbuf0 = format_args!("{:#x}", sys.bus.gs.ctx[0].zbuf),
-        test0 = format_args!("{:#x}", sys.bus.gs.ctx[0].test),
-        test1 = format_args!("{:#x}", sys.bus.gs.ctx[1].test),
+        frame0 = format_args!("{:#x}", gs.frame[0]),
+        frame1 = format_args!("{:#x}", gs.frame[1]),
+        zbuf0 = format_args!("{:#x}", gs.zbuf[0]),
+        test0 = format_args!("{:#x}", gs.test[0]),
+        test1 = format_args!("{:#x}", gs.test[1]),
         ee_pc = format_args!("{:#010x}", sys.ee.pc),
         iop_pc = format_args!("{:#010x}", sys.iop.pc),
         iop_i_mask = format_args!("{:#x}", sys.bus.iop_i_mask),
@@ -398,9 +404,7 @@ fn run_headless(
         d_mask = format_args!("{:#x}", sys.bus.d_mask),
         "run finished"
     );
-    let psms: Vec<String> = sys
-        .bus
-        .gs
+    let psms: Vec<String> = gs
         .tex_psm_hist
         .iter()
         .enumerate()
@@ -428,7 +432,7 @@ fn run_headless(
         let vram = format!("{dir}/gs_vram.bin");
         if let Err(e) = std::fs::write(&ee, &sys.bus.ram)
             .and_then(|_| std::fs::write(&iop, &sys.bus.iop_ram))
-            .and_then(|_| std::fs::write(&vram, &sys.bus.gs.vram))
+            .and_then(|_| std::fs::write(&vram, sys.bus.gs.vram()))
             .and_then(|_| std::fs::write(format!("{dir}/vu1_micro.bin"), &sys.bus.vu1.micro))
             .and_then(|_| std::fs::write(format!("{dir}/vu1_data.bin"), &sys.bus.vu1.data))
             .and_then(|_| std::fs::write(format!("{dir}/spu2_ram.bin"), &sys.bus.spu2.ram))

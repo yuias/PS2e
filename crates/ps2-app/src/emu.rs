@@ -183,6 +183,9 @@ impl Worker {
 
     fn run(mut self) {
         self.audio = Audio::new();
+        // Frames come from the GS worker's vblank composite; asking the
+        // renderer directly would stall emulation until it caught up.
+        self.sys.set_publish_frames(true);
         loop {
             if !self.handle_commands() {
                 break;
@@ -232,6 +235,7 @@ impl Worker {
                     let disc = self.sys.bus.cdvd.disc.take();
                     let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
                     self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
+                    self.sys.set_publish_frames(true);
                     self.sys.bus.cdvd.disc = disc;
                     self.sys.bus.sio2.memcard = memcard;
                 }
@@ -289,8 +293,10 @@ impl Worker {
         let now = Instant::now();
         if now.duration_since(self.last_frame_publish) >= FRAME_INTERVAL {
             self.last_frame_publish = now;
-            let (w, h, rgba) = self.sys.framebuffer();
-            if w > 0 && h > 0 {
+            if let Some((w, h, rgba)) = self.sys.latest_frame()
+                && w > 0
+                && h > 0
+            {
                 let mut f = self.shared.frame.lock().unwrap();
                 f.width = w;
                 f.height = h;

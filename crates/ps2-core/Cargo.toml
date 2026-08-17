@@ -12,3 +12,5 @@ tracing = "0.1"
 default = []
 # TSC-based subsystem time accounting (see prof.rs).
 profile = []
+# Run the GS renderer on a worker thread (native only; wasm keeps it inline).
+threads = []

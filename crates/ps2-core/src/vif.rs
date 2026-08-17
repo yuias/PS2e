@@ -6,7 +6,7 @@
 //! commands keep the word stream in sync.
 
 use crate::gif::Gif;
-use crate::gs::Gs;
+use crate::gs::GsFront;
 use crate::vu1::Vu1;
 use tracing::{trace, warn};
 
@@ -221,7 +221,7 @@ impl Vif {
     }
 
     /// Feed one 32-bit word of the VIF1 stream.
-    pub fn push_word(&mut self, gs: &mut Gs, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
+    pub fn push_word(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
         match &mut self.state {
             State::Cmd => self.command(gs, gif, vu1, w),
             State::Stmask => {
@@ -272,7 +272,7 @@ impl Vif {
         }
     }
 
-    fn command(&mut self, gs: &mut Gs, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
+    fn command(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
         let cmd = (w >> 24) & 0x7F;
         let imm = w & 0xFFFF;
         let num = (w >> 16) & 0xFF;
@@ -386,7 +386,7 @@ mod tests {
 
     struct Rig {
         vif: Vif,
-        gs: Gs,
+        gs: GsFront,
         gif: Gif,
         vu1: Vu1,
     }
@@ -395,7 +395,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 vif: Vif::new(),
-                gs: Gs::new(),
+                gs: GsFront::inline(),
                 gif: Gif::new(),
                 vu1: Vu1::new(),
             }

@@ -39,8 +39,15 @@ pub struct Ps2System {
 }
 
 impl Ps2System {
-    /// Build a system with the given BIOS image (must be 4 MiB).
+    /// Build a system with the given BIOS image (must be 4 MiB). The GS
+    /// renderer runs on a worker thread when the `threads` feature is on.
     pub fn new(bios: Vec<u8>) -> Result<Self, String> {
+        Self::new_with(bios, cfg!(feature = "threads"))
+    }
+
+    /// [`Ps2System::new`] with an explicit choice of a threaded (`true`) or
+    /// inline GS renderer; the threaded one needs the `threads` feature.
+    pub fn new_with(bios: Vec<u8>, gs_threaded: bool) -> Result<Self, String> {
         if bios.len() != bus::BIOS_SIZE {
             return Err(format!(
                 "BIOS must be {} bytes, got {}",
@@ -51,7 +58,7 @@ impl Ps2System {
         Ok(Self {
             ee: ee::Cpu::new(),
             iop: iop::Cpu::new(),
-            bus: Bus::new(bios),
+            bus: Bus::new(bios, gs_threaded),
             cycles: 0,
             frame_pos: 0,
         })
@@ -118,8 +125,20 @@ impl Ps2System {
         core::mem::take(&mut self.bus.tty_buffer)
     }
 
-    /// Current display output as RGBA8: (width, height, pixels).
-    pub fn framebuffer(&self) -> (u32, u32, Vec<u8>) {
+    /// Current display output as RGBA8: (width, height, pixels). Waits for
+    /// the renderer to catch up with everything written so far.
+    pub fn framebuffer(&mut self) -> gs::Frame {
         self.bus.gs.framebuffer()
+    }
+
+    /// Composite the display at every vblank so [`Ps2System::latest_frame`]
+    /// can serve a live front-end without stalling emulation.
+    pub fn set_publish_frames(&mut self, on: bool) {
+        self.bus.gs.set_publish_frames(on);
+    }
+
+    /// Newest vblank-composited frame (see [`Ps2System::set_publish_frames`]).
+    pub fn latest_frame(&self) -> Option<gs::Frame> {
+        self.bus.gs.latest_frame()
     }
 }

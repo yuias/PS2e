@@ -11,7 +11,10 @@ mod raster;
 
 use tracing::{debug, trace, warn};
 
+pub mod front;
 mod layout;
+
+pub use front::{Frame, GsFront, Stats};
 
 pub const VRAM_SIZE: usize = 4 * 1024 * 1024;
 
@@ -75,9 +78,6 @@ pub struct Gs {
     pub dispfb2: u64,
     pub display2: u64,
     pub bgcolor: u64,
-    pub csr: u64,
-    pub imr: u64,
-    priv_shadow: [u64; 32],
     // General registers.
     pub prim: u64,
     pub prmode: u64,
@@ -107,10 +107,6 @@ pub struct Gs {
     /// IMAGE stream (3 bytes per pixel, no chunk alignment).
     trx24: [u8; 3],
     trx24_len: u8,
-    /// Q latched by packed-mode ST writes, consumed by packed RGBAQ.
-    pub packed_q: u32,
-    /// Rising edge into the EE INTC GS line (bit 0).
-    pub intc_pending: bool,
     /// Statistics for bring-up logging.
     pub prims_drawn: u64,
     pub prims_textured: u64,
@@ -153,9 +149,6 @@ impl Gs {
             dispfb2: 0,
             display2: 0,
             bgcolor: 0,
-            csr: 0,
-            imr: 0xFF00,
-            priv_shadow: [0; 32],
             prim: 0,
             prmode: 0,
             prmodecont: 1,
@@ -179,8 +172,6 @@ impl Gs {
             trx_y: 0,
             trx24: [0; 3],
             trx24_len: 0,
-            packed_q: f32::to_bits(1.0),
-            intc_pending: false,
             prims_drawn: 0,
             prims_textured: 0,
             pixels_shaded: 0,
@@ -195,10 +186,11 @@ impl Gs {
         }
     }
 
-    // --- privileged registers -------------------------------------------
+    // --- display registers ----------------------------------------------
 
+    /// Display-side privileged registers (PMODE, SMODE, DISPFB, DISPLAY,
+    /// BGCOLOR); CSR/IMR live in [`GsFront`].
     pub fn priv_write(&mut self, addr: u32, v: u64) {
-        trace!(target: "ps2_core::gs", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#018x}"), "priv write");
         match addr & 0x1FF0 {
             0x0000 => self.pmode = v,
             0x0010 => self.smode1 = v,
@@ -208,47 +200,8 @@ impl Gs {
             0x0090 => self.dispfb2 = v,
             0x00A0 => self.display2 = v,
             0x00E0 => self.bgcolor = v,
-            0x1000 => {
-                // Interrupt flags are write-1-to-clear; bit 9 is reset.
-                self.csr &= !(v & 0x1F);
-                if v & 0x200 != 0 {
-                    self.csr = 0;
-                }
-            }
-            0x1010 => self.imr = v,
-            _ => self.priv_shadow[((addr >> 4) & 31) as usize] = v,
+            _ => {}
         }
-    }
-
-    pub fn priv_read(&mut self, addr: u32) -> u64 {
-        match addr & 0x1FF0 {
-            0x0000 => self.pmode,
-            0x0020 => self.smode2,
-            0x0070 => self.dispfb1,
-            0x0080 => self.display1,
-            0x0090 => self.dispfb2,
-            0x00A0 => self.display2,
-            0x00E0 => self.bgcolor,
-            // CSR: flags + FIFO empty + revision/id.
-            0x1000 => self.csr | 0x4000 | (0x1B << 16) | (0x55 << 24),
-            0x1010 => self.imr,
-            _ => self.priv_shadow[((addr >> 4) & 31) as usize],
-        }
-    }
-
-    fn raise_int(&mut self, bit: u32) {
-        let was = self.csr & (1 << bit) != 0;
-        self.csr |= 1 << bit;
-        // IMR masks sit 8 bits above the CSR flags; 1 = masked.
-        if !was && self.imr & (1 << (bit + 8)) == 0 {
-            self.intc_pending = true;
-        }
-    }
-
-    /// Vertical sync: toggles FIELD and latches the VSINT flag.
-    pub fn vblank(&mut self) {
-        self.csr ^= 1 << 13;
-        self.raise_int(3);
     }
 
     // --- general registers ----------------------------------------------
@@ -341,9 +294,6 @@ impl Gs {
                 }
             }
             0x54 => self.hwreg(v),
-            0x60 => self.raise_int(0), // SIGNAL
-            0x61 => self.raise_int(1), // FINISH
-            0x62 => {}                 // LABEL
             _ => {
                 let (slot, bit) = ((reg >> 6) as usize, reg & 63);
                 if self.warned_regs[slot] & (1 << bit) == 0 {

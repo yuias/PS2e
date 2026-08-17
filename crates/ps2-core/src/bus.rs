@@ -5,7 +5,7 @@
 //! without remapping (see ARCHITECTURE.md).
 
 use crate::gif::Gif;
-use crate::gs::Gs;
+use crate::gs::GsFront;
 use crate::prof;
 use crate::sif::Sif;
 use crate::spu2::Spu2;
@@ -906,7 +906,7 @@ pub struct Bus {
     /// Shadow storage for EE MMIO registers we don't model yet: reads return
     /// the last written value so BIOS read-modify-write sequences behave.
     mmio: Box<[u8]>,
-    pub gs: Gs,
+    pub gs: GsFront,
     pub gif: Gif,
     pub vif1: Vif,
     pub vu1: Vu1,
@@ -980,7 +980,7 @@ pub struct Bus {
 }
 
 impl Bus {
-    pub fn new(bios: Vec<u8>) -> Self {
+    pub fn new(bios: Vec<u8>, gs_threaded: bool) -> Self {
         assert_eq!(bios.len(), BIOS_SIZE);
         let mut mmio = vec![0u8; MMIO_SIZE].into_boxed_slice();
         // DMAC ENABLER resets to 0x1201; the BIOS uses it as a board-revision
@@ -992,7 +992,7 @@ impl Bus {
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; 2 * 1024 * 1024].into_boxed_slice(),
             mmio,
-            gs: Gs::new(),
+            gs: if gs_threaded { GsFront::new() } else { GsFront::inline() },
             gif: Gif::new(),
             vif1: Vif::new(),
             vu0: Vu1::new(),
@@ -2607,7 +2607,7 @@ mod tests {
     use super::*;
 
     fn bus() -> Bus {
-        Bus::new(vec![0u8; BIOS_SIZE])
+        Bus::new(vec![0u8; BIOS_SIZE], false)
     }
 
     #[test]

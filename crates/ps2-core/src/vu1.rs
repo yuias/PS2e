@@ -9,7 +9,7 @@
 //! during bring-up a silent wrong result is worse than a stop.
 
 use crate::gif::Gif;
-use crate::gs::Gs;
+use crate::gs::GsFront;
 use tracing::{trace, warn};
 
 const MICRO_SIZE: usize = 16 * 1024;
@@ -70,12 +70,12 @@ impl Vu1 {
     }
 
     /// MSCAL/MSCALF: run from `start` (in instruction pairs).
-    pub fn start(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+    pub fn start(&mut self, gs: &mut GsFront, gif: &mut Gif, start: u16) {
         self.run(gs, gif, start);
     }
 
     /// MSCNT: continue after the previously executed program.
-    pub fn continue_run(&mut self, gs: &mut Gs, gif: &mut Gif) {
+    pub fn continue_run(&mut self, gs: &mut GsFront, gif: &mut Gif) {
         let pc = self.next_pc;
         self.run(gs, gif, pc);
     }
@@ -84,7 +84,7 @@ impl Vu1 {
     /// Macro ops share the microcode field layout: special2 op2 >= 0x30
     /// selects the lower-pipeline set (DIV, MOVE, MTIR, LQI, ...), all
     /// other encodings are the upper FMAC set.
-    pub fn exec_macro(&mut self, gs: &mut Gs, gif: &mut Gif, instr: u32) {
+    pub fn exec_macro(&mut self, gs: &mut GsFront, gif: &mut Gif, instr: u32) {
         let op = instr & 0x3F;
         match op {
             // Integer ops (VIADD..VIOR) only exist in the lower pipeline.
@@ -189,7 +189,7 @@ impl Vu1 {
 
     // --- main loop -------------------------------------------------------
 
-    fn run(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+    fn run(&mut self, gs: &mut GsFront, gif: &mut Gif, start: u16) {
         let _p = crate::prof::scope(crate::prof::Slot::Vu1);
         // vf00/vi00 are architectural constants.
         self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
@@ -493,7 +493,7 @@ impl Vu1 {
 
     fn exec_lower(
         &mut self,
-        gs: &mut Gs,
+        gs: &mut GsFront,
         gif: &mut Gif,
         pc: u16,
         instr: u32,
@@ -592,7 +592,7 @@ impl Vu1 {
         }
     }
 
-    fn exec_lower_special(&mut self, gs: &mut Gs, gif: &mut Gif, pc: u16, instr: u32) {
+    fn exec_lower_special(&mut self, gs: &mut GsFront, gif: &mut Gif, pc: u16, instr: u32) {
         let dest = (instr >> 21) & 0xF;
         let it = ((instr >> 16) & 0x1F) as usize;
         let is = ((instr >> 11) & 0x1F) as usize;
@@ -631,7 +631,7 @@ impl Vu1 {
     #[allow(clippy::too_many_arguments)]
     fn exec_lower2(
         &mut self,
-        gs: &mut Gs,
+        gs: &mut GsFront,
         gif: &mut Gif,
         pc: u16,
         instr: u32,
@@ -761,7 +761,7 @@ impl Vu1 {
 
     /// XGKICK: stream GIF packets from data memory (PATH1) until a tag
     /// with EOP finishes.
-    fn xgkick(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+    fn xgkick(&mut self, gs: &mut GsFront, gif: &mut Gif, start: u16) {
         if !gif.idle() {
             let st = gif.debug_state();
             warn!(target: "ps2_core::vu1", start, state = format_args!("{st:?}"), "XGKICK with GIF mid-packet");
@@ -823,7 +823,7 @@ mod tests {
         for (i, &(u, l)) in pairs.iter().enumerate() {
             vu.micro[i * 8..i * 8 + 8].copy_from_slice(&pair(u, l));
         }
-        let (mut gs, mut gif) = (Gs::new(), Gif::new());
+        let (mut gs, mut gif) = (GsFront::inline(), Gif::new());
         vu.start(&mut gs, &mut gif, 0);
     }
 
@@ -888,7 +888,7 @@ mod tests {
         put(&mut vu, 20, [0, 0, 0x42, 0]);
         put(&mut vu, 21, [0x0000_8004, 0x302E_6000, 0x0000_0412, 0]);
         // 4 loops x 3 regs = 12 data qwords at 22..34 (zeros are fine).
-        let (mut gs, mut gif) = (Gs::new(), Gif::new());
+        let (mut gs, mut gif) = (GsFront::inline(), Gif::new());
         vu.xgkick(&mut gs, &mut gif, 18);
         assert!(gif.end_of_packet());
     }

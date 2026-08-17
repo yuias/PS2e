@@ -7,7 +7,7 @@
 //! feature the guard is a ZST and everything compiles to nothing.
 
 #[cfg(feature = "profile")]
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Accounting buckets. Order matters only for the report.
 #[derive(Clone, Copy)]
@@ -35,23 +35,29 @@ pub enum Slot {
     GsXfer,
     /// SPU2 voice mixing.
     Spu2,
+    /// GS worker thread waiting for commands.
+    GsIdle,
 }
 
 #[cfg(feature = "profile")]
-const N: usize = 11;
+const N: usize = 12;
 #[cfg(feature = "profile")]
 const NAMES: [&str; N] = [
     "other", "EE", "IOP", "timers", "VIF1", "GIF", "SIF", "VU1", "GS draw", "GS xfer", "SPU2",
+    "GS idle",
 ];
 
 #[cfg(feature = "profile")]
 static TICKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 #[cfg(feature = "profile")]
 static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+// The open scope is per thread (the GS worker has its own), the buckets
+// are shared: percentages are of total CPU time across threads.
 #[cfg(feature = "profile")]
-static CURRENT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "profile")]
-static LAST: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static CURRENT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static LAST: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
 
 #[cfg(feature = "profile")]
 #[inline(always)]
@@ -70,8 +76,8 @@ fn tsc() -> u64 {
 #[inline(always)]
 fn switch(next: usize) -> usize {
     let now = tsc();
-    let last = LAST.swap(now, Ordering::Relaxed);
-    let cur = CURRENT.swap(next, Ordering::Relaxed);
+    let last = LAST.replace(now);
+    let cur = CURRENT.replace(next);
     if last != 0 {
         TICKS[cur].fetch_add(now.wrapping_sub(last), Ordering::Relaxed);
     }
@@ -167,7 +173,7 @@ pub fn report() -> Option<String> {
     }
     #[cfg(feature = "profile")]
     {
-        switch(CURRENT.load(Ordering::Relaxed)); // flush the open scope
+        switch(CURRENT.get()); // flush the open scope
         let t: Vec<u64> = TICKS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
         let c: Vec<u64> = COUNTS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
         let total: u64 = t.iter().sum();
