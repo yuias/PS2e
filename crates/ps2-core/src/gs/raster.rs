@@ -236,10 +236,14 @@ impl Gs {
 
     /// Decode the drawing environment for the current context once per
     /// primitive; the per-pixel path only reads it.
-    fn pixel_pipe(&self) -> PixelPipe {
+    fn pixel_pipe(&mut self) -> PixelPipe {
         let attrs = self.attrs();
-        let ctx = &self.ctx[((attrs >> 9) & 1) as usize];
+        let ctx = self.ctx[((attrs >> 9) & 1) as usize];
         let test = ctx.test;
+        let tex = TexInfo::new(&ctx, self.texa);
+        if attrs & (1 << 4) != 0 && tex.clut_bits != 0 {
+            self.refresh_clut(&tex);
+        }
         PixelPipe {
             scx0: (ctx.scissor & 0x7FF) as i32,
             scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
@@ -251,7 +255,7 @@ impl Gs {
             tfx: ((ctx.tex0 >> 35) & 3) as u8,
             tcc: ctx.tex0 & (1 << 34) != 0,
             bilinear: (ctx.tex1 >> 5) & 1 != 0,
-            tex: TexInfo::new(ctx, self.texa),
+            tex,
             ate: test & 1 != 0,
             atst: ((test >> 1) & 7) as u8,
             aref: ((test >> 4) & 0xFF) as f32,
@@ -469,43 +473,46 @@ impl Gs {
     fn texel(&self, ti: &TexInfo, u: i32, v: i32) -> u32 {
         let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
         let v = wrap(v, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
-        let (tbp, tbw, tex0) = (ti.tbp, ti.tbw, ti.tex0);
+        let (tbp, tbw) = (ti.tbp, ti.tbw);
         match ti.psm {
             PSMCT32 => self.read_psmct32(tbp, tbw, u, v),
             PSMCT24 => (self.read_psmct32(tbp, tbw, u, v) & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
             PSMCT16 | PSMCT16S => expand16(self.read_psmct16(tbp, tbw, u, v), ti.texa),
-            PSMT8 => {
-                let idx = self.read_psmt8(tbp, tbw, u, v);
-                self.clut_lookup(tex0, idx as u32, true)
-            }
-            PSMT4 => {
-                let idx = self.read_psmt4(tbp, tbw, u, v);
-                self.clut_lookup(tex0, idx as u32, false)
-            }
-            PSMT8H => {
-                let idx = self.read_psmct32(tbp, tbw, u, v) >> 24;
-                self.clut_lookup(tex0, idx, true)
-            }
+            PSMT8 => self.clut[self.read_psmt8(tbp, tbw, u, v) as usize],
+            PSMT4 => self.clut[self.read_psmt4(tbp, tbw, u, v) as usize + ti.clut_base],
+            PSMT8H => self.clut[(self.read_psmct32(tbp, tbw, u, v) >> 24) as usize],
             PSMT4HL => {
-                let idx = (self.read_psmct32(tbp, tbw, u, v) >> 24) & 0xF;
-                self.clut_lookup(tex0, idx, false)
+                self.clut[((self.read_psmct32(tbp, tbw, u, v) >> 24) & 0xF) as usize + ti.clut_base]
             }
             PSMT4HH => {
-                let idx = self.read_psmct32(tbp, tbw, u, v) >> 28;
-                self.clut_lookup(tex0, idx, false)
+                self.clut[(self.read_psmct32(tbp, tbw, u, v) >> 28) as usize + ti.clut_base]
             }
             _ => 0xFF00_FFFF,
         }
     }
 
-    /// Look a palette index up through the CLUT buffer.
-    fn clut_lookup(&self, tex0: u64, index: u32, eight_bit: bool) -> u32 {
+    /// Re-decode the CLUT cache when the palette setup changed or a
+    /// transfer touched VRAM. Real hardware only reloads on TEX0 writes
+    /// with CLD set; keying on the setup instead is a superset of that
+    /// (drawing primitives into CLUT memory is not tracked).
+    fn refresh_clut(&mut self, ti: &TexInfo) {
+        let key = ti.clut_key();
+        if key == self.clut_key && !self.clut_dirty {
+            return;
+        }
+        let entries = if ti.clut_bits == 8 { 256 } else { 16 };
+        for e in ti.clut_base..ti.clut_base + entries {
+            self.clut[e] = self.clut_lookup(ti.tex0, e as u32);
+        }
+        self.clut_key = key;
+        self.clut_dirty = false;
+    }
+
+    /// Read palette entry `e` (index plus CSA offset) from VRAM.
+    fn clut_lookup(&self, tex0: u64, e: u32) -> u32 {
         let cbp = ((tex0 >> 37) & 0x3FFF) as u32;
         let cpsm = ((tex0 >> 51) & 0xF) as u32;
         let csm = (tex0 >> 55) & 1;
-        let csa = ((tex0 >> 56) & 0x1F) as u32;
-        // CSA offsets in 16-entry slots (must be 0 for 8-bit CLUTs).
-        let e = if eight_bit { index } else { index + csa * 16 };
         let (x, y) = if csm == 0 {
             // CSM1 packs the CLUT as a 16x16 image whose entries sit in
             // 8x2-entry tiles — equivalently, a linear 16x16 layout with
@@ -569,17 +576,27 @@ struct TexInfo {
     minv: i32,
     maxv: i32,
     texa: u64,
+    /// Palette index width (0 for direct-color formats).
+    clut_bits: u8,
+    /// First CLUT cache entry: CSA offset in 16-entry slots (4-bit only).
+    clut_base: usize,
 }
 
 impl TexInfo {
     fn new(ctx: &Context, texa: u64) -> Self {
         let tex0 = ctx.tex0;
+        let psm = ((tex0 >> 20) & 0x3F) as u32;
+        let clut_bits = match psm {
+            PSMT8 | PSMT8H => 8,
+            PSMT4 | PSMT4HL | PSMT4HH => 4,
+            _ => 0,
+        };
         // CLAMP register: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat.
         Self {
             tex0,
             tbp: (tex0 & 0x3FFF) as u32,
             tbw: ((tex0 >> 14) & 0x3F) as u32,
-            psm: ((tex0 >> 20) & 0x3F) as u32,
+            psm,
             tw: 1u32 << ((tex0 >> 26) & 0xF).min(10),
             th: 1u32 << ((tex0 >> 30) & 0xF).min(10),
             wms: ctx.clamp & 3,
@@ -589,7 +606,19 @@ impl TexInfo {
             minv: ((ctx.clamp >> 24) & 0x3FF) as i32,
             maxv: ((ctx.clamp >> 34) & 0x3FF) as i32,
             texa,
+            clut_bits,
+            clut_base: if clut_bits == 4 { ((tex0 >> 56) & 0x1F) as usize * 16 } else { 0 },
         }
+    }
+
+    /// Everything the decoded CLUT depends on: CBP/CPSM/CSM/CSA, the index
+    /// width, and the TEXA fields used to expand 16-bit entries.
+    fn clut_key(&self) -> u64 {
+        ((self.tex0 >> 37) & 0xFF_FFFF)
+            | ((self.clut_bits as u64) << 24)
+            | ((self.texa & 0xFF) << 32)
+            | (((self.texa >> 15) & 1) << 40)
+            | (((self.texa >> 32) & 0xFF) << 41)
     }
 }
 

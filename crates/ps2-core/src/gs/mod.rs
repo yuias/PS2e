@@ -124,6 +124,13 @@ pub struct Gs {
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
+    /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
+    /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
+    clut: Box<[u32; 512]>,
+    /// Palette setup (`TexInfo::clut_key`) the cache was decoded from.
+    clut_key: u64,
+    /// VRAM changed by a transfer since the CLUT was decoded.
+    clut_dirty: bool,
 }
 
 impl Default for Gs {
@@ -180,6 +187,9 @@ impl Gs {
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
+            clut: Box::new([0; 512]),
+            clut_key: u64::MAX,
+            clut_dirty: true,
         }
     }
 
@@ -475,6 +485,7 @@ impl Gs {
             return;
         }
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        self.clut_dirty = true;
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
         let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
@@ -592,6 +603,7 @@ impl Gs {
     /// LOCAL->LOCAL copy, used by the kernel to move fonts around.
     fn local_copy(&mut self) {
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        self.clut_dirty = true;
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
         let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;
