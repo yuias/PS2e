@@ -147,6 +147,41 @@ pub fn count_iop(pc: u32) {
     }
 }
 
+/// Sub-step timing samples (EE step phases), see `Cpu::step`.
+#[cfg(feature = "profile")]
+static PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(feature = "profile")]
+static PART_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+/// TSC now (0 without the feature).
+#[inline(always)]
+pub fn now() -> u64 {
+    #[cfg(feature = "profile")]
+    {
+        tsc()
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        0
+    }
+}
+
+/// Add one sampled EE step split into up to four phase durations.
+#[inline(always)]
+pub fn step_parts(parts: [u64; 4]) {
+    #[cfg(feature = "profile")]
+    {
+        for (i, p) in parts.iter().enumerate() {
+            PARTS[i].fetch_add(*p, Ordering::Relaxed);
+        }
+        PART_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        let _ = parts;
+    }
+}
+
 /// Record one EE instruction for the profile report.
 #[inline(always)]
 pub fn count_ee(pc: u32, instr: u32) {
@@ -199,6 +234,15 @@ pub fn report() -> Option<String> {
 ",
             total_ops,
             t[Slot::Ee as usize] as f64 / total_ops as f64
+        ));
+        let n = PART_SAMPLES.load(Ordering::Relaxed).max(1) as f64;
+        out.push_str(&format!(
+            "EE step phases (ticks, sampled): irq/bookkeeping {:.1}  fetch {:.1}  execute {:.1}  total {:.1}
+",
+            PARTS[0].load(Ordering::Relaxed) as f64 / n,
+            PARTS[1].load(Ordering::Relaxed) as f64 / n,
+            PARTS[2].load(Ordering::Relaxed) as f64 / n,
+            PARTS[3].load(Ordering::Relaxed) as f64 / n,
         ));
         out.push_str("EE instruction mix (op<<6|funct for SPECIAL/MMI):
 ");

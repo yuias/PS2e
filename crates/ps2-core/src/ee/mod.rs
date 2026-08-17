@@ -185,6 +185,9 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) {
         debug_assert_eq!(self.gpr[0], [0, 0]);
+        // Sampled phase timing for the profile report (every 64th step).
+        let sample = cfg!(feature = "profile") && self.pc & 0xFC == 0;
+        let t0 = if sample { crate::prof::now() } else { 0 };
         if self.pc == 0 {
             panic!("EE jumped to null (previous pc {:#010x})", self.current_pc);
         }
@@ -196,11 +199,17 @@ impl Cpu {
         self.current_pc = self.pc;
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;
+        let t1 = if sample { crate::prof::now() } else { 0 };
         let instr = bus.fetch32(self.pc);
         crate::prof::count_ee(self.pc, instr);
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
+        let t2 = if sample { crate::prof::now() } else { 0 };
         self.execute(instr, bus);
+        if sample {
+            let t3 = crate::prof::now();
+            crate::prof::step_parts([t1 - t0, t2 - t1, t3 - t2, t3 - t0]);
+        }
     }
 
     fn execute(&mut self, instr: u32, bus: &mut Bus) {
