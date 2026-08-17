@@ -33,8 +33,8 @@ Planned crates:
 
 | Decision | Choice | Why |
 | -------- | ------ | --- |
-| CPU execution | Interpreter (`match`-based, no JIT) | Bring-up and BIOS debugging first; deterministic, wasm-safe. Cached interpreter / JIT is a later performance option. Both cores skip stepping while spinning in their kernel idle loops (only an interrupt can move them), which keeps emulated timing exact. |
-| GS rendering | Software rasterizer over VRAM in the hardware page/block/column layout (`gs/layout.rs`) | Accuracy and debuggability first, same as PS1e. The real layout matters: games pack CLUTs and overlay formats in ways a linear model breaks. wgpu only uploads the final framebuffer. A hardware renderer can be added later behind the same command interface. |
+| CPU execution | Interpreter (`match`-based) as the reference; x86-64 recompiler for the EE behind the `jit` feature (`ee/jit/`, dynasm) | The interpreter stays authoritative and wasm-safe; the recompiler translates blocks that keep registers in the `Cpu` struct, calls back into the interpreter for anything it does not translate, and ends blocks at control flow so exceptions/branches keep the interpreter's semantics. The system retires a block, then advances the IOP/timers/vblank by the same cycles (IOP interleave is block-granular under the JIT). Both cores skip stepping while spinning in their kernel idle loops (only an interrupt can move them). `--no-jit` restores cycle-exact interleave; the debugger always steps the interpreter. |
+| GS rendering | Software rasterizer over VRAM in the hardware page/block/column layout (`gs/layout.rs`), on a worker thread behind `GsFront` (`threads` feature) | Accuracy and debuggability first, same as PS1e. The real layout matters: games pack CLUTs and overlay formats in ways a linear model breaks. Everything the EE can observe (CSR/IMR, SIGNAL/FINISH, display registers) is decided on the EE side at enqueue time, so the worker only owns VRAM and stays deterministic. wgpu only uploads the final framebuffer. |
 | BIOS | LLE only, SCPH-50000 as the reference image | The emulator must faithfully run the original BIOS so it can validate the reimplemented one. No HLE hooks in the execution path. |
 | TTY observation | Watch writes to the EE SIO TXFIFO (0x1000F180) | The kernel's debug output channel. Pure observation, no effect on execution — safe for BIOS bring-up. |
 | Bus design | Concrete fields + address `match` dispatch, no traits | Simplicity and speed; avoids generics. Same as PS1e. |
@@ -91,10 +91,12 @@ ps2-core/src/
 ├── ee/
 │   ├── mod.rs    # R5900 interpreter (128-bit GPRs, MMI, COP2 macro, branch delay slots)
 │   ├── cop0.rs   # Status/Cause/EPC, exceptions, ERET, interrupt gating
-│   └── fpu.rs    # COP1 (non-IEEE single-precision; host f32 approximation for now)
+│   ├── fpu.rs    # COP1 (non-IEEE single-precision; host f32 approximation for now)
+│   └── jit/      # x86-64 recompiler: block cache (mod.rs), emitter (emit.rs), bus helpers, RWX arena
 ├── iop/
 │   └── mod.rs    # R3000A interpreter (load delay slots, PS1-style COP0)
 ├── gs/
+│   ├── front.rs  # EE-side GS: privileged registers, CSR/IMR, command stream to the worker
 │   ├── mod.rs    # Registers, vertex kick, IMAGE/local transfers, VRAM accessors, scanout
 │   ├── layout.rs # Hardware page/block/column addressing for every pixel format
 │   └── raster.rs # Triangle/sprite rasterization, texture sampling, tests, blending
