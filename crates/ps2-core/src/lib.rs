@@ -60,7 +60,15 @@ impl Ps2System {
     /// Execute one EE instruction, stepping the IOP at the 8:1 clock ratio.
     pub fn step(&mut self) {
         self.bus.now = self.cycles;
-        self.ee.step(&mut self.bus);
+        // Idle-loop skip: while the EE spins in the kernel idle thread only
+        // an interrupt can move it, so let the rest of the machine run and
+        // resume stepping (into the exception) once one is pending.
+        if !self.ee.idle {
+            self.ee.step(&mut self.bus);
+        } else if self.ee.interrupt_pending(&self.bus) {
+            self.ee.idle = false;
+            self.ee.step(&mut self.bus);
+        }
         // 1 cycle per instruction for now; wait states and dual-issue
         // approximation come later.
         if self.cycles.is_multiple_of(EE_PER_IOP) {

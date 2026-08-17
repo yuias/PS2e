@@ -39,6 +39,10 @@ pub struct Cpu {
     /// PC of the instruction currently executing (for diagnostics/exceptions).
     current_pc: u32,
     in_delay: bool,
+    /// Spinning in an all-nop loop (the kernel idle thread): nothing but an
+    /// interrupt can change state, so [`crate::Ps2System`] skips EE steps
+    /// until one is pending.
+    pub idle: bool,
 }
 
 impl Default for Cpu {
@@ -62,6 +66,7 @@ impl Cpu {
             next_is_delay: false,
             current_pc: 0xBFC0_0000,
             in_delay: false,
+            idle: false,
         }
     }
 
@@ -120,6 +125,25 @@ impl Cpu {
         }
     }
 
+    /// An unconditional backward `b` whose body (delay slot included) is all
+    /// nops is the kernel's idle thread; flag it so the system can skip
+    /// stepping until an interrupt arrives.
+    fn check_idle_loop(&mut self, bus: &mut Bus) {
+        let target = self.next_pc;
+        let end = self.pc; // delay slot address
+        if target > end || end - target > 64 {
+            return;
+        }
+        let mut a = target;
+        while a <= end {
+            if bus.fetch32(a) != 0 {
+                return;
+            }
+            a += 4;
+        }
+        self.idle = true;
+    }
+
     fn exception(&mut self, code: u32) {
         let vector = self
             .cop0
@@ -151,15 +175,20 @@ impl Cpu {
 
     // --- main loop -------------------------------------------------------
 
+    /// Whether an interrupt would be taken at the next step (also refreshes
+    /// the CAUSE IP bits). Used to end an idle-loop skip.
+    #[inline]
+    pub fn interrupt_pending(&mut self, bus: &Bus) -> bool {
+        self.cop0
+            .interrupt_pending(bus.ee_int0_pending(), bus.ee_int1_pending())
+    }
+
     pub fn step(&mut self, bus: &mut Bus) {
         debug_assert_eq!(self.gpr[0], [0, 0]);
         if self.pc == 0 {
             panic!("EE jumped to null (previous pc {:#010x})", self.current_pc);
         }
-        if self
-            .cop0
-            .interrupt_pending(bus.ee_int0_pending(), bus.ee_int1_pending())
-        {
+        if self.interrupt_pending(bus) {
             self.current_pc = self.pc;
             self.in_delay = self.next_is_delay;
             self.exception(EXC_INTERRUPT);
@@ -168,6 +197,7 @@ impl Cpu {
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;
         let instr = bus.fetch32(self.pc);
+        crate::prof::count_ee(self.pc, instr);
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
         self.execute(instr, bus);
@@ -192,7 +222,12 @@ impl Cpu {
                 self.set32(31, self.next_pc);
                 self.branch_to((self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2));
             }
-            0x04 => self.branch_cond(self.r64(rs) == self.r64(rt), imm, false),
+            0x04 => {
+                self.branch_cond(self.r64(rs) == self.r64(rt), imm, false);
+                if rs == 0 && rt == 0 {
+                    self.check_idle_loop(bus);
+                }
+            }
             0x05 => self.branch_cond(self.r64(rs) != self.r64(rt), imm, false),
             0x06 => self.branch_cond((self.r64(rs) as i64) <= 0, imm, false),
             0x07 => self.branch_cond((self.r64(rs) as i64) > 0, imm, false),
