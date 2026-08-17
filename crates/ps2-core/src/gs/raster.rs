@@ -116,8 +116,8 @@ impl Gs {
             self.prims_textured += 1;
         }
         self.log_target(attrs, "sprite", 2);
-        let wid = (x1 - x0).max(1) as f32;
-        let hei = (y1 - y0).max(1) as f32;
+        let inv_wid = 1.0 / (x1 - x0).max(1) as f32;
+        let inv_hei = 1.0 / (y1 - y0).max(1) as f32;
         if px1 - px0 <= 24 && py1 - py0 <= 24 {
             self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
         }
@@ -135,9 +135,9 @@ impl Gs {
         };
         let pipe = self.pixel_pipe();
         for py in py0.max(pipe.scy0)..px_clip(py1).min(pipe.scy1 + 1) {
-            let fy = ((py << 4) as f32 + 8.0 - y0 as f32) / hei;
+            let fy = ((py << 4) as f32 + 8.0 - y0 as f32) * inv_hei;
             for px in px0.max(pipe.scx0)..px_clip(px1).min(pipe.scx1 + 1) {
-                let fx = ((px << 4) as f32 + 8.0 - x0 as f32) / wid;
+                let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * inv_wid;
                 let frag = Frag {
                     r: v1.r as f32,
                     g: v1.g as f32,
@@ -258,7 +258,7 @@ impl Gs {
             tex,
             ate: test & 1 != 0,
             atst: ((test >> 1) & 7) as u8,
-            aref: ((test >> 4) & 0xFF) as f32,
+            aref: ((test >> 4) & 0xFF) as u32,
             afail: ((test >> 12) & 3) as u8,
             zte: test & (1 << 16) != 0,
             ztst: ((test >> 17) & 3) as u8,
@@ -282,27 +282,30 @@ impl Gs {
     }
 
     /// Full per-pixel pipeline: texture, tests, blend, write. The caller
-    /// has already clipped to the scissor box.
+    /// has already clipped to the scissor box. Color math is integer, as
+    /// on hardware: interpolated colors truncate to 8 bits first.
+    #[inline(always)]
     fn shade_pixel(&mut self, pipe: &PixelPipe, x: i32, y: i32, frag: Frag) {
         let (x, y) = (x as u32, y as u32);
         self.pixels_shaded += 1;
 
         // Source color: vertex color, optionally combined with a texel.
-        let mut r = frag.r;
-        let mut g = frag.g;
-        let mut b = frag.b;
-        let mut a = frag.a;
+        let mut r = frag.r as u32;
+        let mut g = frag.g as u32;
+        let mut b = frag.b as u32;
+        let mut a = frag.a as u32;
         if pipe.tme {
             self.tex_psm_hist[pipe.tex.psm as usize] += 1;
-            let (tr, tg, tb, ta) = self.sample(pipe, &frag);
+            let texel = self.sample(pipe, &frag);
+            let (tr, tg, tb, ta) = (texel & 0xFF, (texel >> 8) & 0xFF, (texel >> 16) & 0xFF, texel >> 24);
             match pipe.tfx {
                 0 => {
                     // MODULATE
-                    r = (tr * r / 128.0).min(255.0);
-                    g = (tg * g / 128.0).min(255.0);
-                    b = (tb * b / 128.0).min(255.0);
+                    r = ((tr * r) >> 7).min(255);
+                    g = ((tg * g) >> 7).min(255);
+                    b = ((tb * b) >> 7).min(255);
                     if pipe.tcc {
-                        a = (ta * a / 128.0).min(255.0);
+                        a = ((ta * a) >> 7).min(255);
                     }
                 }
                 1 => {
@@ -316,9 +319,9 @@ impl Gs {
                 }
                 _ => {
                     // HIGHLIGHT/HIGHLIGHT2: approximate.
-                    r = (tr * r / 128.0 + a).min(255.0);
-                    g = (tg * g / 128.0 + a).min(255.0);
-                    b = (tb * b / 128.0 + a).min(255.0);
+                    r = (((tr * r) >> 7) + a).min(255);
+                    g = (((tg * g) >> 7) + a).min(255);
+                    b = (((tb * b) >> 7) + a).min(255);
                     if pipe.tcc {
                         a = ta;
                     }
@@ -334,10 +337,10 @@ impl Gs {
                 1 => true,
                 2 => a < aref,
                 3 => a <= aref,
-                4 => (a as u32) == aref as u32,
+                4 => a == aref,
                 5 => a >= aref,
                 6 => a > aref,
-                _ => (a as u32) != aref as u32,
+                _ => a != aref,
             };
             if !pass {
                 match pipe.afail {
@@ -351,21 +354,21 @@ impl Gs {
 
         // Depth test (linear z buffer, PSMZ32-style storage).
         let (zbp, fbw, zmask) = (pipe.zbp, pipe.fbw, pipe.zmask);
-        if pipe.zte && pipe.ztst != 1 {
-            let zcur = self.read_psmct32(zbp, fbw, x, y) & zmask;
+        if pipe.zte {
+            let zcur = self.read_psmct32(zbp, fbw, x, y);
             let z = frag.z & zmask;
             let pass = match pipe.ztst {
                 0 => false,
-                2 => z >= zcur,
-                _ => z > zcur,
+                1 => true,
+                2 => z >= (zcur & zmask),
+                _ => z > (zcur & zmask),
             };
             if !pass {
                 return;
             }
-        }
-        if pipe.zte && !pipe.zmsk {
-            let cur = self.read_psmct32(zbp, fbw, x, y);
-            self.write_psmct32(zbp, fbw, x, y, (cur & !zmask) | (frag.z & zmask));
+            if !pipe.zmsk {
+                self.write_psmct32(zbp, fbw, x, y, (zcur & !zmask) | z);
+            }
         }
 
         // Destination blend.
@@ -374,53 +377,44 @@ impl Gs {
 
         if pipe.abe {
             let (dr, dg, db, da) = (
-                (dst & 0xFF) as f32,
-                ((dst >> 8) & 0xFF) as f32,
-                ((dst >> 16) & 0xFF) as f32,
-                ((dst >> 24) & 0xFF) as f32,
+                (dst & 0xFF) as i32,
+                ((dst >> 8) & 0xFF) as i32,
+                ((dst >> 16) & 0xFF) as i32,
+                (dst >> 24) as i32,
             );
             // ALPHA: Cv = ((A - B) * C >> 7) + D.
             let al = pipe.alpha;
-            let sel = |k: u64, s: f32, d: f32| -> f32 {
+            let sel = |k: u64, s: u32, d: i32| -> i32 {
                 match k & 3 {
-                    0 => s,
+                    0 => s as i32,
                     1 => d,
-                    _ => 0.0,
+                    _ => 0,
                 }
             };
             let ca = (sel(al, r, dr), sel(al, g, dg), sel(al, b, db));
-            let cb = (
-                sel(al >> 2, r, dr),
-                sel(al >> 2, g, dg),
-                sel(al >> 2, b, db),
-            );
+            let cb = (sel(al >> 2, r, dr), sel(al >> 2, g, dg), sel(al >> 2, b, db));
             let alpha = match (al >> 4) & 3 {
-                0 => a,
+                0 => a as i32,
                 1 => da,
-                _ => ((al >> 32) & 0xFF) as f32,
+                _ => ((al >> 32) & 0xFF) as i32,
             };
-            let cd = (
-                sel(al >> 6, r, dr),
-                sel(al >> 6, g, dg),
-                sel(al >> 6, b, db),
-            );
-            r = ((ca.0 - cb.0) * alpha / 128.0 + cd.0).clamp(0.0, 255.0);
-            g = ((ca.1 - cb.1) * alpha / 128.0 + cd.1).clamp(0.0, 255.0);
-            b = ((ca.2 - cb.2) * alpha / 128.0 + cd.2).clamp(0.0, 255.0);
+            let cd = (sel(al >> 6, r, dr), sel(al >> 6, g, dg), sel(al >> 6, b, db));
+            r = ((((ca.0 - cb.0) * alpha) >> 7) + cd.0).clamp(0, 255) as u32;
+            g = ((((ca.1 - cb.1) * alpha) >> 7) + cd.1).clamp(0, 255) as u32;
+            b = ((((ca.2 - cb.2) * alpha) >> 7) + cd.2).clamp(0, 255) as u32;
         }
 
-        let out =
-            (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a.min(255.0) as u32) << 24);
-        let cur = dst;
-        let mut merged = (out & !pipe.fbmsk) | (cur & pipe.fbmsk);
+        let out = r | (g << 8) | (b << 16) | (a.min(255) << 24);
+        let mut merged = (out & !pipe.fbmsk) | (dst & pipe.fbmsk);
         if pipe.fb24 {
-            merged = (merged & 0xFF_FFFF) | (cur & 0xFF00_0000);
+            merged = (merged & 0xFF_FFFF) | (dst & 0xFF00_0000);
         }
         self.write_psmct32(fbp, fbw, x, y, merged);
     }
 
-    /// Texture sample (nearest or bilinear per TEX1 MMAG).
-    fn sample(&self, pipe: &PixelPipe, frag: &Frag) -> (f32, f32, f32, f32) {
+    /// Texture sample as RGBA8 (nearest or bilinear per TEX1 MMAG).
+    #[inline(always)]
+    fn sample(&self, pipe: &PixelPipe, frag: &Frag) -> u32 {
         let ti = &pipe.tex;
 
         // FST: UV addressing vs STQ. Texel-space coordinates, fractional.
@@ -428,48 +422,33 @@ impl Gs {
             (frag.u, frag.v)
         } else {
             let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
-            (frag.s / q * ti.tw as f32, frag.t / q * ti.th as f32)
+            let inv_q = 1.0 / q;
+            (frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
         };
 
         // TEX1 MMAG selects the magnification filter; minification and
         // mipmaps are not modelled, so it decides for every sample.
-        let texel = if !pipe.bilinear {
-            self.texel(ti, fu.floor() as i32, fv.floor() as i32)
-        } else {
-            let x = fu - 0.5;
-            let y = fv - 0.5;
-            let (x0, y0) = (x.floor(), y.floor());
-            // Weights in 1/256; exact texel centres skip the blend.
-            let fx = ((x - x0) * 256.0) as u32;
-            let fy = ((y - y0) * 256.0) as u32;
-            let (x0, y0) = (x0 as i32, y0 as i32);
-            if fx == 0 && fy == 0 {
-                self.texel(ti, x0, y0)
-            } else {
-                let t00 = self.texel(ti, x0, y0);
-                let t10 = self.texel(ti, x0 + 1, y0);
-                let t01 = self.texel(ti, x0, y0 + 1);
-                let t11 = self.texel(ti, x0 + 1, y0 + 1);
-                let mut out = 0u32;
-                for shift in [0, 8, 16, 24] {
-                    let c = |t: u32| (t >> shift) & 0xFF;
-                    let top = c(t00) * (256 - fx) + c(t10) * fx;
-                    let bottom = c(t01) * (256 - fx) + c(t11) * fx;
-                    let v = (top * (256 - fy) + bottom * fy) >> 16;
-                    out |= v << shift;
-                }
-                out
-            }
-        };
-        (
-            (texel & 0xFF) as f32,
-            ((texel >> 8) & 0xFF) as f32,
-            ((texel >> 16) & 0xFF) as f32,
-            (texel >> 24) as f32,
-        )
+        if !pipe.bilinear {
+            return self.texel(ti, floor_i32(fu), floor_i32(fv));
+        }
+        let x = fu - 0.5;
+        let y = fv - 0.5;
+        let (x0, y0) = (floor_i32(x), floor_i32(y));
+        // Weights in 1/256; exact texel centres skip the blend.
+        let fx = ((x - x0 as f32) * 256.0) as u32;
+        let fy = ((y - y0 as f32) * 256.0) as u32;
+        if fx | fy == 0 {
+            return self.texel(ti, x0, y0);
+        }
+        let t00 = self.texel(ti, x0, y0);
+        let t10 = self.texel(ti, x0 + 1, y0);
+        let t01 = self.texel(ti, x0, y0 + 1);
+        let t11 = self.texel(ti, x0 + 1, y0 + 1);
+        lerp_rgba(lerp_rgba(t00, t10, fx), lerp_rgba(t01, t11, fx), fy)
     }
 
     /// One RGBA8 texel at integer texel coordinates, after CLAMP wrapping.
+    #[inline(always)]
     fn texel(&self, ti: &TexInfo, u: i32, v: i32) -> u32 {
         let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
         let v = wrap(v, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
@@ -547,7 +526,7 @@ struct PixelPipe {
     tex: TexInfo,
     ate: bool,
     atst: u8,
-    aref: f32,
+    aref: u32,
     afail: u8,
     zte: bool,
     ztst: u8,
@@ -627,12 +606,30 @@ fn edge(x0: i32, y0: i32, x1: i32, y1: i32, x: i32, y: i32) -> i64 {
     (x1 - x0) as i64 * (y - y0) as i64 - (y1 - y0) as i64 * (x - x0) as i64
 }
 
+/// Blend two RGBA8 pixels with weight `w` (0..=256) for `b`, all four
+/// channels at once: the R/B and G/A pairs each get 16 bits of headroom.
+#[inline(always)]
+fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
+    let inv = 256 - w;
+    let rb = ((a & 0x00FF_00FF) * inv + (b & 0x00FF_00FF) * w) >> 8;
+    let ga = ((a >> 8) & 0x00FF_00FF) * inv + ((b >> 8) & 0x00FF_00FF) * w;
+    (rb & 0x00FF_00FF) | (ga & 0xFF00_FF00)
+}
+
+/// `f32::floor` as an integer, without the libm call the SSE2 baseline
+/// needs for the intrinsic.
+#[inline(always)]
+fn floor_i32(x: f32) -> i32 {
+    let i = x as i32;
+    if (i as f32) > x { i - 1 } else { i }
+}
+
 #[inline]
 fn px_clip(v: i32) -> i32 {
     v.clamp(0, 2048)
 }
 
-#[inline]
+#[inline(always)]
 fn wrap(c: i32, mode: u64, size: i32, min: i32, max: i32) -> i32 {
     match mode {
         // Texture sizes are powers of two, so REPEAT is a mask.
