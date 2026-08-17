@@ -122,6 +122,9 @@ pub struct Gs {
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
+    /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
+    woven: Vec<u8>,
+    woven_dims: (u32, u32),
     /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
     /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
     clut: Box<[u32; 512]>,
@@ -180,6 +183,8 @@ impl Gs {
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
+            woven: Vec::new(),
+            woven_dims: (0, 0),
             clut: Box::new([0; 512]),
             clut_key: u64::MAX,
             clut_dirty: true,
@@ -699,7 +704,42 @@ impl Gs {
     // --- scanout ---------------------------------------------------------
 
     /// Compose the currently displayed frame as RGBA8. Returns (w, h, data).
+    /// Interlaced field buffers (SMODE2 INT+FFMD) are line-doubled.
     pub fn framebuffer(&self) -> (u32, u32, Vec<u8>) {
+        let (w, h, view) = self.display_view();
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            let sy = if view.field_buffer { y / 2 } else { y };
+            self.scan_line(&view, sy, &mut out[(y * w * 4) as usize..][..(w * 4) as usize]);
+        }
+        (w, h, out)
+    }
+
+    /// Like [`Gs::framebuffer`], but interlaced field buffers are woven:
+    /// this field's lines land on rows of parity `field`, the other rows
+    /// keep the previous field. Bobbing each field alone would show the
+    /// game's half-line field offset as a 30 Hz shake.
+    pub fn framebuffer_woven(&mut self, field: bool) -> (u32, u32, Vec<u8>) {
+        let (w, h, view) = self.display_view();
+        if !view.field_buffer {
+            return self.framebuffer();
+        }
+        if self.woven_dims != (w, h) {
+            self.woven = vec![0u8; (w * h * 4) as usize];
+            self.woven_dims = (w, h);
+        }
+        let mut woven = std::mem::take(&mut self.woven);
+        for sy in 0..h / 2 {
+            let y = sy * 2 + field as u32;
+            self.scan_line(&view, sy, &mut woven[(y * w * 4) as usize..][..(w * 4) as usize]);
+        }
+        let out = woven.clone();
+        self.woven = woven;
+        (w, h, out)
+    }
+
+    /// Decode PMODE/DISPFB/DISPLAY into what the read circuit shows.
+    fn display_view(&self) -> (u32, u32, DisplayView) {
         // Prefer an enabled read circuit; fall back to circuit 1.
         let (dispfb, display) = if self.pmode & 1 != 0 {
             (self.dispfb1, self.display1)
@@ -718,43 +758,54 @@ impl Gs {
         if h == 0 || h > 1024 {
             h = 448;
         }
-        let fbp = ((dispfb & 0x1FF) * 32) as u32; // pages -> blocks
-        let fbw = ((dispfb >> 9) & 0x3F) as u32;
-        let psm = ((dispfb >> 15) & 0x1F) as u32;
-        let dbx = ((dispfb >> 32) & 0x7FF) as u32;
-        let dby = ((dispfb >> 43) & 0x7FF) as u32;
-
-        // INT+FFMD: each field is a half-height buffer; line-double it to
-        // the full display height instead of reading into the next field.
-        let field_double = self.smode2 & 3 == 3;
-        let mut out = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            let sy = if field_double { y / 2 } else { y };
-            for x in 0..w {
-                let (r, g, b) = match psm {
-                    PSMCT32 | PSMCT24 => {
-                        let px = self.read_psmct32(fbp, fbw, dbx + x, dby + sy);
-                        (px as u8, (px >> 8) as u8, (px >> 16) as u8)
-                    }
-                    PSMCT16 | PSMCT16S => {
-                        let px = self.read_psmct16(fbp, fbw, dbx + x, dby + sy, psm);
-                        (
-                            ((px & 0x1F) << 3) as u8,
-                            (((px >> 5) & 0x1F) << 3) as u8,
-                            (((px >> 10) & 0x1F) << 3) as u8,
-                        )
-                    }
-                    _ => (255, 0, 255),
-                };
-                let o = ((y * w + x) * 4) as usize;
-                out[o] = r;
-                out[o + 1] = g;
-                out[o + 2] = b;
-                out[o + 3] = 255;
-            }
-        }
-        (w, h, out)
+        let view = DisplayView {
+            fbp: ((dispfb & 0x1FF) * 32) as u32, // pages -> blocks
+            fbw: ((dispfb >> 9) & 0x3F) as u32,
+            psm: ((dispfb >> 15) & 0x1F) as u32,
+            dbx: ((dispfb >> 32) & 0x7FF) as u32,
+            dby: ((dispfb >> 43) & 0x7FF) as u32,
+            // INT+FFMD: each field is a half-height buffer.
+            field_buffer: self.smode2 & 3 == 3,
+        };
+        (w, h & !1, view)
     }
+
+    /// Read one displayed line (`sy` in buffer lines) as RGBA8 into `out`.
+    fn scan_line(&self, v: &DisplayView, sy: u32, out: &mut [u8]) {
+        let w = out.len() as u32 / 4;
+        for x in 0..w {
+            let (r, g, b) = match v.psm {
+                PSMCT32 | PSMCT24 => {
+                    let px = self.read_psmct32(v.fbp, v.fbw, v.dbx + x, v.dby + sy);
+                    (px as u8, (px >> 8) as u8, (px >> 16) as u8)
+                }
+                PSMCT16 | PSMCT16S => {
+                    let px = self.read_psmct16(v.fbp, v.fbw, v.dbx + x, v.dby + sy, v.psm);
+                    (
+                        ((px & 0x1F) << 3) as u8,
+                        (((px >> 5) & 0x1F) << 3) as u8,
+                        (((px >> 10) & 0x1F) << 3) as u8,
+                    )
+                }
+                _ => (255, 0, 255),
+            };
+            let o = (x * 4) as usize;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+            out[o + 3] = 255;
+        }
+    }
+}
+
+/// Read-circuit parameters for scanout.
+struct DisplayView {
+    fbp: u32,
+    fbw: u32,
+    psm: u32,
+    dbx: u32,
+    dby: u32,
+    field_buffer: bool,
 }
 
 #[cfg(test)]
