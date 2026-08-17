@@ -26,6 +26,8 @@ const AUDIO_TARGET: usize = 3_840;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often the wall-clock speed estimate (EE cycles / real time) refreshes.
 const SPEED_WINDOW: Duration = Duration::from_millis(500);
+/// Cap on the accumulated TTY text kept for the UI panel (bytes).
+const TTY_CAP: usize = 64 * 1024;
 
 pub enum Command {
     SetRunning(bool),
@@ -59,6 +61,18 @@ pub struct Status {
     pub audio_buffered: usize,
     /// Callbacks that ran out of samples (audible as crackle).
     pub audio_underruns: u64,
+    /// EE core: pc, 128-bit GPRs (low half first), HI/LO and COP0 regs.
+    pub ee_pc: u32,
+    pub ee_gpr: [[u64; 2]; 32],
+    pub ee_hi: [u64; 2],
+    pub ee_lo: [u64; 2],
+    pub ee_cop0: [u32; 32],
+    /// IOP core: pc, GPRs, HI/LO and COP0 regs.
+    pub iop_pc: u32,
+    pub iop_gpr: [u32; 32],
+    pub iop_hi: u32,
+    pub iop_lo: u32,
+    pub iop_cop0: [u32; 32],
 }
 
 /// Latest composited display frame (see [`Ps2System::framebuffer`]).
@@ -74,6 +88,9 @@ pub struct FrameSnapshot {
 pub struct Shared {
     pub frame: Mutex<FrameSnapshot>,
     pub status: Mutex<Status>,
+    /// Accumulated kernel/game TTY text, capped to [`TTY_CAP`]. Cleared
+    /// directly by the UI (no round-trip through the worker needed).
+    pub tty: Mutex<String>,
     /// Digital pad bits (UI -> worker), SIO2 bit order (see [`crate::pad`]).
     pub buttons: AtomicU16,
     /// Master volume as f32 bits (UI -> worker).
@@ -332,17 +349,39 @@ impl Worker {
                 st.audio_buffered = audio.buffered_frames();
                 st.audio_underruns = audio.underruns();
             }
+            st.ee_pc = self.sys.ee.pc;
+            st.ee_gpr = self.sys.ee.gpr;
+            st.ee_hi = self.sys.ee.hi;
+            st.ee_lo = self.sys.ee.lo;
+            st.ee_cop0 = self.sys.ee.cop0.regs;
+            st.iop_pc = self.sys.iop.pc;
+            st.iop_gpr = self.sys.iop.gpr;
+            st.iop_hi = self.sys.iop.hi;
+            st.iop_lo = self.sys.iop.lo;
+            st.iop_cop0 = self.sys.iop.cop0;
         }
         self.shared
             .debugger_active
             .store(self.debugger_active(), Ordering::Relaxed);
     }
 
-    /// Stream kernel TTY output to stdout, same as the headless path.
+    /// Stream kernel TTY output to stdout (same as the headless path) and
+    /// accumulate it for the UI panel, capped to [`TTY_CAP`].
     fn flush_tty(&mut self) {
         let tty = self.sys.take_tty();
-        if !tty.is_empty() {
-            crate::print_tty(&tty);
+        if tty.is_empty() {
+            return;
+        }
+        crate::print_tty(&tty);
+        let mut buf = self.shared.tty.lock().unwrap();
+        buf.push_str(&tty);
+        if buf.len() > TTY_CAP {
+            let excess = buf.len() - TTY_CAP;
+            // Drain to the next char boundary so multi-byte UTF-8 isn't split.
+            let cut = (excess..buf.len())
+                .find(|&i| buf.is_char_boundary(i))
+                .unwrap_or(buf.len());
+            buf.drain(..cut);
         }
     }
 

@@ -33,6 +33,20 @@ const KEYMAP: [(egui::Key, u16); 16] = [
     (egui::Key::Backspace, pad::SELECT),
 ];
 
+/// MIPS GPR names, index-aligned with `Cpu::gpr` (shared by EE and IOP).
+const REG_NAMES: [&str; 32] = [
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", //
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", //
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", //
+    "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+];
+
+// Standard MIPS COP0 register numbers; identical on the EE (see
+// ps2_core::ee::cop0) and the IOP's private constants of the same values.
+const COP0_STATUS: usize = 12;
+const COP0_CAUSE: usize = 13;
+const COP0_EPC: usize = 14;
+
 pub struct App {
     emu: Emu,
     display_tex: Option<egui::TextureHandle>,
@@ -42,6 +56,8 @@ pub struct App {
     config: Config,
     config_path: Option<PathBuf>,
     last_screenshot: Option<String>,
+    show_tty: bool,
+    show_regs: bool,
 }
 
 impl App {
@@ -55,6 +71,8 @@ impl App {
             config,
             config_path,
             last_screenshot: None,
+            show_tty: false,
+            show_regs: false,
         }
     }
 
@@ -159,6 +177,9 @@ impl eframe::App for App {
                 ui.separator();
                 ui.checkbox(&mut self.linear_filter, "Linear filter");
                 ui.separator();
+                ui.checkbox(&mut self.show_tty, "TTY");
+                ui.checkbox(&mut self.show_regs, "Registers");
+                ui.separator();
                 ui.label("volume");
                 ui.add(
                     egui::Slider::new(&mut self.volume, 0.0..=1.0)
@@ -180,6 +201,95 @@ impl eframe::App for App {
                 ));
             });
         });
+
+        if self.show_regs {
+            egui::SidePanel::right("registers")
+                .default_width(280.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("EE");
+                        ui.monospace(format!("pc {:08x}", status.ee_pc));
+                        egui::Grid::new("ee_regs").striped(true).show(ui, |ui| {
+                            for (i, name) in REG_NAMES.iter().enumerate() {
+                                let [lo, hi] = status.ee_gpr[i];
+                                ui.monospace(format!("{name:>4}"));
+                                ui.monospace(if hi != 0 {
+                                    format!("{lo:016x}\n  hi:{hi:016x}")
+                                } else {
+                                    format!("{lo:016x}")
+                                });
+                                ui.end_row();
+                            }
+                            ui.monospace("  hi");
+                            ui.monospace(format!("{:016x}:{:016x}", status.ee_hi[1], status.ee_hi[0]));
+                            ui.end_row();
+                            ui.monospace("  lo");
+                            ui.monospace(format!("{:016x}:{:016x}", status.ee_lo[1], status.ee_lo[0]));
+                            ui.end_row();
+                            ui.monospace("status");
+                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_STATUS]));
+                            ui.end_row();
+                            ui.monospace(" cause");
+                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_CAUSE]));
+                            ui.end_row();
+                            ui.monospace("   epc");
+                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_EPC]));
+                            ui.end_row();
+                        });
+
+                        ui.separator();
+                        ui.heading("IOP");
+                        ui.monospace(format!("pc {:08x}", status.iop_pc));
+                        egui::Grid::new("iop_regs").striped(true).show(ui, |ui| {
+                            for (i, name) in REG_NAMES.iter().enumerate() {
+                                ui.monospace(format!("{name:>4}"));
+                                ui.monospace(format!("{:08x}", status.iop_gpr[i]));
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                            ui.monospace("  hi");
+                            ui.monospace(format!("{:08x}", status.iop_hi));
+                            ui.monospace("  lo");
+                            ui.monospace(format!("{:08x}", status.iop_lo));
+                            ui.end_row();
+                            ui.monospace("status");
+                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_STATUS]));
+                            ui.monospace(" cause");
+                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_CAUSE]));
+                            ui.end_row();
+                            ui.monospace("   epc");
+                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_EPC]));
+                            ui.end_row();
+                        });
+                    });
+                });
+        }
+
+        if self.show_tty {
+            egui::TopBottomPanel::bottom("tty")
+                .resizable(true)
+                .default_height(160.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("TTY");
+                        if ui.button("Clear").clicked() {
+                            self.emu.shared.tty.lock().unwrap().clear();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            let tty = self.emu.shared.tty.lock().unwrap().clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tty.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let (width, height, image) = {
