@@ -70,11 +70,13 @@ Planned crates:
    (SLPS-25918) is playable through its title, menus, name entry and
    prologue. Not yet: IPU, VU1 timing, SPU2 sweep volumes.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
-   keyboard pad input (done); the interpreter runs at roughly 40% of
-   real time after idle-loop skipping, with the EE interpreter and the
-   rasterizer sharing the remaining cost. Next: cheaper per-pixel
-   addressing, a cached decoder or JIT for the EE, and the wasm
-   front-end.
+   keyboard pad input, TTY and register panels (done). Speed: EE x86-64
+   recompiler with block linking, GS on a worker thread with the pixel
+   pipeline split across a rayon pool for large primitives, idle-loop
+   skipping on both cores; Amagami runs at ~1.9x real time headless (the
+   OSD's blur-heavy boot screens at ~40%). Next: SPU2 audio quality (a
+   constant noise under music, boot chime starvation), the IOP
+   interpreter, and the wasm front-end.
 
 ## Component map (ps2-core)
 
