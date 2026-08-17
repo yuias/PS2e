@@ -133,6 +133,7 @@ impl Ps2System {
         }
         if self.cycles.is_multiple_of(64) {
             let _g = prof::scope(prof::Slot::Timers);
+            self.bus.now = self.cycles;
             self.bus.tick_timers();
             event = true;
         }
@@ -174,9 +175,7 @@ impl Ps2System {
             {
                 self.bus.now = self.cycles;
                 let n = jit.run(&mut self.ee, &mut self.bus);
-                for _ in 0..n {
-                    self.machine_cycle();
-                }
+                self.advance(n as u64);
                 continue;
             }
             if !self.cycles.is_multiple_of(EE_PER_IOP) || target - self.cycles < EE_PER_IOP {
@@ -211,6 +210,36 @@ impl Ps2System {
                     self.frame_pos = 0;
                 }
                 self.cycles += 1;
+            }
+        }
+    }
+
+    /// Run the rest of the machine for `n` cycles after the EE retired that
+    /// many instructions: IOP slots and timers keep their cadence, vblank
+    /// edges land on the exact cycle, and cycles with nothing due are
+    /// skipped in bulk.
+    fn advance(&mut self, mut n: u64) {
+        while n > 0 {
+            if !self.cycles.is_multiple_of(EE_PER_IOP) || n < EE_PER_IOP {
+                self.machine_cycle();
+                n -= 1;
+                continue;
+            }
+            self.machine_cycle();
+            n -= 1;
+            // Cycles 1..7 of the group can only see a vblank edge.
+            let vbl_edge = self.frame_pos + EE_PER_IOP > EE_CYCLES_PER_FRAME - VBLANK_CYCLES
+                && self.frame_pos <= EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+            let wrap = self.frame_pos + EE_PER_IOP >= EE_CYCLES_PER_FRAME;
+            if !vbl_edge && !wrap {
+                self.frame_pos += EE_PER_IOP - 1;
+                self.cycles += EE_PER_IOP - 1;
+                n -= EE_PER_IOP - 1;
+            } else {
+                for _ in 1..EE_PER_IOP {
+                    self.machine_cycle();
+                }
+                n -= EE_PER_IOP - 1;
             }
         }
     }
