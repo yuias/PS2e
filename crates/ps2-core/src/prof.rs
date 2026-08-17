@@ -109,11 +109,15 @@ pub fn scope(slot: Slot) -> Guard {
 }
 
 /// EE instruction mix (major opcode, plus function for SPECIAL/MMI) and a
-/// coarse PC histogram (64 Ki buckets of one word each) to find hot loops.
+/// per-word PC histogram over the 32 MiB of RAM to find hot loops.
 #[cfg(feature = "profile")]
 static OPS: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
 #[cfg(feature = "profile")]
-static PCS: [AtomicU64; 65536] = [const { AtomicU64::new(0) }; 65536];
+static PCS: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+#[cfg(feature = "profile")]
+fn pcs() -> &'static [AtomicU64] {
+    PCS.get_or_init(|| (0..(32 << 20) / 4).map(|_| AtomicU64::new(0)).collect())
+}
 
 /// Record one EE instruction for the profile report.
 #[inline(always)]
@@ -123,7 +127,9 @@ pub fn count_ee(pc: u32, instr: u32) {
         let op = instr >> 26;
         let key = if op == 0 || op == 0x1C { (op << 6) | (instr & 0x3F) } else { op << 6 };
         OPS[key as usize].fetch_add(1, Ordering::Relaxed);
-        PCS[((pc >> 2) & 0xFFFF) as usize].fetch_add(1, Ordering::Relaxed);
+        if pc & 0x1E00_0000 == 0 {
+            pcs()[((pc & 0x1FF_FFFF) >> 2) as usize].fetch_add(1, Ordering::Relaxed);
+        }
     }
     #[cfg(not(feature = "profile"))]
     {
@@ -160,6 +166,12 @@ pub fn report() -> Option<String> {
             OPS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
         let total_ops: u64 = ops.iter().map(|&(_, n)| n).sum::<u64>().max(1);
         ops.sort_by(|a, b| b.1.cmp(&a.1));
+        out.push_str(&format!(
+            "EE instructions: {} ({:.1} ticks each of EE self time)
+",
+            total_ops,
+            t[Slot::Ee as usize] as f64 / total_ops as f64
+        ));
         out.push_str("EE instruction mix (op<<6|funct for SPECIAL/MMI):
 ");
         for (k, n) in ops.iter().take(24) {
@@ -167,12 +179,12 @@ pub fn report() -> Option<String> {
 ", k, *n as f64 * 100.0 / total_ops as f64));
         }
         let mut pcs: Vec<(usize, u64)> =
-            PCS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
+            pcs().iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
         pcs.sort_by(|a, b| b.1.cmp(&a.1));
-        out.push_str("EE hot words (pc & 0x3fffc):
+        out.push_str("EE hot words (physical RAM address):
 ");
-        for (k, n) in pcs.iter().take(24) {
-            out.push_str(&format!("  {:#07x} {:5.1}%
+        for (k, n) in pcs.iter().take(40) {
+            out.push_str(&format!("  {:#09x} {:5.1}%
 ", k << 2, *n as f64 * 100.0 / total_ops as f64));
         }
         Some(out)

@@ -136,7 +136,7 @@ impl Cpu {
         }
         let mut a = target;
         while a <= end {
-            if bus.fetch32(a) != 0 {
+            if a != self.current_pc && bus.fetch32(a) != 0 {
                 return;
             }
             a += 4;

@@ -62,34 +62,41 @@ impl Ps2System {
         self.bus.now = self.cycles;
         // Idle-loop skip: while the EE spins in the kernel idle thread only
         // an interrupt can move it, so let the rest of the machine run and
-        // resume stepping (into the exception) once one is pending.
+        // resume stepping (into the exception) once one is pending. Only
+        // the IOP, timers and vblank can raise one, so the check runs after
+        // those rather than every cycle.
         if !self.ee.idle {
             self.ee.step(&mut self.bus);
-        } else if self.ee.interrupt_pending(&self.bus) {
-            self.ee.idle = false;
-            self.ee.step(&mut self.bus);
         }
+        let mut event = false;
         // 1 cycle per instruction for now; wait states and dual-issue
         // approximation come later.
         if self.cycles.is_multiple_of(EE_PER_IOP) {
             let _g = prof::scope(prof::Slot::Iop);
             self.iop.step(&mut self.bus);
+            event = true;
         }
         if self.cycles.is_multiple_of(64) {
             let _g = prof::scope(prof::Slot::Timers);
             self.bus.tick_timers();
+            event = true;
         }
         // Counted rather than derived with `%`: this runs per instruction.
         if self.frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
             self.bus.vblank(true);
+            event = true;
         } else if self.frame_pos == 0 && self.cycles != 0 {
             self.bus.vblank(false);
+            event = true;
         }
         self.frame_pos += 1;
         if self.frame_pos == EE_CYCLES_PER_FRAME {
             self.frame_pos = 0;
         }
         self.cycles += 1;
+        if self.ee.idle && event && self.ee.interrupt_pending(&self.bus) {
+            self.ee.idle = false;
+        }
     }
 
     /// Run for approximately `cycles` EE cycles.
