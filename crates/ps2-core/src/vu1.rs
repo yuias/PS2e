@@ -190,6 +190,7 @@ impl Vu1 {
     // --- main loop -------------------------------------------------------
 
     fn run(&mut self, gs: &mut Gs, gif: &mut Gif, start: u16) {
+        let _p = crate::prof::scope(crate::prof::Slot::Vu1);
         // vf00/vi00 are architectural constants.
         self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
         self.vi[0] = 0;

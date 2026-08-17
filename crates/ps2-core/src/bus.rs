@@ -6,6 +6,7 @@
 
 use crate::gif::Gif;
 use crate::gs::Gs;
+use crate::prof;
 use crate::sif::Sif;
 use crate::spu2::Spu2;
 use crate::timers::Timers;
@@ -1555,7 +1556,11 @@ impl Bus {
                 i += 1;
             }
         }
-        for (core, done) in self.spu2.tick(self.now).into_iter().enumerate() {
+        let spu_done = {
+            let _p = prof::scope(prof::Slot::Spu2);
+            self.spu2.tick(self.now)
+        };
+        for (core, done) in spu_done.into_iter().enumerate() {
             if done {
                 self.iop_dma_spu[core].chcr &= !IOP_CHCR_BUSY;
                 self.iop_dma_irq(if core == 0 { 4 } else { 7 });
@@ -1621,6 +1626,7 @@ impl Bus {
     /// Run the VIF1 channel (ch1) to completion: normal or source chain.
     /// With TTE set, each chain tag's upper 64 bits carry two vifcodes.
     fn pump_vif1(&mut self) {
+        let _p = prof::scope(prof::Slot::Vif1);
         let mut guard = 0u32;
         while self.dma_vif1.chcr & EE_CHCR_STR != 0 {
             guard += 1;
@@ -1708,6 +1714,7 @@ impl Bus {
 
     /// Run the GIF channel (ch2) to completion: normal or source chain.
     fn pump_gif(&mut self) {
+        let _p = prof::scope(prof::Slot::Gif);
         let mut guard = 0u32;
         while self.dma_gif.chcr & EE_CHCR_STR != 0 {
             guard += 1;
@@ -1903,6 +1910,7 @@ impl Bus {
     /// Move as much SIF traffic as the armed channels allow. Runs transfers
     /// to completion synchronously; timing comes later if software needs it.
     pub fn pump_sif(&mut self) {
+        let _p = prof::scope(prof::Slot::Sif);
         // Safety valve against malformed chains.
         for _ in 0..4096 {
             let mut progressed = false;

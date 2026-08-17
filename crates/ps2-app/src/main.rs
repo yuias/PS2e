@@ -323,6 +323,9 @@ fn main() -> ExitCode {
         .map(|(psm, n)| format!("{psm:#04x}:{n}"))
         .collect();
     tracing::info!(psms = psms.join(" "), "texture samples per PSM");
+    if let Some(report) = ps2_core::prof::report() {
+        eprintln!("{report}");
+    }
 
     if let Some(path) = &args.memcard
         && sys.bus.sio2.memcard.dirty

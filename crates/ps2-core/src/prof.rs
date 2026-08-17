@@ -1,0 +1,138 @@
+//! Coarse subsystem time accounting for the `profile` feature.
+//!
+//! Sampling profilers need elevation on Windows, so the bring-up loop uses
+//! cheap TSC scopes instead: `let _g = prof::scope(Slot::X);` charges the
+//! time until the guard drops. Scopes nest, and time is always charged to
+//! the innermost open scope, so every bucket is *self* time. Without the
+//! feature the guard is a ZST and everything compiles to nothing.
+
+#[cfg(feature = "profile")]
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Accounting buckets. Order matters only for the report.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum Slot {
+    /// Outside every scope (front-end, screenshots, ...).
+    Other,
+    /// EE interpreter (fetch/decode/execute, non-DMA bus traffic).
+    Ee,
+    /// IOP interpreter and IOP-side DMA.
+    Iop,
+    /// Periodic tick: timers, deferred DMA IRQs.
+    Timers,
+    /// EE ch1 DMA: VIF1 parsing/unpack.
+    Vif1,
+    /// EE ch2 DMA: GIF packet decode, GS register writes.
+    Gif,
+    /// SIF0/SIF1 pumps.
+    Sif,
+    /// VU1 microprogram execution.
+    Vu1,
+    /// GS primitive rasterization.
+    GsDraw,
+    /// GS IMAGE / local-copy transfers.
+    GsXfer,
+    /// SPU2 voice mixing.
+    Spu2,
+}
+
+#[cfg(feature = "profile")]
+const N: usize = 11;
+#[cfg(feature = "profile")]
+const NAMES: [&str; N] = [
+    "other", "EE", "IOP", "timers", "VIF1", "GIF", "SIF", "VU1", "GS draw", "GS xfer", "SPU2",
+];
+
+#[cfg(feature = "profile")]
+static TICKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+#[cfg(feature = "profile")]
+static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+#[cfg(feature = "profile")]
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "profile")]
+static LAST: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
+/// Charge the time since the last switch to the current slot and make
+/// `next` current.
+#[cfg(feature = "profile")]
+#[inline(always)]
+fn switch(next: usize) -> usize {
+    let now = tsc();
+    let last = LAST.swap(now, Ordering::Relaxed);
+    let cur = CURRENT.swap(next, Ordering::Relaxed);
+    if last != 0 {
+        TICKS[cur].fetch_add(now.wrapping_sub(last), Ordering::Relaxed);
+    }
+    cur
+}
+
+/// Open scope; drops back to the enclosing slot.
+#[must_use]
+pub struct Guard {
+    #[cfg(feature = "profile")]
+    prev: usize,
+}
+
+impl Drop for Guard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(feature = "profile")]
+        switch(self.prev);
+    }
+}
+
+/// Enter `slot` until the returned guard drops.
+#[inline(always)]
+pub fn scope(slot: Slot) -> Guard {
+    #[cfg(feature = "profile")]
+    {
+        COUNTS[slot as usize].fetch_add(1, Ordering::Relaxed);
+        Guard { prev: switch(slot as usize) }
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        let _ = slot;
+        Guard {}
+    }
+}
+
+/// Human-readable breakdown, or `None` when profiling is compiled out.
+pub fn report() -> Option<String> {
+    #[cfg(not(feature = "profile"))]
+    {
+        None
+    }
+    #[cfg(feature = "profile")]
+    {
+        switch(CURRENT.load(Ordering::Relaxed)); // flush the open scope
+        let t: Vec<u64> = TICKS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let c: Vec<u64> = COUNTS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let total: u64 = t.iter().sum();
+        if total == 0 {
+            return Some("profile: no samples".into());
+        }
+        let mut out = String::from("profile (self time):\n");
+        for i in 0..N {
+            out.push_str(&format!(
+                "  {:<8} {:5.1}%  {:>13} scopes  {:>9.1} ticks/scope\n",
+                NAMES[i],
+                t[i] as f64 * 100.0 / total as f64,
+                c[i],
+                t[i] as f64 / c[i].max(1) as f64,
+            ));
+        }
+        Some(out)
+    }
+}

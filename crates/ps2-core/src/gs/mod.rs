@@ -471,6 +471,7 @@ impl Gs {
         if self.trxdir != 0 {
             return;
         }
+        let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
         let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
@@ -587,6 +588,7 @@ impl Gs {
 
     /// LOCAL->LOCAL copy, used by the kernel to move fonts around.
     fn local_copy(&mut self) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
         let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;

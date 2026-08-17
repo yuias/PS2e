@@ -20,6 +20,7 @@ struct Frag {
 
 impl Gs {
     pub(super) fn draw_point(&mut self) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         let v = self.vq[0];
         let frag = Frag {
             r: v.r as f32,
@@ -94,6 +95,7 @@ impl Gs {
     }
 
     pub(super) fn draw_sprite(&mut self) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         let v0 = self.vq[0];
         let v1 = self.vq[1];
         let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
@@ -159,6 +161,7 @@ impl Gs {
     }
 
     pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         let (v0, v1, v2) = (self.vq[i0], self.vq[i1], self.vq[i2]);
         self.prims_drawn += 1;
         let attrs = self.attrs();

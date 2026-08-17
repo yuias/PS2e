@@ -9,6 +9,7 @@ pub mod ee;
 pub mod gif;
 pub mod gs;
 pub mod iop;
+pub mod prof;
 pub mod sif;
 pub mod spu2;
 pub mod timers;
@@ -63,9 +64,11 @@ impl Ps2System {
         // 1 cycle per instruction for now; wait states and dual-issue
         // approximation come later.
         if self.cycles.is_multiple_of(EE_PER_IOP) {
+            let _g = prof::scope(prof::Slot::Iop);
             self.iop.step(&mut self.bus);
         }
         if self.cycles.is_multiple_of(64) {
+            let _g = prof::scope(prof::Slot::Timers);
             self.bus.tick_timers();
         }
         // Counted rather than derived with `%`: this runs per instruction.
@@ -83,6 +86,8 @@ impl Ps2System {
 
     /// Run for approximately `cycles` EE cycles.
     pub fn run(&mut self, cycles: u64) {
+        // One EE scope per slice: nested IOP/timer/DMA scopes hand back here.
+        let _g = prof::scope(prof::Slot::Ee);
         let target = self.cycles + cycles;
         while self.cycles < target {
             self.step();

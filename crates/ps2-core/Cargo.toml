@@ -10,3 +10,5 @@ tracing = "0.1"
 
 [features]
 default = []
+# TSC-based subsystem time accounting (see prof.rs).
+profile = []
