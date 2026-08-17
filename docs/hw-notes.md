@@ -404,3 +404,18 @@ each wait):
   the PS2 logo). During the OP the particle triangles sample 6720/8960
   and 0/2240 (refraction look-ups with STQ) plus small PSMCT16/32
   textures at bp 11552/11488/11456/12384/12320.
+- CLUT packing needs the real VRAM layout: 32-bit CSM1 CLUTs live at
+  bp 10080/10092/10100/10103/10108/10120 — 3..12 blocks apart. On
+  hardware a 16x16 PSMCT32 image is exactly four consecutive blocks
+  (block table row 0: 0 1, row 1: 2 3), so these never overlap; a
+  linear "one row per block" model made 10108 span 16 blocks and every
+  palette upload clobbered its neighbours (glyphs came out on opaque
+  boxes). Text glyphs: PSMT8H at bp 0 (tbw 10) with cbp 10108/10120,
+  cld=1, index 0x40.. = coverage; the same CLUT slot is re-uploaded per
+  use, so the CLUT cache is keyed by CBP/CPSM/CSM/CSA/TEXA and flushed
+  on any transfer.
+- The game idles in the EE kernel idle thread (`b .-32` over nops at
+  0x81fc0) ~62% of the time and the IOP in `j .; nop` (0xae94) ~92%;
+  both are skipped until an interrupt is pending without changing
+  emulated timing (frames are bit-identical).
+
