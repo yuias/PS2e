@@ -11,6 +11,8 @@ mod raster;
 
 use tracing::{debug, trace, warn};
 
+mod layout;
+
 pub const VRAM_SIZE: usize = 4 * 1024 * 1024;
 
 // Pixel storage formats.
@@ -516,10 +518,17 @@ impl Gs {
             }
         }
         match dpsm {
-            PSMCT32 | PSMZ32 => push(
+            PSMCT32 => push(
                 self,
                 2,
                 move |gs: &mut Gs, x, y, px| gs.write_psmct32(dbp, dbw, x, y, px),
+                v,
+                32,
+            ),
+            PSMZ32 => push(
+                self,
+                2,
+                move |gs: &mut Gs, x, y, px| gs.write_psmz32(dbp, dbw, x, y, px),
                 v,
                 32,
             ),
@@ -550,7 +559,7 @@ impl Gs {
             PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => push(
                 self,
                 4,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct16(dbp, dbw, x, y, px as u16),
+                move |gs: &mut Gs, x, y, px| gs.write_psmct16(dbp, dbw, x, y, dpsm, px as u16),
                 v,
                 16,
             ),
@@ -624,13 +633,17 @@ impl Gs {
         for y in 0..rrh {
             for x in 0..rrw {
                 match spsm {
-                    PSMCT32 | PSMZ32 | PSMCT24 => {
+                    PSMCT32 | PSMCT24 => {
                         let px = self.read_psmct32(sbp, sbw, ssax + x, ssay + y);
                         self.write_psmct32(dbp, dbw, dsax + x, dsay + y, px);
                     }
-                    PSMCT16 | PSMCT16S => {
-                        let px = self.read_psmct16(sbp, sbw, ssax + x, ssay + y);
-                        self.write_psmct16(dbp, dbw, dsax + x, dsay + y, px);
+                    PSMZ32 | PSMZ24 => {
+                        let px = self.read_psmz32(sbp, sbw, ssax + x, ssay + y);
+                        self.write_psmz32(dbp, dbw, dsax + x, dsay + y, px);
+                    }
+                    PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                        let px = self.read_psmct16(sbp, sbw, ssax + x, ssay + y, spsm);
+                        self.write_psmct16(dbp, dbw, dsax + x, dsay + y, spsm, px);
                     }
                     PSMT8 => {
                         let px = self.read_psmt8(sbp, sbw, ssax + x, ssay + y);
@@ -646,66 +659,75 @@ impl Gs {
         }
     }
 
-    // --- linear VRAM accessors ------------------------------------------
-    // Base pointers are in 64-word blocks; buffer width in 64-pixel units.
+    // --- VRAM accessors --------------------------------------------------
+    // Base pointers are 256-byte blocks; buffer width in 64-pixel units. The
+    // hardware layout lives in `layout`.
 
-    #[inline]
-    fn word_off(bp: u32, bw: u32, x: u32, y: u32) -> usize {
-        ((bp as usize * 64) + (y as usize * bw.max(1) as usize * 64) + x as usize) % (VRAM_SIZE / 4)
+    #[inline(always)]
+    fn rd32(&self, o: usize) -> u32 {
+        u32::from_le_bytes(self.vram[o..o + 4].try_into().unwrap())
+    }
+    #[inline(always)]
+    fn wr32(&mut self, o: usize, v: u32) {
+        self.vram[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
 
     #[inline]
     pub fn write_psmct32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
-        let o = Self::word_off(bp, bw, x, y) * 4;
-        self.vram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        self.wr32(layout::addr32(bp, bw, x, y, false), v);
     }
 
     /// Replace only the `mask` bits of a 32-bit pixel.
     #[inline]
     pub fn write_psmct32_bits(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32, mask: u32) {
-        let o = Self::word_off(bp, bw, x, y) * 4;
-        let cur = u32::from_le_bytes(self.vram[o..o + 4].try_into().unwrap());
-        self.vram[o..o + 4].copy_from_slice(&((cur & !mask) | (v & mask)).to_le_bytes());
+        let o = layout::addr32(bp, bw, x, y, false);
+        let cur = self.rd32(o);
+        self.wr32(o, (cur & !mask) | (v & mask));
     }
 
     #[inline]
     pub fn read_psmct32(&self, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
-        let o = Self::word_off(bp, bw, x, y) * 4;
-        u32::from_le_bytes(self.vram[o..o + 4].try_into().unwrap())
+        self.rd32(layout::addr32(bp, bw, x, y, false))
+    }
+
+    /// PSMZ32/PSMZ24 word (Z buffers use their own block order).
+    #[inline]
+    pub fn write_psmz32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
+        self.wr32(layout::addr32(bp, bw, x, y, true), v);
     }
 
     #[inline]
-    pub fn write_psmct16(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u16) {
-        let o = ((bp as usize * 128) + (y as usize * bw.max(1) as usize * 64) + x as usize)
-            % (VRAM_SIZE / 2);
-        self.vram[o * 2..o * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    pub fn read_psmz32(&self, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
+        self.rd32(layout::addr32(bp, bw, x, y, true))
+    }
+
+    /// 16-bit pixel in any of PSMCT16/16S/PSMZ16/16S (`psm` picks the block order).
+    #[inline]
+    pub fn write_psmct16(&mut self, bp: u32, bw: u32, x: u32, y: u32, psm: u32, v: u16) {
+        let o = layout::addr16(bp, bw, x, y, psm & 8 != 0, psm & 0x30 != 0);
+        self.vram[o..o + 2].copy_from_slice(&v.to_le_bytes());
     }
 
     #[inline]
-    pub fn read_psmct16(&self, bp: u32, bw: u32, x: u32, y: u32) -> u16 {
-        let o = ((bp as usize * 128) + (y as usize * bw.max(1) as usize * 64) + x as usize)
-            % (VRAM_SIZE / 2);
-        u16::from_le_bytes(self.vram[o * 2..o * 2 + 2].try_into().unwrap())
+    pub fn read_psmct16(&self, bp: u32, bw: u32, x: u32, y: u32, psm: u32) -> u16 {
+        let o = layout::addr16(bp, bw, x, y, psm & 8 != 0, psm & 0x30 != 0);
+        u16::from_le_bytes(self.vram[o..o + 2].try_into().unwrap())
     }
 
     #[inline]
     pub fn write_psmt8(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u8) {
-        let o =
-            ((bp as usize * 256) + (y as usize * bw.max(1) as usize * 64) + x as usize) % VRAM_SIZE;
-        self.vram[o] = v;
+        self.vram[layout::addr8(bp, bw, x, y)] = v;
     }
 
     #[inline]
     pub fn read_psmt8(&self, bp: u32, bw: u32, x: u32, y: u32) -> u8 {
-        let o =
-            ((bp as usize * 256) + (y as usize * bw.max(1) as usize * 64) + x as usize) % VRAM_SIZE;
-        self.vram[o]
+        self.vram[layout::addr8(bp, bw, x, y)]
     }
 
     #[inline]
     pub fn write_psmt4(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u8) {
-        let idx = (bp as usize * 512) + (y as usize * bw.max(1) as usize * 64) + x as usize;
-        let o = (idx / 2) % VRAM_SIZE;
+        let idx = layout::addr4(bp, bw, x, y);
+        let o = idx >> 1;
         if idx & 1 == 0 {
             self.vram[o] = (self.vram[o] & 0xF0) | (v & 0xF);
         } else {
@@ -715,8 +737,8 @@ impl Gs {
 
     #[inline]
     pub fn read_psmt4(&self, bp: u32, bw: u32, x: u32, y: u32) -> u8 {
-        let idx = (bp as usize * 512) + (y as usize * bw.max(1) as usize * 64) + x as usize;
-        let o = (idx / 2) % VRAM_SIZE;
+        let idx = layout::addr4(bp, bw, x, y);
+        let o = idx >> 1;
         if idx & 1 == 0 {
             self.vram[o] & 0xF
         } else {
@@ -765,7 +787,7 @@ impl Gs {
                         (px as u8, (px >> 8) as u8, (px >> 16) as u8)
                     }
                     PSMCT16 | PSMCT16S => {
-                        let px = self.read_psmct16(fbp, fbw, dbx + x, dby + sy);
+                        let px = self.read_psmct16(fbp, fbw, dbx + x, dby + sy, psm);
                         (
                             ((px & 0x1F) << 3) as u8,
                             (((px >> 5) & 0x1F) << 3) as u8,

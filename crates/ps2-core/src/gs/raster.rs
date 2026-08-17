@@ -355,7 +355,7 @@ impl Gs {
         // Depth test (linear z buffer, PSMZ32-style storage).
         let (zbp, fbw, zmask) = (pipe.zbp, pipe.fbw, pipe.zmask);
         if pipe.zte {
-            let zcur = self.read_psmct32(zbp, fbw, x, y);
+            let zcur = self.read_psmz32(zbp, fbw, x, y);
             let z = frag.z & zmask;
             let pass = match pipe.ztst {
                 0 => false,
@@ -367,7 +367,7 @@ impl Gs {
                 return;
             }
             if !pipe.zmsk {
-                self.write_psmct32(zbp, fbw, x, y, (zcur & !zmask) | z);
+                self.write_psmz32(zbp, fbw, x, y, (zcur & !zmask) | z);
             }
         }
 
@@ -456,7 +456,11 @@ impl Gs {
         match ti.psm {
             PSMCT32 => self.read_psmct32(tbp, tbw, u, v),
             PSMCT24 => (self.read_psmct32(tbp, tbw, u, v) & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
-            PSMCT16 | PSMCT16S => expand16(self.read_psmct16(tbp, tbw, u, v), ti.texa),
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                expand16(self.read_psmct16(tbp, tbw, u, v, ti.psm), ti.texa)
+            }
+            PSMZ32 => self.read_psmz32(tbp, tbw, u, v),
+            PSMZ24 => (self.read_psmz32(tbp, tbw, u, v) & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
             PSMT8 => self.clut[self.read_psmt8(tbp, tbw, u, v) as usize],
             PSMT4 => self.clut[self.read_psmt4(tbp, tbw, u, v) as usize + ti.clut_base],
             PSMT8H => self.clut[(self.read_psmct32(tbp, tbw, u, v) >> 24) as usize],
@@ -505,7 +509,7 @@ impl Gs {
         if cpsm == 0 {
             self.read_psmct32(cbp, 1, x, y)
         } else {
-            expand16(self.read_psmct16(cbp, 1, x, y), self.texa)
+            expand16(self.read_psmct16(cbp, 1, x, y, if cpsm == 0xA { PSMCT16S } else { PSMCT16 }), self.texa)
         }
     }
 }
