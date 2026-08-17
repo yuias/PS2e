@@ -421,6 +421,10 @@ fn run_headless(
         .map(|(psm, n)| format!("{psm:#04x}:{n}"))
         .collect();
     tracing::info!(psms = psms.join(" "), "texture samples per PSM");
+    let (compiled, invalidated, run, interp) = sys.jit_stats();
+    if run > 0 {
+        tracing::info!(compiled, invalidated, run, interp, "recompiler");
+    }
     if let Some(report) = ps2_core::prof::report() {
         eprintln!("{report}");
     }

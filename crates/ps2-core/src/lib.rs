@@ -89,6 +89,16 @@ impl Ps2System {
         }
     }
 
+    /// Recompiler counters: (blocks compiled, invalidated, run, interpreter
+    /// steps taken by the dispatcher); zeros without a recompiler.
+    pub fn jit_stats(&self) -> (u64, u64, u64, u64) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(j) = &self.jit {
+            return (j.blocks_compiled, j.blocks_invalidated, j.blocks_run, j.interp_steps);
+        }
+        (0, 0, 0, 0)
+    }
+
     /// Whether the EE recompiler is active.
     pub fn jit_enabled(&self) -> bool {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]

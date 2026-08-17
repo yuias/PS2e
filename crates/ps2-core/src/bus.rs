@@ -969,10 +969,12 @@ pub struct Bus {
     ee_tlb: [(u32, u32, u32, u32); 48],
     /// (vaddr page | 1) -> phys page; 0 = invalid slot.
     tlb_cache: Box<[(u32, u32)]>,
-    /// RAM pages (4 KiB) holding recompiled code; a write to one queues it
-    /// in `dirty_code_pages` for the recompiler to drop its blocks.
+    /// RAM pages (4 KiB) holding recompiled code; a write to one queues the
+    /// address in `dirty_code_writes` for the recompiler to drop the blocks
+    /// covering it (kernel data shares pages with kernel code, so whole
+    /// pages would thrash).
     pub(crate) code_pages: Box<[bool]>,
-    pub(crate) dirty_code_pages: Vec<u32>,
+    pub(crate) dirty_code_writes: Vec<u32>,
     /// A TLB rewrite invalidated every recompiled block.
     pub(crate) jit_flush_needed: bool,
     /// Instruction-fetch page cache: virtual page tag and its RAM offset
@@ -1040,7 +1042,7 @@ impl Bus {
             ee_tlb: [(0, 0, 0, 0); 48],
             tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
             code_pages: vec![false; RAM_SIZE >> 12].into_boxed_slice(),
-            dirty_code_pages: Vec::new(),
+            dirty_code_writes: Vec::new(),
             jit_flush_needed: false,
             fetch_tag: 1,
             fetch_base: 0,
@@ -1064,20 +1066,23 @@ impl Bus {
         }
     }
 
-    /// RAM page a virtual EE address maps to, if it maps to RAM at all.
-    pub fn ram_page_of(&mut self, vaddr: u32) -> Option<u32> {
+    /// Physical RAM address a virtual EE address maps to, if RAM at all.
+    pub fn ram_phys_of(&mut self, vaddr: u32) -> Option<u32> {
         let phys = self.translate(vaddr);
-        ((phys as usize) < RAM_SIZE).then_some(phys >> 12)
+        ((phys as usize) < RAM_SIZE).then_some(phys)
     }
 
     /// A physical RAM address was written: if recompiled code lives on its
-    /// page, queue the page for invalidation (once per compile).
+    /// page, queue the address so the recompiler can drop blocks covering
+    /// it. The dispatcher drains the queue after every block, so it stays
+    /// short even for a hot variable next to code.
     #[inline(always)]
     fn note_ram_write(&mut self, addr: usize) {
-        let page = addr >> 12;
-        if self.code_pages[page] {
-            self.code_pages[page] = false;
-            self.dirty_code_pages.push(page as u32);
+        if self.code_pages[addr >> 12] {
+            let a = (addr & !7) as u32;
+            if self.dirty_code_writes.last() != Some(&a) {
+                self.dirty_code_writes.push(a);
+            }
         }
     }
 

@@ -41,6 +41,8 @@ const LOOKUP_ENTRIES: usize = 1 << 16;
 struct Block {
     pc: u32,
     entry: Entry,
+    /// Physical byte range the block was translated from (RAM blocks).
+    phys: Option<(u32, u32)>,
     valid: bool,
 }
 
@@ -54,6 +56,8 @@ pub struct Jit {
     page_blocks: Vec<Vec<u32>>,
     pub blocks_compiled: u64,
     pub blocks_invalidated: u64,
+    pub blocks_run: u64,
+    pub interp_steps: u64,
 }
 
 impl Jit {
@@ -66,6 +70,8 @@ impl Jit {
             page_blocks: vec![Vec::new(); RAM_SIZE >> 12],
             blocks_compiled: 0,
             blocks_invalidated: 0,
+            blocks_run: 0,
+            interp_steps: 0,
         })
     }
 
@@ -76,13 +82,15 @@ impl Jit {
         if bus.jit_flush_needed {
             bus.jit_flush_needed = false;
             self.flush(bus);
-        } else if !bus.dirty_code_pages.is_empty() {
+        } else if !bus.dirty_code_writes.is_empty() {
             self.invalidate_dirty(bus);
         }
         if cpu.next_is_delay || cpu.interrupt_pending(bus) {
             cpu.step(bus);
+            self.interp_steps += 1;
             return 1;
         }
+        self.blocks_run += 1;
         let pc = cpu.pc;
         if pc == 0 {
             panic!("EE jumped to null (previous pc {:#010x})", cpu.current_pc);
@@ -99,6 +107,7 @@ impl Jit {
         // interpreter's delay-slot state behind; let it finish the branch.
         while cpu.next_is_delay {
             cpu.step(bus);
+            self.interp_steps += 1;
             n += 1;
         }
         n
@@ -122,15 +131,28 @@ impl Jit {
         Some(b.entry)
     }
 
+    /// Drop the blocks whose code was written (8-byte granularity).
     fn invalidate_dirty(&mut self, bus: &mut Bus) {
-        for page in bus.dirty_code_pages.drain(..) {
-            for idx in self.page_blocks[page as usize].drain(..) {
+        for a in bus.dirty_code_writes.drain(..) {
+            let page = (a >> 12) as usize;
+            let mut any_left = false;
+            for &idx in &self.page_blocks[page] {
                 let b = &mut self.blocks[idx as usize];
-                if b.valid {
-                    b.valid = false;
-                    self.by_pc.remove(&b.pc);
-                    self.blocks_invalidated += 1;
+                if !b.valid {
+                    continue;
                 }
+                match b.phys {
+                    Some((s, e)) if s < a + 8 && a < e => {
+                        b.valid = false;
+                        self.by_pc.remove(&b.pc);
+                        self.blocks_invalidated += 1;
+                    }
+                    _ => any_left = true,
+                }
+            }
+            if !any_left {
+                self.page_blocks[page].clear();
+                bus.code_pages[page] = false;
             }
         }
     }
@@ -145,7 +167,7 @@ impl Jit {
             v.clear();
         }
         bus.code_pages.fill(false);
-        bus.dirty_code_pages.clear();
+        bus.dirty_code_writes.clear();
     }
 
     fn compile(&mut self, pc: u32, bus: &mut Bus) -> Entry {
@@ -225,19 +247,21 @@ impl Jit {
         // SAFETY: the bytes at ptr are the function assembled above.
         let entry: Entry = unsafe { std::mem::transmute(ptr) };
 
-        // Track the RAM pages the block reads its code from, for
+        // Track the RAM range the block reads its code from, for
         // invalidation on write. ROM/other blocks are never invalidated.
         let last = pc.wrapping_add((count.max(1) - 1) * 4);
-        let mut pages = [bus.ram_page_of(pc), bus.ram_page_of(last)];
-        if pages[1] == pages[0] {
-            pages[1] = None;
-        }
         let idx = self.blocks.len() as u32;
-        for p in pages.iter().flatten() {
-            self.page_blocks[*p as usize].push(idx);
-            bus.code_pages[*p as usize] = true;
+        let phys = match (bus.ram_phys_of(pc), bus.ram_phys_of(last)) {
+            (Some(s), Some(e)) => Some((s, e + 4)),
+            _ => None,
+        };
+        if let Some((s, e)) = phys {
+            for p in (s >> 12)..=((e - 1) >> 12) {
+                self.page_blocks[p as usize].push(idx);
+                bus.code_pages[p as usize] = true;
+            }
         }
-        self.blocks.push(Block { pc, entry, valid: true });
+        self.blocks.push(Block { pc, entry, phys, valid: true });
         self.by_pc.insert(pc, idx);
         self.lookup[((pc >> 2) as usize) & (LOOKUP_ENTRIES - 1)] = idx + 1;
         self.blocks_compiled += 1;
