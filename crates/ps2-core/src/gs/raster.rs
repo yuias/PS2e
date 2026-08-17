@@ -22,6 +22,7 @@ impl Gs {
     pub(super) fn draw_point(&mut self) {
         let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         let v = self.vq[0];
+        let pipe = self.pixel_pipe();
         let frag = Frag {
             r: v.r as f32,
             g: v.g as f32,
@@ -34,7 +35,10 @@ impl Gs {
             u: v.u as f32 / 16.0,
             v: v.v as f32 / 16.0,
         };
-        self.shade_pixel(v.x >> 4, v.y >> 4, frag);
+        let (px, py) = (v.x >> 4, v.y >> 4);
+        if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
+            self.shade_pixel(&pipe, px, py, frag);
+        }
         self.prims_drawn += 1;
     }
 
@@ -117,32 +121,23 @@ impl Gs {
         if px1 - px0 <= 24 && py1 - py0 <= 24 {
             self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
         }
-        for py in py0..px_clip(py1) {
-            for px in px0..px_clip(px1) {
-                // Interpolate texture coords across the rectangle; color is
-                // flat from the second vertex.
+        // Texture coords run left-to-right / top-to-bottom regardless of
+        // vertex order; color is flat from the second vertex.
+        let (u0, u1, s0, s1) = if v0.x <= v1.x {
+            (v0.u, v1.u, v0.s, v1.s)
+        } else {
+            (v1.u, v0.u, v1.s, v0.s)
+        };
+        let (tv0, tv1, t0, t1) = if v0.y <= v1.y {
+            (v0.v, v1.v, v0.t, v1.t)
+        } else {
+            (v1.v, v0.v, v1.t, v0.t)
+        };
+        let pipe = self.pixel_pipe();
+        for py in py0.max(pipe.scy0)..px_clip(py1).min(pipe.scy1 + 1) {
+            let fy = ((py << 4) as f32 + 8.0 - y0 as f32) / hei;
+            for px in px0.max(pipe.scx0)..px_clip(px1).min(pipe.scx1 + 1) {
                 let fx = ((px << 4) as f32 + 8.0 - x0 as f32) / wid;
-                let fy = ((py << 4) as f32 + 8.0 - y0 as f32) / hei;
-                let (u0, u1) = if v0.x <= v1.x {
-                    (v0.u, v1.u)
-                } else {
-                    (v1.u, v0.u)
-                };
-                let (tv0, tv1) = if v0.y <= v1.y {
-                    (v0.v, v1.v)
-                } else {
-                    (v1.v, v0.v)
-                };
-                let (s0, s1) = if v0.x <= v1.x {
-                    (v0.s, v1.s)
-                } else {
-                    (v1.s, v0.s)
-                };
-                let (t0, t1) = if v0.y <= v1.y {
-                    (v0.t, v1.t)
-                } else {
-                    (v1.t, v0.t)
-                };
                 let frag = Frag {
                     r: v1.r as f32,
                     g: v1.g as f32,
@@ -155,7 +150,7 @@ impl Gs {
                     u: (u0 as f32 + (u1 - u0) as f32 * fx) / 16.0,
                     v: (tv0 as f32 + (tv1 - tv0) as f32 * fy) / 16.0,
                 };
-                self.shade_pixel(px, py, frag);
+                self.shade_pixel(&pipe, px, py, frag);
             }
         }
     }
@@ -187,16 +182,37 @@ impl Gs {
             self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
         }
         let inv_area = 1.0 / area as f32;
+        let pipe = self.pixel_pipe();
+        let minx = minx.max(pipe.scx0);
+        let maxx = maxx.min(pipe.scx1);
+        let miny = miny.max(pipe.scy0);
+        let maxy = maxy.min(pipe.scy1);
+        if minx > maxx || miny > maxy {
+            return;
+        }
+        // Edge functions are affine in (sx, sy): evaluate at the top-left
+        // sample once and step by whole pixels (16 units) — exact in i64.
+        let (sx0, sy0) = ((minx << 4) + 8, (miny << 4) + 8);
+        let mut row_w0 = edge(b.x, b.y, c.x, c.y, sx0, sy0);
+        let mut row_w1 = edge(c.x, c.y, a.x, a.y, sx0, sy0);
+        let mut row_w2 = edge(a.x, a.y, b.x, b.y, sx0, sy0);
+        let (dx0, dy0) = (-(c.y - b.y) as i64 * 16, (c.x - b.x) as i64 * 16);
+        let (dx1, dy1) = (-(a.y - c.y) as i64 * 16, (a.x - c.x) as i64 * 16);
+        let (dx2, dy2) = (-(b.y - a.y) as i64 * 16, (b.x - a.x) as i64 * 16);
         for py in miny..=maxy {
+            let (mut w0, mut w1, mut w2) = (row_w0, row_w1, row_w2);
+            row_w0 += dy0;
+            row_w1 += dy1;
+            row_w2 += dy2;
             for px in minx..=maxx {
-                let sx = (px << 4) + 8;
-                let sy = (py << 4) + 8;
-                let w0 = edge(b.x, b.y, c.x, c.y, sx, sy);
-                let w1 = edge(c.x, c.y, a.x, a.y, sx, sy);
-                let w2 = edge(a.x, a.y, b.x, b.y, sx, sy);
-                if w0 < 0 || w1 < 0 || w2 < 0 {
+                let (cw0, cw1, cw2) = (w0, w1, w2);
+                w0 += dx0;
+                w1 += dx1;
+                w2 += dx2;
+                if cw0 < 0 || cw1 < 0 || cw2 < 0 {
                     continue;
                 }
+                let (w0, w1, w2) = (cw0, cw1, cw2);
                 let l0 = w0 as f32 * inv_area;
                 let l1 = w1 as f32 * inv_area;
                 let l2 = w2 as f32 * inv_area;
@@ -213,44 +229,75 @@ impl Gs {
                     u: (a.u as f32 * l0 + b.u as f32 * l1 + c.u as f32 * l2) / 16.0,
                     v: (a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2) / 16.0,
                 };
-                self.shade_pixel(px, py, frag);
+                self.shade_pixel(&pipe, px, py, frag);
             }
         }
     }
 
-    /// Full per-pixel pipeline: scissor, texture, tests, blend, write.
-    fn shade_pixel(&mut self, x: i32, y: i32, frag: Frag) {
-        let ctxi = self.ctx_index();
-        let ctx = self.ctx[ctxi];
+    /// Decode the drawing environment for the current context once per
+    /// primitive; the per-pixel path only reads it.
+    fn pixel_pipe(&self) -> PixelPipe {
         let attrs = self.attrs();
-
-        // Scissor (pixel units, inclusive).
-        let scx0 = (ctx.scissor & 0x7FF) as i32;
-        let scx1 = ((ctx.scissor >> 16) & 0x7FF) as i32;
-        let scy0 = ((ctx.scissor >> 32) & 0x7FF) as i32;
-        let scy1 = ((ctx.scissor >> 48) & 0x7FF) as i32;
-        if x < scx0 || x > scx1 || y < scy0 || y > scy1 {
-            return;
+        let ctx = &self.ctx[((attrs >> 9) & 1) as usize];
+        let test = ctx.test;
+        PixelPipe {
+            scx0: (ctx.scissor & 0x7FF) as i32,
+            scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
+            scy0: ((ctx.scissor >> 32) & 0x7FF) as i32,
+            scy1: ((ctx.scissor >> 48) & 0x7FF) as i32,
+            tme: attrs & (1 << 4) != 0,
+            fst: attrs & (1 << 8) != 0,
+            abe: attrs & (1 << 6) != 0,
+            tfx: ((ctx.tex0 >> 35) & 3) as u8,
+            tcc: ctx.tex0 & (1 << 34) != 0,
+            bilinear: (ctx.tex1 >> 5) & 1 != 0,
+            tex: TexInfo::new(ctx, self.texa),
+            ate: test & 1 != 0,
+            atst: ((test >> 1) & 7) as u8,
+            aref: ((test >> 4) & 0xFF) as f32,
+            afail: ((test >> 12) & 3) as u8,
+            zte: test & (1 << 16) != 0,
+            ztst: ((test >> 17) & 3) as u8,
+            zbp: ((ctx.zbuf & 0x1FF) * 32) as u32,
+            zmsk: ctx.zbuf & (1 << 32) != 0,
+            // Z buffer depth: PSMZ32 keeps 32 bits, PSMZ24 24, PSMZ16(S) 16;
+            // the upper bits of the stored word belong to whatever else
+            // shares the memory (Amagami parks 8-bit textures over its Z24
+            // buffer).
+            zmask: match (ctx.zbuf >> 24) & 0xF {
+                0x0 => u32::MAX,
+                0x1 => 0x00FF_FFFF,
+                _ => 0xFFFF,
+            },
+            fbp: ((ctx.frame & 0x1FF) * 32) as u32,
+            fbw: ((ctx.frame >> 16) & 0x3F) as u32,
+            fb24: ((ctx.frame >> 24) & 0x3F) as u32 == PSMCT24,
+            fbmsk: (ctx.frame >> 32) as u32,
+            alpha: ctx.alpha,
         }
+    }
+
+    /// Full per-pixel pipeline: texture, tests, blend, write. The caller
+    /// has already clipped to the scissor box.
+    fn shade_pixel(&mut self, pipe: &PixelPipe, x: i32, y: i32, frag: Frag) {
         let (x, y) = (x as u32, y as u32);
+        self.pixels_shaded += 1;
 
         // Source color: vertex color, optionally combined with a texel.
         let mut r = frag.r;
         let mut g = frag.g;
         let mut b = frag.b;
         let mut a = frag.a;
-        if attrs & (1 << 4) != 0 {
-            self.tex_psm_hist[((ctx.tex0 >> 20) & 0x3F) as usize] += 1;
-            let (tr, tg, tb, ta) = self.sample(ctx, attrs, &frag);
-            let tfx = (ctx.tex0 >> 35) & 3;
-            let tcc = ctx.tex0 & (1 << 34) != 0;
-            match tfx {
+        if pipe.tme {
+            self.tex_psm_hist[pipe.tex.psm as usize] += 1;
+            let (tr, tg, tb, ta) = self.sample(pipe, &frag);
+            match pipe.tfx {
                 0 => {
                     // MODULATE
                     r = (tr * r / 128.0).min(255.0);
                     g = (tg * g / 128.0).min(255.0);
                     b = (tb * b / 128.0).min(255.0);
-                    if tcc {
+                    if pipe.tcc {
                         a = (ta * a / 128.0).min(255.0);
                     }
                 }
@@ -259,7 +306,7 @@ impl Gs {
                     r = tr;
                     g = tg;
                     b = tb;
-                    if tcc {
+                    if pipe.tcc {
                         a = ta;
                     }
                 }
@@ -268,7 +315,7 @@ impl Gs {
                     r = (tr * r / 128.0 + a).min(255.0);
                     g = (tg * g / 128.0 + a).min(255.0);
                     b = (tb * b / 128.0 + a).min(255.0);
-                    if tcc {
+                    if pipe.tcc {
                         a = ta;
                     }
                 }
@@ -276,11 +323,9 @@ impl Gs {
         }
 
         // Alpha test.
-        let test = ctx.test;
-        if test & 1 != 0 {
-            let atst = (test >> 1) & 7;
-            let aref = ((test >> 4) & 0xFF) as f32;
-            let pass = match atst {
+        if pipe.ate {
+            let aref = pipe.aref;
+            let pass = match pipe.atst {
                 0 => false,
                 1 => true,
                 2 => a < aref,
@@ -291,8 +336,7 @@ impl Gs {
                 _ => (a as u32) != aref as u32,
             };
             if !pass {
-                let afail = (test >> 12) & 3;
-                match afail {
+                match pipe.afail {
                     0 => return, // KEEP
                     1 => {}      // FB_ONLY: continue without z write
                     2 => return, // ZB_ONLY: no color -> nothing visible
@@ -302,23 +346,11 @@ impl Gs {
         }
 
         // Depth test (linear z buffer, PSMZ32-style storage).
-        let zte = test & (1 << 16) != 0;
-        let ztst = (test >> 17) & 3;
-        let zbp = ((ctx.zbuf & 0x1FF) * 32) as u32;
-        let zmsk = ctx.zbuf & (1 << 32) != 0;
-        let fbw = ((ctx.frame >> 16) & 0x3F) as u32;
-        // Z buffer depth: PSMZ32 keeps 32 bits, PSMZ24 24, PSMZ16(S) 16;
-        // the upper bits of the stored word belong to whatever else shares
-        // the memory (Amagami parks 8-bit textures over its Z24 buffer).
-        let zmask = match (ctx.zbuf >> 24) & 0xF {
-            0x0 => u32::MAX,
-            0x1 => 0x00FF_FFFF,
-            _ => 0xFFFF,
-        };
-        if zte && ztst != 1 {
+        let (zbp, fbw, zmask) = (pipe.zbp, pipe.fbw, pipe.zmask);
+        if pipe.zte && pipe.ztst != 1 {
             let zcur = self.read_psmct32(zbp, fbw, x, y) & zmask;
             let z = frag.z & zmask;
-            let pass = match ztst {
+            let pass = match pipe.ztst {
                 0 => false,
                 2 => z >= zcur,
                 _ => z > zcur,
@@ -327,26 +359,24 @@ impl Gs {
                 return;
             }
         }
-        if zte && !zmsk {
+        if pipe.zte && !pipe.zmsk {
             let cur = self.read_psmct32(zbp, fbw, x, y);
             self.write_psmct32(zbp, fbw, x, y, (cur & !zmask) | (frag.z & zmask));
         }
 
         // Destination blend.
-        let fbp = ((ctx.frame & 0x1FF) * 32) as u32;
-        let psm = ((ctx.frame >> 24) & 0x3F) as u32;
-        let fbmsk = (ctx.frame >> 32) as u32;
+        let fbp = pipe.fbp;
         let dst = self.read_psmct32(fbp, fbw, x, y);
 
-        let (dr, dg, db, da) = (
-            (dst & 0xFF) as f32,
-            ((dst >> 8) & 0xFF) as f32,
-            ((dst >> 16) & 0xFF) as f32,
-            ((dst >> 24) & 0xFF) as f32,
-        );
-        if attrs & (1 << 6) != 0 {
+        if pipe.abe {
+            let (dr, dg, db, da) = (
+                (dst & 0xFF) as f32,
+                ((dst >> 8) & 0xFF) as f32,
+                ((dst >> 16) & 0xFF) as f32,
+                ((dst >> 24) & 0xFF) as f32,
+            );
             // ALPHA: Cv = ((A - B) * C >> 7) + D.
-            let al = ctx.alpha;
+            let al = pipe.alpha;
             let sel = |k: u64, s: f32, d: f32| -> f32 {
                 match k & 3 {
                     0 => s,
@@ -378,19 +408,19 @@ impl Gs {
         let out =
             (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a.min(255.0) as u32) << 24);
         let cur = dst;
-        let mut merged = (out & !fbmsk) | (cur & fbmsk);
-        if psm == PSMCT24 {
+        let mut merged = (out & !pipe.fbmsk) | (cur & pipe.fbmsk);
+        if pipe.fb24 {
             merged = (merged & 0xFF_FFFF) | (cur & 0xFF00_0000);
         }
         self.write_psmct32(fbp, fbw, x, y, merged);
     }
 
-    /// Nearest-neighbour texture sample.
-    fn sample(&self, ctx: Context, attrs: u64, frag: &Frag) -> (f32, f32, f32, f32) {
-        let ti = TexInfo::new(&ctx, self.texa);
+    /// Texture sample (nearest or bilinear per TEX1 MMAG).
+    fn sample(&self, pipe: &PixelPipe, frag: &Frag) -> (f32, f32, f32, f32) {
+        let ti = &pipe.tex;
 
         // FST: UV addressing vs STQ. Texel-space coordinates, fractional.
-        let (fu, fv) = if attrs & (1 << 8) != 0 {
+        let (fu, fv) = if pipe.fst {
             (frag.u, frag.v)
         } else {
             let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
@@ -399,8 +429,8 @@ impl Gs {
 
         // TEX1 MMAG selects the magnification filter; minification and
         // mipmaps are not modelled, so it decides for every sample.
-        let texel = if (ctx.tex1 >> 5) & 1 == 0 {
-            self.texel(&ti, fu.floor() as i32, fv.floor() as i32)
+        let texel = if !pipe.bilinear {
+            self.texel(ti, fu.floor() as i32, fv.floor() as i32)
         } else {
             let x = fu - 0.5;
             let y = fv - 0.5;
@@ -410,12 +440,12 @@ impl Gs {
             let fy = ((y - y0) * 256.0) as u32;
             let (x0, y0) = (x0 as i32, y0 as i32);
             if fx == 0 && fy == 0 {
-                self.texel(&ti, x0, y0)
+                self.texel(ti, x0, y0)
             } else {
-                let t00 = self.texel(&ti, x0, y0);
-                let t10 = self.texel(&ti, x0 + 1, y0);
-                let t01 = self.texel(&ti, x0, y0 + 1);
-                let t11 = self.texel(&ti, x0 + 1, y0 + 1);
+                let t00 = self.texel(ti, x0, y0);
+                let t10 = self.texel(ti, x0 + 1, y0);
+                let t01 = self.texel(ti, x0, y0 + 1);
+                let t11 = self.texel(ti, x0 + 1, y0 + 1);
                 let mut out = 0u32;
                 for shift in [0, 8, 16, 24] {
                     let c = |t: u32| (t >> shift) & 0xFF;
@@ -494,7 +524,37 @@ impl Gs {
     }
 }
 
-/// TEX0/CLAMP fields decoded once per sample.
+/// Drawing environment decoded once per primitive (see `pixel_pipe`).
+struct PixelPipe {
+    // Scissor, inclusive pixel bounds.
+    scx0: i32,
+    scx1: i32,
+    scy0: i32,
+    scy1: i32,
+    tme: bool,
+    fst: bool,
+    abe: bool,
+    tfx: u8,
+    tcc: bool,
+    bilinear: bool,
+    tex: TexInfo,
+    ate: bool,
+    atst: u8,
+    aref: f32,
+    afail: u8,
+    zte: bool,
+    ztst: u8,
+    zbp: u32,
+    zmsk: bool,
+    zmask: u32,
+    fbp: u32,
+    fbw: u32,
+    fb24: bool,
+    fbmsk: u32,
+    alpha: u64,
+}
+
+/// TEX0/CLAMP fields decoded once per primitive.
 struct TexInfo {
     tex0: u64,
     tbp: u32,

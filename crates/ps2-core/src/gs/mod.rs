@@ -112,6 +112,8 @@ pub struct Gs {
     /// Statistics for bring-up logging.
     pub prims_drawn: u64,
     pub prims_textured: u64,
+    /// Pixels that entered the shading pipeline (after scissor/coverage).
+    pub pixels_shaded: u64,
     /// Texture samples per TEX0 PSM, for bring-up logging.
     pub tex_psm_hist: [u64; 64],
     /// IMAGE transfer formats already reported as unhandled (bit per PSM).
@@ -172,6 +174,7 @@ impl Gs {
             intc_pending: false,
             prims_drawn: 0,
             prims_textured: 0,
+            pixels_shaded: 0,
             tex_psm_hist: [0; 64],
             warned_trx_psm: 0,
             seen_tex0: std::collections::HashSet::new(),

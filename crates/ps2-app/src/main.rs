@@ -297,6 +297,7 @@ fn main() -> ExitCode {
         cycles = sys.cycles,
         prims = sys.bus.gs.prims_drawn,
         prims_tex = sys.bus.gs.prims_textured,
+        pixels = sys.bus.gs.pixels_shaded,
         pmode = format_args!("{:#x}", sys.bus.gs.pmode),
         dispfb1 = format_args!("{:#x}", sys.bus.gs.dispfb1),
         dispfb2 = format_args!("{:#x}", sys.bus.gs.dispfb2),
