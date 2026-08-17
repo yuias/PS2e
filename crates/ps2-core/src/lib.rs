@@ -111,12 +111,56 @@ impl Ps2System {
     }
 
     /// Run for approximately `cycles` EE cycles.
+    ///
+    /// Same sequence as repeated [`Ps2System::step`], but the eight EE cycles
+    /// between IOP slots are grouped so the per-cycle checks (`%`, vblank
+    /// edge, wake-up) are hoisted, and an idle EE skips a whole group at
+    /// once when no vblank edge falls inside it.
     pub fn run(&mut self, cycles: u64) {
         // One EE scope per slice: nested IOP/timer/DMA scopes hand back here.
         let _g = prof::scope(prof::Slot::Ee);
         let target = self.cycles + cycles;
         while self.cycles < target {
+            if !self.cycles.is_multiple_of(EE_PER_IOP) || target - self.cycles < EE_PER_IOP {
+                self.step();
+                continue;
+            }
+            // Cycle 0 of the group carries the IOP slot and timers.
             self.step();
+            // Cycles 1..7: EE only, plus a vblank edge if one lands here.
+            let vbl_edge = self.frame_pos + EE_PER_IOP > EE_CYCLES_PER_FRAME - VBLANK_CYCLES
+                && self.frame_pos <= EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+            let wrap = self.frame_pos + EE_PER_IOP >= EE_CYCLES_PER_FRAME;
+            if self.ee.idle && !vbl_edge && !wrap {
+                self.frame_pos += EE_PER_IOP - 1;
+                self.cycles += EE_PER_IOP - 1;
+                continue;
+            }
+            for _ in 1..EE_PER_IOP {
+                self.bus.now = self.cycles;
+                if !self.ee.idle {
+                    self.ee.step(&mut self.bus);
+                }
+                if self.frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
+                    self.bus.vblank(true);
+                    self.wake_idle_ee();
+                } else if self.frame_pos == 0 && self.cycles != 0 {
+                    self.bus.vblank(false);
+                    self.wake_idle_ee();
+                }
+                self.frame_pos += 1;
+                if self.frame_pos == EE_CYCLES_PER_FRAME {
+                    self.frame_pos = 0;
+                }
+                self.cycles += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn wake_idle_ee(&mut self) {
+        if self.ee.idle && self.ee.interrupt_pending(&self.bus) {
+            self.ee.idle = false;
         }
     }
 
