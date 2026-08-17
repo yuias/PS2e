@@ -310,6 +310,8 @@ impl Gs {
         }
         let inv_area = 1.0 / area as f32;
         let pipe = self.pixel_pipe();
+        self.tex_rows[0].key.0 = u64::MAX;
+        self.tex_rows[1].key.0 = u64::MAX;
         let minx = minx.max(pipe.scx0);
         let maxx = maxx.min(pipe.scx1);
         let miny = miny.max(pipe.scy0);
@@ -326,6 +328,11 @@ impl Gs {
         let (dx0, dy0) = (-(c.y - b.y) as i64 * 16, (c.x - b.x) as i64 * 16);
         let (dx1, dy1) = (-(a.y - c.y) as i64 * 16, (a.x - c.x) as i64 * 16);
         let (dx2, dy2) = (-(b.y - a.y) as i64 * 16, (b.x - a.x) as i64 * 16);
+        // Per-vertex attribute vectors for the 4-lane interpolation.
+        let col = |v: &Vertex| [v.r as f32, v.g as f32, v.b as f32, v.a as f32];
+        let stq = |v: &Vertex| [v.s, v.t, v.q, v.u as f32];
+        let (ca, cb, cc) = (col(&a), col(&b), col(&c));
+        let (sa, sb, sc) = (stq(&a), stq(&b), stq(&c));
         for py in miny..=maxy {
             let (mut w0, mut w1, mut w2) = (row_w0, row_w1, row_w2);
             row_w0 += dy0;
@@ -344,23 +351,77 @@ impl Gs {
                 let l0 = w0 as f32 * inv_area;
                 let l1 = w1 as f32 * inv_area;
                 let l2 = w2 as f32 * inv_area;
+                let rgba = interp3(&ca, &cb, &cc, l0, l1, l2);
+                let stqu = interp3(&sa, &sb, &sc, l0, l1, l2);
                 let frag = Frag {
-                    r: a.r as f32 * l0 + b.r as f32 * l1 + c.r as f32 * l2,
-                    g: a.g as f32 * l0 + b.g as f32 * l1 + c.g as f32 * l2,
-                    b: a.b as f32 * l0 + b.b as f32 * l1 + c.b as f32 * l2,
-                    a: a.a as f32 * l0 + b.a as f32 * l1 + c.a as f32 * l2,
+                    r: rgba[0],
+                    g: rgba[1],
+                    b: rgba[2],
+                    a: rgba[3],
                     z: (a.z as f64 * l0 as f64 + b.z as f64 * l1 as f64 + c.z as f64 * l2 as f64)
                         as u32,
-                    s: a.s * l0 + b.s * l1 + c.s * l2,
-                    t: a.t * l0 + b.t * l1 + c.t * l2,
-                    q: a.q * l0 + b.q * l1 + c.q * l2,
-                    u: (a.u as f32 * l0 + b.u as f32 * l1 + c.u as f32 * l2) / 16.0,
+                    s: stqu[0],
+                    t: stqu[1],
+                    q: stqu[2],
+                    u: stqu[3] / 16.0,
                     v: (a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2) / 16.0,
                 };
-                let texel = if pipe.tme { self.sample(&pipe, &frag) } else { 0 };
+                let texel = if pipe.tme { self.sample_cached(&pipe, &frag) } else { 0 };
                 self.shade_row_px(&pipe, &row, px as u32, frag, texel);
             }
         }
+    }
+
+    /// [`Gs::sample`] through the decoded-row cache: texels come from
+    /// `tex_rows`, refilled in 32-texel chunks around a miss. Same texels
+    /// and weights as the direct path.
+    fn sample_cached(&mut self, pipe: &PixelPipe, frag: &Frag) -> u32 {
+        let ti = &pipe.tex;
+        let (fu, fv) = if pipe.fst {
+            (frag.u, frag.v)
+        } else {
+            let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
+            let inv_q = 1.0 / q;
+            (frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
+        };
+        if !pipe.bilinear {
+            return self.cached_texel(ti, 0, floor_i32(fu), floor_i32(fv));
+        }
+        let x = fu - 0.5;
+        let y = fv - 0.5;
+        let (x0, y0) = (floor_i32(x), floor_i32(y));
+        let fx = ((x - x0 as f32) * 256.0) as u32;
+        let fy = ((y - y0 as f32) * 256.0) as u32;
+        if fx | fy == 0 {
+            return self.cached_texel(ti, 0, x0, y0);
+        }
+        // Common case: both rows cached and the 2x2 footprint inside them.
+        let (r0, r1) = (&self.tex_rows[0], &self.tex_rows[1]);
+        if r0.key == (ti.tex0, y0)
+            && r1.key == (ti.tex0, y0 + 1)
+            && x0 >= r0.u_lo
+            && x0 + 1 < r0.u_lo + r0.data.len() as i32
+            && x0 >= r1.u_lo
+            && x0 + 1 < r1.u_lo + r1.data.len() as i32
+        {
+            let (i0, i1) = ((x0 - r0.u_lo) as usize, (x0 - r1.u_lo) as usize);
+            return bilerp_rgba(r0.data[i0], r0.data[i0 + 1], r1.data[i1], r1.data[i1 + 1], fx, fy);
+        }
+        let t00 = self.cached_texel(ti, 0, x0, y0);
+        let t10 = self.cached_texel(ti, 0, x0 + 1, y0);
+        let t01 = self.cached_texel(ti, 1, x0, y0 + 1);
+        let t11 = self.cached_texel(ti, 1, x0 + 1, y0 + 1);
+        bilerp_rgba(t00, t10, t01, t11, fx, fy)
+    }
+
+    #[inline(always)]
+    fn cached_texel(&mut self, ti: &TexInfo, slot: usize, u: i32, y: i32) -> u32 {
+        let row = &self.tex_rows[slot];
+        if row.key == (ti.tex0, y) && u >= row.u_lo && u < row.u_lo + row.data.len() as i32 {
+            return row.data[(u - row.u_lo) as usize];
+        }
+        self.fill_tex_row(slot, ti, y, u - 8, u + 23);
+        self.tex_rows[slot].data[8]
     }
 
     /// Decode the drawing environment for the current context once per
@@ -852,6 +913,38 @@ fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
     let rb = ((a & 0x00FF_00FF) * inv + (b & 0x00FF_00FF) * w) >> 8;
     let ga = ((a >> 8) & 0x00FF_00FF) * inv + ((b >> 8) & 0x00FF_00FF) * w;
     (rb & 0x00FF_00FF) | (ga & 0xFF00_FF00)
+}
+
+/// `a*l0 + b*l1 + c*l2` on four lanes, evaluated as the scalar form
+/// `(a*l0 + b*l1) + c*l2` per lane so results match it bit for bit.
+#[inline(always)]
+fn interp3(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4], l0: f32, l1: f32, l2: f32) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: SSE baseline; unaligned loads/stores of the arrays.
+        unsafe {
+            let va = _mm_loadu_ps(a.as_ptr());
+            let vb = _mm_loadu_ps(b.as_ptr());
+            let vc = _mm_loadu_ps(c.as_ptr());
+            let v = _mm_add_ps(
+                _mm_add_ps(_mm_mul_ps(va, _mm_set1_ps(l0)), _mm_mul_ps(vb, _mm_set1_ps(l1))),
+                _mm_mul_ps(vc, _mm_set1_ps(l2)),
+            );
+            let mut out = [0f32; 4];
+            _mm_storeu_ps(out.as_mut_ptr(), v);
+            out
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [
+            a[0] * l0 + b[0] * l1 + c[0] * l2,
+            a[1] * l0 + b[1] * l1 + c[1] * l2,
+            a[2] * l0 + b[2] * l1 + c[2] * l2,
+            a[3] * l0 + b[3] * l1 + c[3] * l2,
+        ]
+    }
 }
 
 /// RGB8 (R low) into three 21-bit lanes of a u64.
