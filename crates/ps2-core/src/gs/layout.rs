@@ -104,6 +104,86 @@ pub(super) fn addr4(bp: u32, bw: u32, x: u32, y: u32) -> usize {
     ((block as usize) * 512 + col as usize) & (BYTE_MASK * 2 + 1)
 }
 
+/// Row-based 32-bit addressing for the rasterizer: a scanline's byte
+/// address is `row_base32(bp, bw, y, z) + col_off32(y, x)`, where the
+/// second term only depends on `y & 31` and `x`, so a scanline needs the
+/// base once and a table lookup per pixel.
+#[inline(always)]
+pub(super) fn row_base32(bp: u32, bw: u32, y: u32, z: bool) -> usize {
+    let bw = bw.max(1);
+    let block = bp.wrapping_add((y >> 5) * bw * 32);
+    let col = ((y & 7) >> 1) * 16 + (y & 1) * 2;
+    let _ = z; // the Z block order is in the column table
+    (block as usize) * 256 + col as usize * 4
+}
+
+/// Byte offset of pixel `x` within its scanline (see [`row_base32`]); `z`
+/// selects the Z block order.
+#[inline(always)]
+pub(super) fn col_off32(y: u32, x: u32, z: bool) -> usize {
+    ((x >> 6) as usize) * 8192
+        + COL_OFF32[z as usize][((y >> 3) & 3) as usize][(x & 63) as usize] as usize
+}
+
+/// `col_off32` per (z, block row, x & 63): block table entry times 256
+/// plus the in-block column offset of x.
+const COL_OFF32: [[[u16; 64]; 4]; 2] = {
+    let mut t = [[[0u16; 64]; 4]; 2];
+    let mut z = 0;
+    while z < 2 {
+        let mut j = 0;
+        while j < 4 {
+            let mut x = 0;
+            while x < 64 {
+                let block = BLOCK32[j][x >> 3] ^ if z == 1 { Z_FLIP } else { 0 };
+                t[z][j][x] = (block * 256 + ((x as u32 & 7) >> 1) * 16 + (x as u32 & 1) * 4) as u16;
+                x += 1;
+            }
+            j += 1;
+        }
+        z += 1;
+    }
+    t
+};
+
+/// Row-based PSMT8 addressing: `row_base8(bp, bw, y) + col_off8(y, x)`.
+#[inline(always)]
+pub(super) fn row_base8(bp: u32, bw: u32, y: u32) -> usize {
+    let bw = bw.max(1);
+    let block = bp.wrapping_add((y >> 6) * (bw >> 1) * 32);
+    let c = (y & 15) >> 2;
+    let ry = y & 3;
+    let col = c * 64 + (ry & 1) * 8 + (ry >> 1);
+    (block as usize) * 256 + col as usize
+}
+
+/// Byte offset of texel `x` within its PSMT8 row (see [`row_base8`]).
+#[inline(always)]
+pub(super) fn col_off8(y: u32, x: u32) -> usize {
+    ((x >> 7) as usize) * 8192 + COL_OFF8[(y & 63) as usize][(x & 127) as usize] as usize
+}
+
+/// `col_off8` per (y & 63, x & 127): block entry times 256 plus the
+/// x-dependent part of the column swizzle (whose half-swap depends on y).
+const COL_OFF8: [[u16; 128]; 64] = {
+    let mut t = [[0u16; 128]; 64];
+    let mut y = 0;
+    while y < 64 {
+        let mut x = 0;
+        while x < 128 {
+            let c = (y as u32 & 15) >> 2;
+            let ry = y as u32 & 3;
+            let swap = ((ry >> 1) ^ (c & 1)) & 1;
+            let xs = (x as u32 & 15) ^ (swap << 2);
+            let col = ((xs >> 1) & 3) * 16 + (xs & 1) * 4 + (xs >> 3) * 2;
+            t[y][x] = (BLOCK8[(y >> 4) & 3][(x >> 4) & 7] * 256 + col) as u16;
+            x += 1;
+        }
+        y += 1;
+    }
+    t
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +272,35 @@ mod tests {
                 212, 220, 244, 252, 148, 156, 180, 188, 214, 222, 246, 254, 150, 158, 182, 190
             ]
         );
+    }
+
+    /// The scanline decomposition matches the full address computation.
+    #[test]
+    fn row_addressing_matches() {
+        for &(bp, bw) in &[(0u32, 10u32), (2240, 10), (10108, 1), (4480, 8)] {
+            for y in [0u32, 1, 7, 8, 31, 32, 100, 447] {
+                for x in [0u32, 1, 7, 8, 63, 64, 65, 320, 639] {
+                    for z in [false, true] {
+                        let want = addr32(bp, bw, x, y, z);
+                        let got = (row_base32(bp, bw, y, z) + col_off32(y, x, z)) & (VRAM_SIZE - 1);
+                        assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y} z {z}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_addressing8_matches() {
+        for &(bp, bw) in &[(0u32, 10u32), (4480, 8), (4480, 10), (7840, 6)] {
+            for y in [0u32, 1, 2, 3, 5, 15, 16, 63, 64, 200] {
+                for x in [0u32, 1, 4, 7, 8, 15, 16, 127, 128, 511] {
+                    let want = addr8(bp, bw, x, y);
+                    let got = (row_base8(bp, bw, y) + col_off8(y, x)) & (VRAM_SIZE - 1);
+                    assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y}");
+                }
+            }
+        }
     }
 
     /// Block placement: a 16x16 32-bit image (a CLUT) occupies exactly four

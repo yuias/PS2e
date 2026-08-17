@@ -122,6 +122,8 @@ pub struct Gs {
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
+    /// Decoded texture rows for the sprite fast path (see raster.rs).
+    tex_rows: [TexRow; 2],
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
     woven_dims: (u32, u32),
@@ -183,6 +185,7 @@ impl Gs {
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
+            tex_rows: [TexRow::default(), TexRow::default()],
             woven: Vec::new(),
             woven_dims: (0, 0),
             clut: Box::new([0; 512]),
@@ -796,6 +799,15 @@ impl Gs {
             out[o + 3] = 255;
         }
     }
+}
+
+/// One decoded texture row: RGBA8 texels `u_lo..` of row `key.1` of the
+/// texture set up by TEX0 `key.0`. Valid within one primitive only.
+#[derive(Default)]
+pub(super) struct TexRow {
+    pub key: (u64, i32),
+    pub u_lo: i32,
+    pub data: Vec<u32>,
 }
 
 /// Read-circuit parameters for scanout.

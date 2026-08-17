@@ -134,25 +134,152 @@ impl Gs {
             (v1.v, v0.v, v1.t, v0.t)
         };
         let pipe = self.pixel_pipe();
+        let (pxa, pxb) = (px0.max(pipe.scx0), px_clip(px1).min(pipe.scx1 + 1));
+        // Rows decoded for an earlier primitive may have been drawn over
+        // since; only reuse within this sprite (a sprite that samples what
+        // its own earlier rows wrote is the accepted deviation).
+        self.tex_rows[0].key.0 = u64::MAX;
+        self.tex_rows[1].key.0 = u64::MAX;
+        // Texel-space u for a pixel column, exactly as `sample` derives it
+        // from the fragment (same operations, same rounding).
+        let inv_q = {
+            let q = if v1.q.abs() < 1e-9 { 1.0 } else { v1.q };
+            1.0 / q
+        };
+        let tw = pipe.tex.tw as f32;
+        let th = pipe.tex.th as f32;
+        let fu_at = |px: i32| -> f32 {
+            let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * inv_wid;
+            if pipe.fst {
+                (u0 as f32 + (u1 - u0) as f32 * fx) / 16.0
+            } else {
+                (s0 + (s1 - s0) * fx) * inv_q * tw
+            }
+        };
         for py in py0.max(pipe.scy0)..px_clip(py1).min(pipe.scy1 + 1) {
             let fy = ((py << 4) as f32 + 8.0 - y0 as f32) * inv_hei;
-            for px in px0.max(pipe.scx0)..px_clip(px1).min(pipe.scx1 + 1) {
+            let frag = Frag {
+                r: v1.r as f32,
+                g: v1.g as f32,
+                b: v1.b as f32,
+                a: v1.a as f32,
+                z: v1.z,
+                s: 0.0,
+                t: t0 + (t1 - t0) * fy,
+                q: v1.q,
+                u: 0.0,
+                v: (tv0 as f32 + (tv1 - tv0) as f32 * fy) / 16.0,
+            };
+            let row = Row::new(&pipe, py as u32);
+            if pipe.tme && pxb > pxa {
+                // v is constant along the row: decode the one or two
+                // texture rows the row samples once, then blend from them.
+                let fv = if pipe.fst { frag.v } else { frag.t * inv_q * th };
+                let (fu_a, fu_b) = (fu_at(pxa), fu_at(pxb - 1));
+                let (fu_lo, fu_hi) = (fu_a.min(fu_b), fu_a.max(fu_b));
+                let (y_row, wy, u_lo, u_hi) = if pipe.bilinear {
+                    let y = fv - 0.5;
+                    let y_row = floor_i32(y);
+                    let wy = ((y - y_row as f32) * 256.0) as u32;
+                    (y_row, wy, floor_i32(fu_lo - 0.5), floor_i32(fu_hi - 0.5) + 1)
+                } else {
+                    (floor_i32(fv), 0, floor_i32(fu_lo), floor_i32(fu_hi))
+                };
+                if u_hi - u_lo < 4096 {
+                    self.fill_tex_row(0, &pipe.tex, y_row, u_lo, u_hi);
+                    if pipe.bilinear {
+                        self.fill_tex_row(1, &pipe.tex, y_row + 1, u_lo, u_hi);
+                    }
+                    let [row0, row1] = std::mem::take(&mut self.tex_rows);
+                    for px in pxa..pxb {
+                        let fu = fu_at(px);
+                        let texel = if pipe.bilinear {
+                            let x = fu - 0.5;
+                            let x0 = floor_i32(x);
+                            let wx = ((x - x0 as f32) * 256.0) as u32;
+                            let i = (x0 - u_lo) as usize;
+                            if wx | wy == 0 {
+                                row0.data[i]
+                            } else {
+                                bilerp_rgba(row0.data[i], row0.data[i + 1], row1.data[i], row1.data[i + 1], wx, wy)
+                            }
+                        } else {
+                            row0.data[(floor_i32(fu) - u_lo) as usize]
+                        };
+                        self.shade_row_px(&pipe, &row, px as u32, frag, texel);
+                    }
+                    self.tex_rows = [row0, row1];
+                    continue;
+                }
+            }
+            for px in pxa..pxb {
                 let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * inv_wid;
                 let frag = Frag {
-                    r: v1.r as f32,
-                    g: v1.g as f32,
-                    b: v1.b as f32,
-                    a: v1.a as f32,
-                    z: v1.z,
                     s: s0 + (s1 - s0) * fx,
-                    t: t0 + (t1 - t0) * fy,
-                    q: v1.q,
                     u: (u0 as f32 + (u1 - u0) as f32 * fx) / 16.0,
-                    v: (tv0 as f32 + (tv1 - tv0) as f32 * fy) / 16.0,
+                    ..frag
                 };
-                self.shade_pixel(&pipe, px, py, frag);
+                let texel = if pipe.tme { self.sample(&pipe, &frag) } else { 0 };
+                self.shade_row_px(&pipe, &row, px as u32, frag, texel);
             }
         }
+    }
+
+    /// Make `tex_rows[slot]` hold texels `u_lo..=u_hi` of texture row `y`
+    /// (wrapped/clamped like any sample); reuses the previous contents when
+    /// they already cover the request.
+    fn fill_tex_row(&mut self, slot: usize, ti: &TexInfo, y: i32, u_lo: i32, u_hi: i32) {
+        let key = (ti.tex0, y);
+        let covers = |row: &TexRow| {
+            row.key == key && row.u_lo == u_lo && row.u_lo + row.data.len() as i32 > u_hi
+        };
+        if covers(&self.tex_rows[slot]) {
+            return;
+        }
+        // The other slot may hold this very row (the previous output row's
+        // second tap row becomes this row's first).
+        if covers(&self.tex_rows[slot ^ 1]) {
+            self.tex_rows.swap(0, 1);
+            return;
+        }
+        let mut row = std::mem::take(&mut self.tex_rows[slot]);
+        row.key = key;
+        row.u_lo = u_lo;
+        row.data.clear();
+        row.data.reserve((u_hi - u_lo + 1) as usize);
+        let v = wrap(y, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
+        // The row's texture line is fixed: address it as base + column
+        // table for the formats the fast paths matter for.
+        match ti.psm {
+            PSMT8 => {
+                let base = layout::row_base8(ti.tbp, ti.tbw, v);
+                for u in u_lo..=u_hi {
+                    let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
+                    let idx = self.vram[(base + layout::col_off8(v, u)) & (VRAM_SIZE - 1)];
+                    row.data.push(self.clut[idx as usize]);
+                }
+            }
+            PSMCT32 | PSMCT24 | PSMT8H | PSMT4HL | PSMT4HH => {
+                let base = layout::row_base32(ti.tbp, ti.tbw, v, false);
+                for u in u_lo..=u_hi {
+                    let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
+                    let px = self.rd32((base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1));
+                    row.data.push(match ti.psm {
+                        PSMCT32 => px,
+                        PSMCT24 => (px & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
+                        PSMT8H => self.clut[(px >> 24) as usize],
+                        PSMT4HL => self.clut[((px >> 24) & 0xF) as usize + ti.clut_base],
+                        _ => self.clut[(px >> 28) as usize + ti.clut_base],
+                    });
+                }
+            }
+            _ => {
+                for u in u_lo..=u_hi {
+                    row.data.push(self.texel(ti, u, y));
+                }
+            }
+        }
+        self.tex_rows[slot] = row;
     }
 
     pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
@@ -204,6 +331,7 @@ impl Gs {
             row_w0 += dy0;
             row_w1 += dy1;
             row_w2 += dy2;
+            let row = Row::new(&pipe, py as u32);
             for px in minx..=maxx {
                 let (cw0, cw1, cw2) = (w0, w1, w2);
                 w0 += dx0;
@@ -229,7 +357,8 @@ impl Gs {
                     u: (a.u as f32 * l0 + b.u as f32 * l1 + c.u as f32 * l2) / 16.0,
                     v: (a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2) / 16.0,
                 };
-                self.shade_pixel(&pipe, px, py, frag);
+                let texel = if pipe.tme { self.sample(&pipe, &frag) } else { 0 };
+                self.shade_row_px(&pipe, &row, px as u32, frag, texel);
             }
         }
     }
@@ -245,6 +374,7 @@ impl Gs {
             self.refresh_clut(&tex);
         }
         PixelPipe {
+            kind: (self.prim & 7) as u8,
             scx0: (ctx.scissor & 0x7FF) as i32,
             scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
             scy0: ((ctx.scissor >> 32) & 0x7FF) as i32,
@@ -286,8 +416,29 @@ impl Gs {
     /// on hardware: interpolated colors truncate to 8 bits first.
     #[inline(always)]
     fn shade_pixel(&mut self, pipe: &PixelPipe, x: i32, y: i32, frag: Frag) {
-        let (x, y) = (x as u32, y as u32);
+        let texel = if pipe.tme { self.sample(pipe, &frag) } else { 0 };
+        self.shade_with(pipe, x, y, frag, texel);
+    }
+
+    /// [`Gs::shade_pixel`] with the texel already sampled (row caches).
+    #[inline(always)]
+    fn shade_with(&mut self, pipe: &PixelPipe, x: i32, y: i32, frag: Frag, texel: u32) {
+        let row = Row::new(pipe, y as u32);
+        self.shade_row_px(pipe, &row, x as u32, frag, texel);
+    }
+
+    /// The pixel pipeline proper: `row` carries the scanline's frame/Z
+    /// buffer bases so per-pixel addressing is a table lookup.
+    #[inline(always)]
+    fn shade_row_px(&mut self, pipe: &PixelPipe, row: &Row, x: u32, frag: Frag, texel: u32) {
+        let y = row.y;
         self.pixels_shaded += 1;
+        #[cfg(feature = "profile")]
+        {
+            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
+                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5);
+            crate::prof::count_pixel(k);
+        }
 
         // Source color: vertex color, optionally combined with a texel.
         let mut r = frag.r as u32;
@@ -296,7 +447,6 @@ impl Gs {
         let mut a = frag.a as u32;
         if pipe.tme {
             self.tex_psm_hist[pipe.tex.psm as usize] += 1;
-            let texel = self.sample(pipe, &frag);
             let (tr, tg, tb, ta) = (texel & 0xFF, (texel >> 8) & 0xFF, (texel >> 16) & 0xFF, texel >> 24);
             match pipe.tfx {
                 0 => {
@@ -353,9 +503,11 @@ impl Gs {
         }
 
         // Depth test (linear z buffer, PSMZ32-style storage).
-        let (zbp, fbw, zmask) = (pipe.zbp, pipe.fbw, pipe.zmask);
+        let zmask = pipe.zmask;
+        let z_off = (row.z_base + layout::col_off32(y, x, true)) & (VRAM_SIZE - 1);
+        let fb_off = (row.fb_base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
         if pipe.zte {
-            let zcur = self.read_psmz32(zbp, fbw, x, y);
+            let zcur = self.rd32(z_off);
             let z = frag.z & zmask;
             let pass = match pipe.ztst {
                 0 => false,
@@ -367,13 +519,12 @@ impl Gs {
                 return;
             }
             if !pipe.zmsk {
-                self.write_psmz32(zbp, fbw, x, y, (zcur & !zmask) | z);
+                self.wr32(z_off, (zcur & !zmask) | z);
             }
         }
 
         // Destination blend.
-        let fbp = pipe.fbp;
-        let dst = self.read_psmct32(fbp, fbw, x, y);
+        let dst = self.rd32(fb_off);
 
         if pipe.abe {
             let (dr, dg, db, da) = (
@@ -409,7 +560,7 @@ impl Gs {
         if pipe.fb24 {
             merged = (merged & 0xFF_FFFF) | (dst & 0xFF00_0000);
         }
-        self.write_psmct32(fbp, fbw, x, y, merged);
+        self.wr32(fb_off, merged);
     }
 
     /// Texture sample as RGBA8 (nearest or bilinear per TEX1 MMAG).
@@ -444,7 +595,7 @@ impl Gs {
         let t10 = self.texel(ti, x0 + 1, y0);
         let t01 = self.texel(ti, x0, y0 + 1);
         let t11 = self.texel(ti, x0 + 1, y0 + 1);
-        lerp_rgba(lerp_rgba(t00, t10, fx), lerp_rgba(t01, t11, fx), fy)
+        bilerp_rgba(t00, t10, t01, t11, fx, fy)
     }
 
     /// One RGBA8 texel at integer texel coordinates, after CLAMP wrapping.
@@ -514,8 +665,29 @@ impl Gs {
     }
 }
 
+/// Per-scanline frame/Z buffer bases (see `layout::row_base32`).
+struct Row {
+    y: u32,
+    fb_base: usize,
+    z_base: usize,
+}
+
+impl Row {
+    #[inline(always)]
+    fn new(pipe: &PixelPipe, y: u32) -> Self {
+        Self {
+            y,
+            fb_base: layout::row_base32(pipe.fbp, pipe.fbw, y, false),
+            z_base: layout::row_base32(pipe.zbp, pipe.fbw, y, true),
+        }
+    }
+}
+
 /// Drawing environment decoded once per primitive (see `pixel_pipe`).
 struct PixelPipe {
+    /// Primitive kind being drawn (PRIM bits 0-2), for the pixel histogram.
+    #[cfg_attr(not(feature = "profile"), allow(dead_code))]
+    kind: u8,
     // Scissor, inclusive pixel bounds.
     scx0: i32,
     scx1: i32,
@@ -610,8 +782,56 @@ fn edge(x0: i32, y0: i32, x1: i32, y1: i32, x: i32, y: i32) -> i64 {
     (x1 - x0) as i64 * (y - y0) as i64 - (y1 - y0) as i64 * (x - x0) as i64
 }
 
+/// Bilinear blend of a 2x2 texel footprint (`t00 t10` top, `t01 t11`
+/// bottom) with weights `wx`, `wy` in 1/256: horizontal lerps first, then
+/// vertical, each truncating to 8 bits like [`lerp_rgba`].
+#[inline(always)]
+fn bilerp_rgba(t00: u32, t10: u32, t01: u32, t11: u32, wx: u32, wy: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is part of the x86-64 baseline.
+        unsafe { bilerp_sse2(t00, t10, t01, t11, wx, wy) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        lerp_rgba(lerp_rgba(t00, t10, wx), lerp_rgba(t01, t11, wx), wy)
+    }
+}
+
+/// Both rows' four channels in eight 16-bit lanes: 255 * 256 fits, and
+/// `mullo` keeps the low 16 bits either way, so the sums are exact.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn bilerp_sse2(t00: u32, t10: u32, t01: u32, t11: u32, wx: u32, wy: u32) -> u32 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 baseline; pure register arithmetic.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let left = _mm_unpacklo_epi8(_mm_set_epi64x(0, (t00 as i64) | ((t01 as i64) << 32)), zero);
+        let right = _mm_unpacklo_epi8(_mm_set_epi64x(0, (t10 as i64) | ((t11 as i64) << 32)), zero);
+        let x = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_mullo_epi16(left, _mm_set1_epi16((256 - wx) as i16)),
+                _mm_mullo_epi16(right, _mm_set1_epi16(wx as i16)),
+            ),
+            8,
+        );
+        let top = x;
+        let bottom = _mm_srli_si128(x, 8);
+        let y = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_mullo_epi16(top, _mm_set1_epi16((256 - wy) as i16)),
+                _mm_mullo_epi16(bottom, _mm_set1_epi16(wy as i16)),
+            ),
+            8,
+        );
+        _mm_cvtsi128_si32(_mm_packus_epi16(y, y)) as u32
+    }
+}
+
 /// Blend two RGBA8 pixels with weight `w` (0..=256) for `b`, all four
 /// channels at once: the R/B and G/A pairs each get 16 bits of headroom.
+#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
     let inv = 256 - w;

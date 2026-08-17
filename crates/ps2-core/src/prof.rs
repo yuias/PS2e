@@ -182,6 +182,18 @@ pub fn step_parts(parts: [u64; 4]) {
     }
 }
 
+#[cfg(feature = "profile")]
+static PIXELS: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+
+/// Record one shaded pixel under a small setup key.
+#[inline(always)]
+pub fn count_pixel(key: usize) {
+    #[cfg(feature = "profile")]
+    PIXELS[key & 4095].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(feature = "profile"))]
+    let _ = key;
+}
+
 /// Record one EE instruction for the profile report.
 #[inline(always)]
 pub fn count_ee(pc: u32, instr: u32) {
@@ -253,6 +265,20 @@ pub fn report() -> Option<String> {
         let mut pcs: Vec<(usize, u64)> =
             pcs().iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
         pcs.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut px: Vec<(usize, u64)> =
+            PIXELS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
+        let px_total: u64 = px.iter().map(|&(_, n)| n).sum::<u64>().max(1);
+        px.sort_by(|a, b| b.1.cmp(&a.1));
+        out.push_str("GS pixels by setup (kind, tme, bilinear, abe, psm):
+");
+        for (k, n) in px.iter().take(16) {
+            out.push_str(&format!(
+                "  kind={} tme={} bil={} abe={} psm={:#04x} {:5.1}%
+",
+                k & 3, (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 0x3F,
+                *n as f64 * 100.0 / px_total as f64
+            ));
+        }
         out.push_str("EE hot words (physical RAM address):
 ");
         for (k, n) in pcs.iter().take(40) {
