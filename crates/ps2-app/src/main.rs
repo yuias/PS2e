@@ -397,6 +397,7 @@ fn run_headless(
         prims = gs.prims_drawn,
         prims_tex = gs.prims_textured,
         pixels = gs.pixels_shaded,
+        prims_split = gs.prims_split,
         pmode = format_args!("{:#x}", sys.bus.gs.pmode),
         dispfb1 = format_args!("{:#x}", sys.bus.gs.dispfb1),
         dispfb2 = format_args!("{:#x}", sys.bus.gs.dispfb2),

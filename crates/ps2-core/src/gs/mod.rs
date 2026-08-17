@@ -116,6 +116,8 @@ pub struct Gs {
     pub prims_textured: u64,
     /// Pixels that entered the shading pipeline (after scissor/coverage).
     pub pixels_shaded: u64,
+    /// Primitives rasterized on the worker pool.
+    pub prims_split: u64,
     /// Texture samples per TEX0 PSM, for bring-up logging.
     pub tex_psm_hist: [u64; 64],
     /// IMAGE transfer formats already reported as unhandled (bit per PSM).
@@ -186,6 +188,7 @@ impl Gs {
             prims_drawn: 0,
             prims_textured: 0,
             pixels_shaded: 0,
+            prims_split: 0,
             tex_psm_hist: [0; 64],
             warned_trx_psm: 0,
             seen_tex0: std::collections::HashSet::new(),

@@ -61,7 +61,7 @@ impl Rows {
 }
 
 /// Pixels a primitive must cover before it is split across threads.
-const PARALLEL_MIN_PIXELS: i64 = 16 * 1024;
+const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a split primitive is cut into.
 const PARALLEL_LANES: usize = 4;
 
@@ -204,20 +204,30 @@ impl Gs {
 
     /// Whether the texture may alias the frame or Z buffer within the rows
     /// drawn (conservative block-range test): such primitives read what
-    /// they write and must stay on one thread.
-    fn texture_aliases_target(pipe: &PixelPipe, rows: i32) -> bool {
+    /// they write and must stay on one thread. `tex_v` is the texel row
+    /// range the primitive samples (`None` = unknown, assume the whole
+    /// declared height).
+    fn texture_aliases_target(pipe: &PixelPipe, rows: i32, tex_v: Option<(f32, f32)>) -> bool {
         if !pipe.tme {
             return false;
         }
         let ti = &pipe.tex;
-        // Row height per page: 32 (32-bit), 64 (16/8-bit), 128 (4-bit).
-        let tex_pages = (ti.th / 32 + 1) * ti.tbw.max(1);
-        let tex = ti.tbp..ti.tbp + tex_pages * 32;
-        let target_pages = ((rows as u32) / 32 + 2) * pipe.fbw.max(1);
+        // Texel rows the primitive can touch: the sampled range (plus one
+        // for the bilinear tap) unless it wraps around the texture.
+        let (v_lo, v_hi) = match tex_v {
+            Some((lo, hi)) if lo >= 0.0 && hi + 1.0 < ti.th as f32 => (lo as u32, hi as u32 + 1),
+            _ => (0, ti.th),
+        };
+        // 32-bit pages are 32 rows tall; the other formats' pages are taller,
+        // so this over-estimates their span (safe side).
+        let tbw = ti.tbw.max(1);
+        let tex = ti.tbp + (v_lo / 32) * tbw * 32..ti.tbp + (v_hi / 32 + 1) * tbw * 32;
+        let target_pages = ((rows as u32).div_ceil(32)) * pipe.fbw.max(1);
         let fb = pipe.fbp..pipe.fbp + target_pages * 32;
         let zb = pipe.zbp..pipe.zbp + target_pages * 32;
         let overlaps = |a: &std::ops::Range<u32>, b: &std::ops::Range<u32>| a.start < b.end && b.start < a.end;
-        overlaps(&tex, &fb) || (pipe.zte && overlaps(&tex, &zb))
+        // Only buffers actually written can feed back.
+        (pipe.fbmsk != u32::MAX && overlaps(&tex, &fb)) || (pipe.zte && !pipe.zmsk && overlaps(&tex, &zb))
     }
 
     pub(super) fn draw_sprite(&mut self) {
@@ -276,7 +286,14 @@ impl Gs {
             v1,
         };
         let (rya, ryb) = (py0.max(pipe.scy0), px_clip(py1).min(pipe.scy1 + 1));
-        self.run_rows(&pipe, rya, ryb, geom.pxb - geom.pxa, |p, rows| p.sprite_rows(&geom, rows));
+        let th = pipe.tex.th as f32;
+        let tex_v = if pipe.fst {
+            (tv0.min(tv1) as f32 / 16.0, tv0.max(tv1) as f32 / 16.0)
+        } else {
+            let (a, b) = (t0 * geom.inv_q * th, t1 * geom.inv_q * th);
+            (a.min(b), a.max(b))
+        };
+        self.run_rows(&pipe, rya, ryb, geom.pxb - geom.pxa, Some(tex_v), |p, rows| p.sprite_rows(&geom, rows));
     }
 
     pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
@@ -338,7 +355,16 @@ impl Gs {
             sb: stq(&b),
             sc: stq(&c),
         };
-        self.run_rows(&pipe, miny, maxy + 1, maxx - minx + 1, |p, rows| p.tri_rows(&geom, rows));
+        let th = pipe.tex.th as f32;
+        let tex_v = if pipe.fst {
+            let vs = [a.v, b.v, c.v];
+            (*vs.iter().min().unwrap() as f32 / 16.0, *vs.iter().max().unwrap() as f32 / 16.0)
+        } else {
+            let tv = |v: &Vertex| v.t / if v.q.abs() < 1e-9 { 1.0 } else { v.q } * th;
+            let (ta, tb, tc) = (tv(&a), tv(&b), tv(&c));
+            (ta.min(tb).min(tc), ta.max(tb).max(tc))
+        };
+        self.run_rows(&pipe, miny, maxy + 1, maxx - minx + 1, Some(tex_v), |p, rows| p.tri_rows(&geom, rows));
     }
 
     /// Rasterize rows `start..end`: on the worker pool in bands when the
@@ -349,15 +375,17 @@ impl Gs {
         start: i32,
         end: i32,
         width: i32,
+        tex_v: Option<(f32, f32)>,
         f: impl Fn(&mut Painter, Rows) + Sync,
     ) {
         let pixels = (end - start).max(0) as i64 * width.max(0) as i64;
-        let split = pixels >= PARALLEL_MIN_PIXELS
-            && self.pool.len() >= PARALLEL_LANES
-            && !Self::texture_aliases_target(pipe, end);
+        let big = pixels >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES;
+        let alias = big && Self::texture_aliases_target(pipe, end, tex_v);
+        let split = big && !alias;
         if split {
             #[cfg(feature = "threads")]
             {
+                self.prims_split += 1;
                 let canvas = &self.canvas;
                 let clut = &self.clut;
                 let (rows, f) = (Rows { start, end, lane: 0, lanes: PARALLEL_LANES }, &f);
