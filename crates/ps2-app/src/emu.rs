@@ -251,7 +251,9 @@ impl Worker {
                     // (mid-write contents included).
                     let disc = self.sys.bus.cdvd.disc.take();
                     let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
+                    let jit = self.sys.jit_enabled();
                     self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
+                    let _ = self.sys.set_jit(jit);
                     self.sys.set_publish_frames(true);
                     self.sys.bus.cdvd.disc = disc;
                     self.sys.bus.sio2.memcard = memcard;

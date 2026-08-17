@@ -36,6 +36,9 @@ pub struct Ps2System {
     pub cycles: u64,
     /// Position within the current video frame, in EE cycles.
     frame_pos: u64,
+    /// EE recompiler; `None` runs the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit: Option<ee::jit::Jit>,
 }
 
 impl Ps2System {
@@ -61,7 +64,41 @@ impl Ps2System {
             bus: Bus::new(bios, gs_threaded),
             cycles: 0,
             frame_pos: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: Some(ee::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?),
         })
+    }
+
+    /// Enable or disable the EE recompiler (a no-op without the `jit`
+    /// feature). The interpreter and the recompiler are interchangeable
+    /// at any instruction boundary.
+    pub fn set_jit(&mut self, on: bool) -> Result<(), String> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            if on && self.jit.is_none() {
+                self.jit =
+                    Some(ee::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?);
+            } else if !on {
+                self.jit = None;
+            }
+            Ok(())
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            if on { Err("built without the jit feature".into()) } else { Ok(()) }
+        }
+    }
+
+    /// Whether the EE recompiler is active.
+    pub fn jit_enabled(&self) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.jit.is_some()
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            false
+        }
     }
 
     /// Execute one EE instruction, stepping the IOP at the 8:1 clock ratio.
@@ -75,6 +112,13 @@ impl Ps2System {
         if !self.ee.idle {
             self.ee.step(&mut self.bus);
         }
+        self.machine_cycle();
+    }
+
+    /// Everything but the EE for one cycle: the IOP slot, timers, vblank
+    /// edges, and the idle wake-up check.
+    #[inline]
+    fn machine_cycle(&mut self) {
         let mut event = false;
         // 1 cycle per instruction for now; wait states and dual-issue
         // approximation come later.
@@ -112,15 +156,29 @@ impl Ps2System {
 
     /// Run for approximately `cycles` EE cycles.
     ///
-    /// Same sequence as repeated [`Ps2System::step`], but the eight EE cycles
-    /// between IOP slots are grouped so the per-cycle checks (`%`, vblank
-    /// edge, wake-up) are hoisted, and an idle EE skips a whole group at
-    /// once when no vblank edge falls inside it.
+    /// With the recompiler, whole blocks retire before the rest of the
+    /// machine catches up by the same number of cycles. Without it (or
+    /// while the EE idles) the sequence is that of repeated
+    /// [`Ps2System::step`], but the eight EE cycles between IOP slots are
+    /// grouped so the per-cycle checks (`%`, vblank edge, wake-up) are
+    /// hoisted, and an idle EE skips a whole group at once when no vblank
+    /// edge falls inside it.
     pub fn run(&mut self, cycles: u64) {
         // One EE scope per slice: nested IOP/timer/DMA scopes hand back here.
         let _g = prof::scope(prof::Slot::Ee);
         let target = self.cycles + cycles;
         while self.cycles < target {
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if !self.ee.idle
+                && let Some(jit) = &mut self.jit
+            {
+                self.bus.now = self.cycles;
+                let n = jit.run(&mut self.ee, &mut self.bus);
+                for _ in 0..n {
+                    self.machine_cycle();
+                }
+                continue;
+            }
             if !self.cycles.is_multiple_of(EE_PER_IOP) || target - self.cycles < EE_PER_IOP {
                 self.step();
                 continue;

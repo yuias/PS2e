@@ -45,6 +45,8 @@ struct Args {
     wait_debugger: bool,
     /// Run the GS renderer on the emulation thread instead of its worker.
     gs_inline: bool,
+    /// Interpret the EE instead of recompiling it.
+    no_jit: bool,
     /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
@@ -92,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
         debug_iop: None,
         wait_debugger: false,
         gs_inline: false,
+        no_jit: false,
         presses: Vec::new(),
         memcard: None,
         disc: None,
@@ -131,6 +134,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--wait-debugger" => args.wait_debugger = true,
             "--gs-inline" => args.gs_inline = true,
+            "--no-jit" => args.no_jit = true,
             "--press" => args
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
@@ -155,6 +159,7 @@ fn parse_args() -> Result<Args, String> {
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
                      --gs-inline      render on the emulation thread (no GS worker)\n\
+                     --no-jit         interpret the EE instead of recompiling it\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
@@ -216,6 +221,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.no_jit && let Err(e) = sys.set_jit(false) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let debugger = match (args.debug_ee, args.debug_iop) {
         (None, None) => None,

@@ -969,6 +969,12 @@ pub struct Bus {
     ee_tlb: [(u32, u32, u32, u32); 48],
     /// (vaddr page | 1) -> phys page; 0 = invalid slot.
     tlb_cache: Box<[(u32, u32)]>,
+    /// RAM pages (4 KiB) holding recompiled code; a write to one queues it
+    /// in `dirty_code_pages` for the recompiler to drop its blocks.
+    pub(crate) code_pages: Box<[bool]>,
+    pub(crate) dirty_code_pages: Vec<u32>,
+    /// A TLB rewrite invalidated every recompiled block.
+    pub(crate) jit_flush_needed: bool,
     /// Instruction-fetch page cache: virtual page tag and its RAM offset
     /// (tag 1 never matches an aligned page).
     fetch_tag: u32,
@@ -1033,6 +1039,9 @@ impl Bus {
             warned_unmapped: HashSet::new(),
             ee_tlb: [(0, 0, 0, 0); 48],
             tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
+            code_pages: vec![false; RAM_SIZE >> 12].into_boxed_slice(),
+            dirty_code_pages: Vec::new(),
+            jit_flush_needed: false,
             fetch_tag: 1,
             fetch_base: 0,
             dma_irq_queue: Vec::new(),
@@ -1050,6 +1059,25 @@ impl Bus {
             self.ee_tlb[idx] = (mask, hi, lo0, lo1);
             self.tlb_cache.fill((0, 0));
             self.fetch_tag = 1;
+            // Blocks were keyed by virtual pc under the old mapping.
+            self.jit_flush_needed = true;
+        }
+    }
+
+    /// RAM page a virtual EE address maps to, if it maps to RAM at all.
+    pub fn ram_page_of(&mut self, vaddr: u32) -> Option<u32> {
+        let phys = self.translate(vaddr);
+        ((phys as usize) < RAM_SIZE).then_some(phys >> 12)
+    }
+
+    /// A physical RAM address was written: if recompiled code lives on its
+    /// page, queue the page for invalidation (once per compile).
+    #[inline(always)]
+    fn note_ram_write(&mut self, addr: usize) {
+        let page = addr >> 12;
+        if self.code_pages[page] {
+            self.code_pages[page] = false;
+            self.dirty_code_pages.push(page as u32);
         }
     }
 
@@ -1185,7 +1213,10 @@ impl Bus {
     pub fn poke8(&mut self, vaddr: u32, v: u8) -> bool {
         let addr = self.translate(vaddr);
         match addr {
-            0x0000_0000..=0x01FF_FFFF => self.ram[addr as usize] = v,
+            0x0000_0000..=0x01FF_FFFF => {
+                self.ram[addr as usize] = v;
+                self.note_ram_write(addr as usize);
+            }
             0x7000_0000..=0x7000_3FFF => self.spad[(addr & 0x3FFF) as usize] = v,
             0x1C00_0000..=0x1C1F_FFFF => self.iop_ram[(addr & 0x1F_FFFF) as usize] = v,
             _ => return false,
@@ -1272,7 +1303,10 @@ impl Bus {
     fn write<const N: usize>(&mut self, vaddr: u32, v: u64) {
         let addr = self.translate(vaddr);
         match addr {
-            0x0000_0000..=0x01FF_FFFF => write_le::<N>(&mut self.ram, addr as usize, v),
+            0x0000_0000..=0x01FF_FFFF => {
+                write_le::<N>(&mut self.ram, addr as usize, v);
+                self.note_ram_write(addr as usize);
+            }
             0x7000_0000..=0x7000_3FFF => write_le::<N>(&mut self.spad, (addr & 0x3FFF) as usize, v),
             0x1000_0000..=0x1000_FFFF => self.write_mmio::<N>(addr, v),
             0x1100_8000..=0x1100_BFFF => {
@@ -2206,6 +2240,7 @@ impl Bus {
                     let w = self.sif.fifo0.pop_front().unwrap();
                     if a + 16 <= RAM_SIZE {
                         write_le::<4>(&mut self.ram, a + i * 4, w as u64);
+                        self.note_ram_write(a);
                     }
                 }
                 self.dma_sif0.madr = self.dma_sif0.madr.wrapping_add(16);

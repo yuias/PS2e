@@ -7,6 +7,8 @@
 
 pub mod cop0;
 pub mod fpu;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub mod jit;
 
 use crate::bus::Bus;
 use cop0::Cop0;
@@ -174,6 +176,23 @@ impl Cpu {
     }
 
     // --- main loop -------------------------------------------------------
+
+    /// Execute one already-fetched instruction as if stepped at `addr`
+    /// (used by the recompiler for instructions it does not translate).
+    /// Returns true when control was diverted: a branch was taken or
+    /// skipped (likely form), an exception entered, or the idle loop was
+    /// recognised — the caller must then let [`Cpu::step`] finish the
+    /// pending delay slot before continuing at `pc`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(super) fn exec_at(&mut self, bus: &mut Bus, addr: u32, instr: u32) -> bool {
+        self.current_pc = addr;
+        self.in_delay = false;
+        self.next_is_delay = false;
+        self.pc = addr.wrapping_add(4);
+        self.next_pc = addr.wrapping_add(8);
+        self.execute(instr, bus);
+        self.next_is_delay || self.pc != addr.wrapping_add(4) || self.idle
+    }
 
     /// Whether an interrupt would be taken at the next step. Also used to
     /// end an idle-loop skip.
