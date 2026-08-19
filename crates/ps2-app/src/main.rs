@@ -14,6 +14,7 @@
 
 mod audio;
 mod config;
+mod display;
 mod emu;
 mod pad;
 mod ui;
@@ -321,6 +322,8 @@ fn run_windowed(
                 volume: cfg.volume,
             };
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
+            let render_state = cc.wgpu_render_state.as_ref().expect("the wgpu renderer is selected");
+            display::init(render_state);
             Ok(Box::new(ui::App::new(emu, cfg, cfg_path)))
         }),
     );

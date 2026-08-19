@@ -21,6 +21,10 @@ const DEFAULT_TEMPLATE: &str = r#"# PS2e configuration
 # Master volume, 0.0 .. 1.0
 volume = 0.5
 
+# Display scaler: "nearest", "linear", "sharp" (nearest to an integer
+# multiple, then linear) or "lanczos".
+scaler = "sharp"
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -32,6 +36,7 @@ pub struct Config {
     pub bios: Option<PathBuf>,
     pub volume: f32,
     pub memcard: Option<PathBuf>,
+    pub scaler: crate::display::ScaleMode,
 }
 
 impl Default for Config {
@@ -40,6 +45,7 @@ impl Default for Config {
             bios: None,
             volume: 0.5,
             memcard: None,
+            scaler: crate::display::ScaleMode::Sharp,
         }
     }
 }

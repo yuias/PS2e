@@ -78,9 +78,11 @@ pub struct Status {
 /// Latest composited display frame (see [`Ps2System::framebuffer`]).
 #[derive(Default)]
 pub struct FrameSnapshot {
-    pub rgba: Vec<u8>,
+    pub rgba: std::sync::Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    /// Bumped on every new frame so the display can skip re-uploads.
+    pub seq: u64,
 }
 
 /// State published by the worker and inputs fed back by the UI.
@@ -319,7 +321,8 @@ impl Worker {
                 let mut f = self.shared.frame.lock().unwrap();
                 f.width = w;
                 f.height = h;
-                f.rgba = rgba;
+                f.rgba = std::sync::Arc::new(rgba);
+                f.seq = f.seq.wrapping_add(1);
             }
             self.ctx.request_repaint();
         }

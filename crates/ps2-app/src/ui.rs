@@ -5,7 +5,7 @@
 //! is deliberate — a wasm frontend could reuse the same snapshot types.
 
 use crate::config::Config;
-use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
+use crate::emu::{Command, DebuggerState, Emu};
 use crate::pad;
 use eframe::egui;
 use std::path::PathBuf;
@@ -49,8 +49,7 @@ const COP0_EPC: usize = 14;
 
 pub struct App {
     emu: Emu,
-    display_tex: Option<egui::TextureHandle>,
-    linear_filter: bool,
+    scale_mode: crate::display::ScaleMode,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
     config: Config,
@@ -65,8 +64,7 @@ impl App {
         let volume = config.volume.clamp(0.0, 1.0);
         Self {
             emu,
-            display_tex: None,
-            linear_filter: false,
+            scale_mode: config.scaler,
             volume,
             config,
             config_path,
@@ -104,21 +102,13 @@ impl Drop for App {
     /// card itself when it stops.)
     fn drop(&mut self) {
         if let Some(path) = &self.config_path
-            && (self.config.volume - self.volume).abs() > f32::EPSILON
+            && ((self.config.volume - self.volume).abs() > f32::EPSILON || self.config.scaler != self.scale_mode)
         {
             self.config.volume = self.volume;
+            self.config.scaler = self.scale_mode;
             self.config.save(path);
         }
     }
-}
-
-/// Convert a framebuffer snapshot (already RGBA8) to an egui image.
-fn frame_image(frame: &FrameSnapshot) -> egui::ColorImage {
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    if frame.rgba.len() < w * h * 4 {
-        return egui::ColorImage::default(); // no frame captured yet
-    }
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &frame.rgba)
 }
 
 impl eframe::App for App {
@@ -175,7 +165,13 @@ impl eframe::App for App {
                     });
                 }
                 ui.separator();
-                ui.checkbox(&mut self.linear_filter, "Linear filter");
+                egui::ComboBox::from_label("Scaler")
+                    .selected_text(self.scale_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in crate::display::ScaleMode::ALL {
+                            ui.selectable_value(&mut self.scale_mode, mode, mode.label());
+                        }
+                    });
                 ui.separator();
                 ui.checkbox(&mut self.show_tty, "TTY");
                 ui.checkbox(&mut self.show_regs, "Registers");
@@ -292,38 +288,32 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let (width, height, image) = {
+            let (width, height, rgba, seq) = {
                 let frame = self.emu.shared.frame.lock().unwrap();
-                (frame.width, frame.height, frame_image(&frame))
+                (frame.width, frame.height, frame.rgba.clone(), frame.seq)
             };
             if width == 0 || height == 0 {
                 ui.centered_and_justified(|ui| ui.label("waiting for a frame..."));
                 return;
             }
-            let filter = if self.linear_filter {
-                egui::TextureOptions::LINEAR
-            } else {
-                egui::TextureOptions::NEAREST
-            };
-            let tex = match &mut self.display_tex {
-                Some(t) => {
-                    t.set(image, filter);
-                    t.clone()
-                }
-                None => {
-                    let t = ui.ctx().load_texture("display", image, filter);
-                    self.display_tex = Some(t.clone());
-                    t
-                }
-            };
             // Fit the panel while keeping the framebuffer's own aspect ratio.
             let avail = ui.available_size();
             let aspect = width as f32 / height as f32;
             let scale = (avail.x / aspect).min(avail.y);
             let size = egui::Vec2::new(scale * aspect, scale);
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(&tex).fit_to_exact_size(size));
-            });
+            let rect = egui::Rect::from_center_size(ui.available_rect_before_wrap().center(), size);
+            let ppp = ui.ctx().pixels_per_point();
+            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+                rect,
+                crate::display::DisplayCallback {
+                    rgba,
+                    width,
+                    height,
+                    seq,
+                    mode: self.scale_mode,
+                    dst_size: [size.x * ppp, size.y * ppp],
+                },
+            ));
         });
     }
 }
