@@ -63,6 +63,9 @@ struct Core {
     adma_pending: std::collections::VecDeque<Vec<u8>>,
     /// Ring halves holding data not yet played out.
     adma_filled: [bool; 2],
+    /// Ring half the next AutoDMA block is written to; blocks land in
+    /// stream order, alternating halves.
+    adma_write: usize,
     /// IRQA was hit and the flag is latched until IRQ enable is dropped.
     irq_flag: bool,
     /// AutoDMA input read position (0..0x200 halfwords into the L/R areas).
@@ -274,7 +277,22 @@ impl Spu2 {
                     voice.lsax_pinned = true;
                 }
             }
-            REG_MMIX | REG_ADMAS | 0x188 | 0x18C | 0x190 | 0x194 => {
+            REG_ADMAS => {
+                debug!(target: "ps2_core::spu2", core, value = format_args!("{v:#06x}"), "ADMAS");
+                let was = self.adma_enabled(core);
+                self.set_reg16(off, v);
+                if !was && self.adma_enabled(core) {
+                    // A fresh stream plays from the top of the ring so the
+                    // first block is heard first and the writer stays one
+                    // half ahead of the reader.
+                    let c = &mut self.cores[core];
+                    c.adma_pending.clear();
+                    c.adma_filled = [false; 2];
+                    c.adma_write = 0;
+                    c.adma_pos = 0;
+                }
+            }
+            REG_MMIX | 0x188 | 0x18C | 0x190 | 0x194 => {
                 debug!(target: "ps2_core::spu2", core, reg = format_args!("{local:#x}"), value = format_args!("{v:#06x}"), "mix control");
                 self.set_reg16(off, v);
             }
@@ -339,14 +357,14 @@ impl Spu2 {
         self.reg16(REG_ADMAS + core * 0x400) & (1 << core) != 0
     }
 
-    /// Move pending AutoDMA blocks into free ring halves: the half the read
-    /// position is not in first, so a fresh stream starts within 256
-    /// samples, then whichever half playback has left.
+    /// Move pending AutoDMA blocks into the ring, in stream order, as long
+    /// as the write half is free (played out). Writing into the half being
+    /// played only happens when the stream has run dry, as on hardware.
     fn adma_fill(&mut self, core: usize) {
-        let playing = self.cores[core].adma_pos >> 8;
-        for half in [playing ^ 1, playing] {
+        loop {
+            let half = self.cores[core].adma_write;
             if self.cores[core].adma_filled[half] {
-                continue;
+                return;
             }
             let Some(block) = self.cores[core].adma_pending.pop_front() else {
                 return;
@@ -358,34 +376,48 @@ impl Spu2 {
             let (l, r) = block.split_at(block.len().min(512));
             self.ram[base..base + l.len()].copy_from_slice(l);
             self.ram[base + 0x400..base + 0x400 + r.len()].copy_from_slice(r);
-            self.cores[core].adma_filled[half] = true;
+            let c = &mut self.cores[core];
+            c.adma_filled[half] = true;
+            c.adma_write = half ^ 1;
         }
+    }
+
+    /// EE cycle at which the last queued AutoDMA block lands in the ring:
+    /// each waiting block needs one more half boundary of playback. That
+    /// is when the transfer completes from the IOP's point of view, which
+    /// paces the stream at exactly the playback rate.
+    fn adma_due(&self, core: usize, now: u64) -> u64 {
+        let c = &self.cores[core];
+        let waiting = c.adma_pending.len() as u64;
+        if waiting == 0 {
+            return now + EE_CYCLES_PER_SAMPLE;
+        }
+        let until_boundary = ADMA_BLOCK_SAMPLES - (c.adma_pos as u64 & (ADMA_BLOCK_SAMPLES - 1));
+        // One sample of slack so the boundary sample is mixed (and the
+        // block written) before the completion is seen.
+        now + (until_boundary + (waiting - 1) * ADMA_BLOCK_SAMPLES + 1) * EE_CYCLES_PER_SAMPLE
     }
 
     /// Kick a DMA on `core`: `data` is copied into sound RAM (`to_spu`) or
     /// filled from it. Returns the EE cycle at which the transfer completes;
-    /// the caller raises the IOP DMA interrupt then. AutoDMA blocks are
-    /// paced at playback speed, plain transfers at bus speed; a kick while
-    /// the previous transfer is still in flight queues behind it.
+    /// the caller raises the IOP DMA interrupt then. AutoDMA completes when
+    /// playback has made room for the last block, plain transfers run at
+    /// bus speed; a plain kick while the previous transfer is still in
+    /// flight queues behind it.
     pub fn dma(&mut self, core: usize, to_spu: bool, data: &mut [u8], now: u64) -> u64 {
         let bytes = data.len() as u64;
-        let start_at = self.cores[core].dma_due.map_or(now, |due| due.max(now));
         let due = if to_spu && self.adma_enabled(core) {
-            // Each 1 KiB block: 512 bytes left then 512 bytes right, into
-            // the core's input area (L 0x2000/R 0x2200 halfwords, +0x400
-            // for core 1), alternating buffer halves.
             // Blocks land in the ring as halves free up (the hardware
             // transfers behind the read position); writing them all at kick
-            // time overwrote the half being played and clicked every 512
-            // samples. See `adma_fill`.
+            // time overwrote the half being played. See `adma_fill`.
             for block in data.chunks(ADMA_BLOCK_BYTES as usize) {
                 self.cores[core].adma_pending.push_back(block.to_vec());
             }
             self.adma_fill(core);
-            let blocks = bytes.div_ceil(ADMA_BLOCK_BYTES);
             debug!(target: "ps2_core::spu2", core, bytes, "ADMA block(s) queued");
-            start_at + blocks * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE
+            self.adma_due(core, now)
         } else {
+            let start_at = self.cores[core].dma_due.map_or(now, |due| due.max(now));
             let start = self.cores[core].tsa;
             if to_spu {
                 for pair in data.chunks(2) {
@@ -602,8 +634,49 @@ mod tests {
     fn adma_paces_at_playback_rate() {
         let mut spu = Spu2::new();
         spu.write::<2>(REG_ADMAS, 1);
+        // Both halves free: a 2-block kick lands at once.
         let mut data = vec![0u8; 2048];
         let due = spu.dma(0, true, &mut data, 0);
-        assert_eq!(due, 2 * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE);
+        assert_eq!(due, EE_CYCLES_PER_SAMPLE);
+        // The next kick waits for playback to free both halves: the second
+        // block lands at the second boundary.
+        let due = spu.dma(0, true, &mut data, 0);
+        assert_eq!(due, (2 * ADMA_BLOCK_SAMPLES + 1) * EE_CYCLES_PER_SAMPLE);
+    }
+
+    #[test]
+    fn adma_plays_blocks_in_order() {
+        let mut spu = Spu2::new();
+        spu.write::<2>(REG_ADMAS, 1);
+        spu.write::<2>(REG_MMIX, u32::from(MMIX_INPUT_DRY));
+        spu.write::<2>(REG_MVOL, 0x3FFF);
+        spu.write::<2>(REG_MVOL + 2, 0x3FFF);
+        // BVOL for core 0 and AVOL on core 1 (core 0 feeds core 1's input).
+        spu.write::<2>(REG_MVOL + 12, 0x7FFF);
+        spu.write::<2>(REG_MVOL + 14, 0x7FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 8, 0x7FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 10, 0x7FFF);
+        // Block k carries the constant sample (k+1)*1000 on both channels.
+        let block = |k: i16| -> Vec<u8> { (0..512).flat_map(|_| ((k + 1) * 1000).to_le_bytes()).collect() };
+        let mut now = 0;
+        let mut expect = vec![];
+        for k in 0..8i16 {
+            let mut data: Vec<u8> = [block(2 * k), block(2 * k + 1)].concat();
+            let due = spu.dma(0, true, &mut data, now);
+            // The IOP re-arms from the completion interrupt, a little late.
+            now = due + 3000;
+            spu.tick(now);
+            expect.extend([(2 * k + 1) * 1000, (2 * k + 2) * 1000]);
+        }
+        spu.tick(now + 16 * ADMA_BLOCK_SAMPLES * EE_CYCLES_PER_SAMPLE);
+        let out = spu.take_output();
+        // Left channel, at 256-sample block boundaries: every block
+        // appears once, in order, and no sample inside a block is stale.
+        for (i, s) in out.iter().step_by(2).take(16 * 256).enumerate() {
+            // Volumes: 0x7FFF/0x8000 twice then MVOL 0x7FFE/0x8000, so
+            // about 0.3% below the input.
+            let want = expect[i / 256];
+            assert!((s - want).abs() <= want / 200 + 1, "sample {i}: {s} vs {want}");
+        }
     }
 }
