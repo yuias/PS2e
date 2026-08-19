@@ -1631,6 +1631,11 @@ impl Bus {
                 self.iop_dma_irq(if core == 0 { 4 } else { 7 });
             }
         }
+        // A voice crossing IRQA during the mix raises the line here, not
+        // only at the next register access.
+        if self.spu2.take_irq() {
+            self.iop_i_stat |= 1 << 9;
+        }
         self.intc_stat |= self.timers.check_irqs(self.now);
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
