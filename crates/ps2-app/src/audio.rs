@@ -16,8 +16,10 @@ pub struct Audio {
 
 impl Audio {
     /// Open the default output device. Returns None (with a log) when no
-    /// device is available so the emulator still runs silent.
-    pub fn new() -> Option<Self> {
+    /// device is available so the emulator still runs silent. `target` is
+    /// the queue depth (stereo frames) the pacer tries to hold: below it
+    /// playback slows down gracefully instead of starving.
+    pub fn new(target: usize) -> Option<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let config = device.default_output_config().ok()?;
@@ -31,7 +33,7 @@ impl Audio {
         // SPU2 produces 48000 Hz stereo; when the device rate differs,
         // linearly interpolate between consecutive source frames (zero-order
         // hold at a non-integer ratio is audibly rough).
-        let step = 48_000.0 / sample_rate as f64;
+        let base_step = 48_000.0 / sample_rate as f64;
         let mut pos = 0.0f64;
         let mut prev = (0i16, 0i16);
         let mut cur = (0i16, 0i16);
@@ -42,6 +44,13 @@ impl Audio {
                 move |data: &mut [f32], _| {
                     let mut q = q.lock().unwrap();
                     let mut starved = false;
+                    // Dynamic rate control: while the queue holds roughly the
+                    // target, consume at the nominal rate; as it drains (the
+                    // machine is running slower than real time) consume more
+                    // slowly, down to 0.7x, so a slow stretch plays lower
+                    // rather than in pieces.
+                    let fill = (q.len() / 2) as f64 / target.max(1) as f64;
+                    let step = base_step * if fill < 0.75 { (1.0 - (0.75 - fill) * 0.6).max(0.7) } else { 1.0 };
                     for frame in data.chunks_mut(channels) {
                         pos += step;
                         while pos >= 1.0 {

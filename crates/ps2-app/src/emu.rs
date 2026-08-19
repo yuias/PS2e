@@ -199,7 +199,7 @@ impl Worker {
     }
 
     fn run(mut self) {
-        self.audio = Audio::new();
+        self.audio = Audio::new(AUDIO_TARGET);
         // Frames come from the GS worker's vblank composite; asking the
         // renderer directly would stall emulation until it caught up.
         self.sys.set_publish_frames(true);
