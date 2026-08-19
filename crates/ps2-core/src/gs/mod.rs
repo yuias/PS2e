@@ -134,6 +134,9 @@ pub struct Gs {
     pool: Vec<raster::Scratch>,
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
+    /// Per-pixel motion flags of the last composited frame (see
+    /// [`Deinterlace::Adaptive`]), one byte per pixel of `woven`.
+    motion: Vec<u8>,
     woven_dims: (u32, u32),
     /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
     /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
@@ -201,6 +204,7 @@ impl Gs {
                 Vec::new()
             },
             woven: Vec::new(),
+            motion: Vec::new(),
             woven_dims: (0, 0),
             clut: Box::new([0; 512]),
             clut_key: u64::MAX,
@@ -768,23 +772,81 @@ impl Gs {
     /// this field's lines land on rows of parity `field`, the other rows
     /// keep the previous field. Bobbing each field alone would show the
     /// game's half-line field offset as a 30 Hz shake.
-    pub fn framebuffer_woven(&mut self, field: bool) -> (u32, u32, Vec<u8>) {
+    pub fn framebuffer_woven(&mut self, field: bool, mode: Deinterlace) -> (u32, u32, Vec<u8>) {
         let (w, h, view) = self.display_view();
         if !view.field_buffer {
             return self.framebuffer();
         }
         if self.woven_dims != (w, h) {
             self.woven = vec![0u8; (w * h * 4) as usize];
+            self.motion = vec![0u8; (w * h) as usize];
             self.woven_dims = (w, h);
         }
         let mut woven = std::mem::take(&mut self.woven);
+        let mut motion = std::mem::take(&mut self.motion);
+        let stride = (w * 4) as usize;
+        // The new field lands on its rows; the other rows keep the previous
+        // field. Motion is the change against the same field two vblanks
+        // ago, which is exactly what those rows held until now.
+        let mut line = vec![0u8; stride];
         for sy in 0..h / 2 {
             let y = sy * 2 + field as u32;
-            self.scan_line(&view, sy, &mut woven[(y * w * 4) as usize..][..(w * 4) as usize]);
+            self.scan_line(&view, sy, &mut line);
+            let row = &mut woven[y as usize * stride..][..stride];
+            if mode == Deinterlace::Adaptive {
+                let flags = &mut motion[(y * w) as usize..][..w as usize];
+                for (x, f) in flags.iter_mut().enumerate() {
+                    let (a, b) = (&row[x * 4..x * 4 + 3], &line[x * 4..x * 4 + 3]);
+                    let diff: u32 = a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum();
+                    *f = u8::from(diff > MOTION_THRESHOLD);
+                }
+            }
+            row.copy_from_slice(&line);
         }
-        let out = woven.clone();
+        let mut out = woven.clone();
+        match mode {
+            Deinterlace::Weave => {}
+            Deinterlace::Bob => {
+                // Only the new field is real: rebuild the other rows from it.
+                for y in (0..h).filter(|y| (y & 1 != 0) != field) {
+                    Self::interpolate_row(&woven, &mut out, w, h, y, None);
+                }
+            }
+            Deinterlace::Adaptive => {
+                // Keep the old field where nothing moved, interpolate the new
+                // one where either neighbouring new row changed.
+                for y in (0..h).filter(|y| (y & 1 != 0) != field) {
+                    Self::interpolate_row(&woven, &mut out, w, h, y, Some(&motion));
+                }
+            }
+        }
         self.woven = woven;
+        self.motion = motion;
         (w, h, out)
+    }
+
+    /// Fill row `y` of `out` from the rows above and below in `woven` (the
+    /// current field), everywhere or only where `motion` flags either of
+    /// them.
+    fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<&[u8]>) {
+        let stride = (w * 4) as usize;
+        let above = y.saturating_sub(1);
+        let below = (y + 1).min(h - 1);
+        // Edge rows have one real neighbour only.
+        let (above, below) = if y == 0 { (below, below) } else if y == h - 1 { (above, above) } else { (above, below) };
+        let (ra, rb) = (&woven[above as usize * stride..][..stride], &woven[below as usize * stride..][..stride]);
+        let row = &mut out[y as usize * stride..][..stride];
+        for x in 0..w as usize {
+            if let Some(m) = motion {
+                let moved = m[(above * w) as usize + x] | m[(below * w) as usize + x];
+                if moved == 0 {
+                    continue;
+                }
+            }
+            for c in 0..4 {
+                row[x * 4 + c] = ((ra[x * 4 + c] as u16 + rb[x * 4 + c] as u16 + 1) >> 1) as u8;
+            }
+        }
     }
 
     /// Decode PMODE/DISPFB/DISPLAY into what the read circuit shows.
@@ -856,6 +918,22 @@ pub(super) struct TexRow {
     pub data: Vec<u32>,
 }
 
+/// How interlaced field buffers are shown (see [`Gs::framebuffer_woven`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Deinterlace {
+    /// Latest two fields interleaved: full detail, combs on motion.
+    #[default]
+    Weave,
+    /// Latest field only, the other rows interpolated from it: no combing,
+    /// half the vertical detail.
+    Bob,
+    /// Weave where nothing moved, bob where it did.
+    Adaptive,
+}
+
+/// Summed RGB difference above which a pixel counts as moving.
+const MOTION_THRESHOLD: u32 = 24;
+
 /// Read-circuit parameters for scanout.
 struct DisplayView {
     fbp: u32,
@@ -869,6 +947,51 @@ struct DisplayView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Interlaced field buffers: weave keeps both fields, bob rebuilds the
+    /// other rows from the new field, adaptive does so only where the new
+    /// field differs from the one two vblanks ago.
+    #[test]
+    fn deinterlace_modes() {
+        let mut gs = Gs::new();
+        // 64x8 display (4 lines per field), field buffer at bp 0, PSMCT32,
+        // PMODE circuit 1, SMODE2 INT+FFMD.
+        gs.priv_write(0x0000, 1);
+        gs.priv_write(0x0020, 3);
+        gs.priv_write(0x0070, 1 << 9); // fbw 1
+        gs.priv_write(0x0080, (63u64 << 32) | (7u64 << 44)); // 64x8
+        let fill = |gs: &mut Gs, v: u32| {
+            for y in 0..4 {
+                for x in 0..64 {
+                    gs.write_psmct32(0, 1, x, y, v);
+                }
+            }
+        };
+        let px = |f: &[u8], w: u32, x: u32, y: u32| f[((y * w + x) * 4) as usize];
+        // Field 0 = 0x10, field 1 = 0x20, then field 0 again = 0x30 (moved).
+        fill(&mut gs, 0x10);
+        let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Weave);
+        assert_eq!(px(&f, 64, 5, 0), 0x10);
+        fill(&mut gs, 0x20);
+        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Weave);
+        assert_eq!((px(&f, 64, 5, 0), px(&f, 64, 5, 1)), (0x10, 0x20));
+        fill(&mut gs, 0x30);
+        let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Weave);
+        assert_eq!((px(&f, 64, 5, 0), px(&f, 64, 5, 1)), (0x30, 0x20));
+        // Bob on field 1 (0x40): even rows become the average of odd rows.
+        fill(&mut gs, 0x40);
+        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Bob);
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x40, 0x40));
+        // Adaptive: field 0 moves (0x30 -> 0x50) so the odd rows (0x40) are
+        // replaced by interpolation of the new even rows; then a still
+        // field 1 (0x40 again) keeps the woven even rows.
+        fill(&mut gs, 0x50);
+        let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Adaptive);
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x50));
+        fill(&mut gs, 0x40);
+        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Adaptive);
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x40));
+    }
 
     /// Full-screen textured sprite copying one 640x224 buffer into another
     /// (Amagami's OP does this to build a refraction source).

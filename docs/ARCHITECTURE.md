@@ -73,7 +73,9 @@ Planned crates:
    VU1 timing, SPU2 sweep volumes, reverb input/output resampling FIRs.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
    keyboard pad input, menu/status bar, TTY and register panels, F11
-   fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest)
+   fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest),
+   selectable deinterlacing of field-buffer output (weave / bob /
+   motion-adaptive, composited at vblank on the GS thread)
    and audio rate control that slows playback instead of starving when
    the machine lags (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel

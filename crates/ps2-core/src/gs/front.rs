@@ -69,9 +69,9 @@ enum Cmd {
     /// Privileged display register (PMODE, DISPFB, ...), kept in order
     /// with the drawing that precedes it.
     Priv(u32, u64),
-    /// Vertical blank with the field now displayed: weave the display into
-    /// the shared frame slot.
-    Vblank(bool),
+    /// Vertical blank with the field now displayed and the deinterlace
+    /// mode: composite the display into the shared frame slot.
+    Vblank(bool, super::Deinterlace),
     /// Reply with the current display (after draining).
     Frame(std::sync::mpsc::SyncSender<Frame>),
     /// Reply with a copy of VRAM.
@@ -124,6 +124,8 @@ pub struct GsFront {
     latest_frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     /// Composite at every vblank so [`GsFront::latest_frame`] stays fresh.
     publish_frames: bool,
+    /// How the published frame treats interlaced field buffers.
+    pub deinterlace: super::Deinterlace,
 }
 
 impl Default for GsFront {
@@ -206,6 +208,7 @@ impl GsFront {
             intc_pending: false,
             latest_frame: Default::default(),
             publish_frames: false,
+            deinterlace: super::Deinterlace::default(),
         }
     }
 
@@ -215,8 +218,8 @@ impl GsFront {
             Cmd::Reg(reg, v) => gs.write_reg(reg, v),
             Cmd::Image(data) => gs.image(&data),
             Cmd::Priv(addr, v) => gs.priv_write(addr, v),
-            Cmd::Vblank(field) => {
-                let frame = gs.framebuffer_woven(field);
+            Cmd::Vblank(field, mode) => {
+                let frame = gs.framebuffer_woven(field, mode);
                 *latest.lock().unwrap() = Some(frame);
             }
             Cmd::Frame(reply) => {
@@ -364,7 +367,7 @@ impl GsFront {
         self.csr ^= 1 << 13;
         self.raise_int(3);
         if self.publish_frames {
-            self.push(Cmd::Vblank(self.csr & (1 << 13) != 0));
+            self.push(Cmd::Vblank(self.csr & (1 << 13) != 0, self.deinterlace));
         }
         self.flush();
     }

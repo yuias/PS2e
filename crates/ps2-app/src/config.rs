@@ -25,6 +25,10 @@ volume = 0.5
 # multiple, then linear) or "lanczos".
 scaler = "sharp"
 
+# Interlaced output: "weave" (both fields, combs on motion), "bob" (latest
+# field only) or "adaptive" (weave where still, bob where moving).
+deinterlace = "adaptive"
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -37,6 +41,37 @@ pub struct Config {
     pub volume: f32,
     pub memcard: Option<PathBuf>,
     pub scaler: crate::display::ScaleMode,
+    pub deinterlace: DeinterlaceSetting,
+}
+
+/// Config/UI form of [`ps2_core::gs::Deinterlace`].
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum DeinterlaceSetting {
+    Weave,
+    Bob,
+    Adaptive,
+}
+
+impl DeinterlaceSetting {
+    pub const ALL: [DeinterlaceSetting; 3] = [DeinterlaceSetting::Weave, DeinterlaceSetting::Bob, DeinterlaceSetting::Adaptive];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DeinterlaceSetting::Weave => "Weave",
+            DeinterlaceSetting::Bob => "Bob",
+            DeinterlaceSetting::Adaptive => "Adaptive",
+        }
+    }
+
+    /// Index into [`crate::emu::DEINTERLACE_MODES`].
+    pub fn index(self) -> u8 {
+        match self {
+            DeinterlaceSetting::Weave => 0,
+            DeinterlaceSetting::Bob => 1,
+            DeinterlaceSetting::Adaptive => 2,
+        }
+    }
 }
 
 impl Default for Config {
@@ -46,6 +81,7 @@ impl Default for Config {
             volume: 0.5,
             memcard: None,
             scaler: crate::display::ScaleMode::Sharp,
+            deinterlace: DeinterlaceSetting::Adaptive,
         }
     }
 }

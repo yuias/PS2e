@@ -97,8 +97,18 @@ pub struct Shared {
     pub buttons: AtomicU16,
     /// Master volume as f32 bits (UI -> worker).
     pub volume: AtomicU32,
+    /// Deinterlace mode index (UI -> worker), see [`deinterlace_mode`].
+    pub deinterlace: std::sync::atomic::AtomicU8,
     /// Debugger attached/halted (set by the worker) drives UI enablement.
     pub debugger_active: AtomicBool,
+}
+
+/// Deinterlace modes in UI/config order, indexed by `Shared::deinterlace`.
+pub const DEINTERLACE_MODES: [ps2_core::gs::Deinterlace; 3] =
+    [ps2_core::gs::Deinterlace::Weave, ps2_core::gs::Deinterlace::Bob, ps2_core::gs::Deinterlace::Adaptive];
+
+pub fn deinterlace_mode(index: u8) -> ps2_core::gs::Deinterlace {
+    DEINTERLACE_MODES.get(index as usize).copied().unwrap_or_default()
 }
 
 /// Everything the worker owns besides the system itself.
@@ -210,6 +220,7 @@ impl Worker {
                 break;
             }
             self.sys.bus.sio2.buttons = self.shared.buttons.load(Ordering::Relaxed);
+            self.sys.bus.gs.deinterlace = deinterlace_mode(self.shared.deinterlace.load(Ordering::Relaxed));
 
             // While a debugger is attached (or awaited) it owns execution.
             let mut worked = false;

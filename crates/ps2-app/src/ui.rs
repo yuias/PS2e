@@ -50,6 +50,7 @@ const COP0_EPC: usize = 14;
 pub struct App {
     emu: Emu,
     scale_mode: crate::display::ScaleMode,
+    deinterlace: crate::config::DeinterlaceSetting,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
     config: Config,
@@ -66,6 +67,7 @@ impl App {
         Self {
             emu,
             scale_mode: config.scaler,
+            deinterlace: config.deinterlace,
             volume,
             config,
             config_path,
@@ -104,10 +106,13 @@ impl Drop for App {
     /// card itself when it stops.)
     fn drop(&mut self) {
         if let Some(path) = &self.config_path
-            && ((self.config.volume - self.volume).abs() > f32::EPSILON || self.config.scaler != self.scale_mode)
+            && ((self.config.volume - self.volume).abs() > f32::EPSILON
+                || self.config.scaler != self.scale_mode
+                || self.config.deinterlace != self.deinterlace)
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
+            self.config.deinterlace = self.deinterlace;
             self.config.save(path);
         }
     }
@@ -126,6 +131,7 @@ impl eframe::App for App {
             .shared
             .volume
             .store(self.volume.to_bits(), Ordering::Relaxed);
+        self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
         let debugger_active = self.emu.shared.debugger_active.load(Ordering::Relaxed);
@@ -182,6 +188,11 @@ impl eframe::App for App {
                         ui.label("Scaler");
                         for mode in crate::display::ScaleMode::ALL {
                             ui.radio_value(&mut self.scale_mode, mode, mode.label());
+                        }
+                        ui.separator();
+                        ui.label("Deinterlace");
+                        for mode in crate::config::DeinterlaceSetting::ALL {
+                            ui.radio_value(&mut self.deinterlace, mode, mode.label());
                         }
                         ui.separator();
                         ui.checkbox(&mut self.show_tty, "TTY panel");
