@@ -879,8 +879,7 @@ impl Painter<'_> {
         let fst = pipe.fst;
         let (tw, th) = (pipe.tex.tw as f32, pipe.tex.th as f32);
         let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
-        let (blend_a, blend_b, blend_c, blend_d, blend_fix) =
-            (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
+        let blend = Blend::new(pipe);
         let canvas = self.canvas;
         let fb24 = pipe.fb24;
         let ztest = ZTest::new(pipe);
@@ -954,27 +953,7 @@ impl Painter<'_> {
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
             let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
             if ABE {
-                let src = spread21(out & 0xFF_FFFF);
-                let dstc = spread21(dst & 0xFF_FFFF);
-                let pick = |k: u8| -> u64 {
-                    match k {
-                        0 => src,
-                        1 => dstc,
-                        _ => 0,
-                    }
-                };
-                let alpha = match blend_c {
-                    0 => a8 as u64,
-                    1 => (dst >> 24) as u64,
-                    _ => blend_fix,
-                };
-                const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
-                let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
-                let lane = |sh: u32| -> u32 {
-                    let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
-                    v.clamp(0, 255) as u32
-                };
-                out = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+                out = blend.apply(out, dst, a8);
             }
             if fb24 {
                 // PSMCT24 frame: the alpha byte belongs to whatever shares
@@ -1157,34 +1136,13 @@ impl Painter<'_> {
         };
         if pipe.abe || pipe.fb24 {
             // Destination-dependent: blend the constant colour per pixel.
-            let src = spread21(out & 0xFF_FFFF);
-            let (blend_a, blend_b, blend_c, blend_d) = (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d);
-            let fix = pipe.blend_fix as u64;
+            let blend = Blend::new(pipe);
             for px in pxa..pxb {
                 let o = fb_at(px);
                 let dst = canvas.rd32(o);
                 let mut v = out;
                 if pipe.abe {
-                    let dstc = spread21(dst & 0xFF_FFFF);
-                    let pick = |k: u8| -> u64 {
-                        match k {
-                            0 => src,
-                            1 => dstc,
-                            _ => 0,
-                        }
-                    };
-                    let alpha = match blend_c {
-                        0 => a as u64,
-                        1 => (dst >> 24) as u64,
-                        _ => fix,
-                    };
-                    const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
-                    let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
-                    let lane = |sh: u32| -> u32 {
-                        let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
-                        v.clamp(0, 255) as u32
-                    };
-                    v = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+                    v = blend.apply(out, dst, a);
                 }
                 if pipe.fb24 {
                     v = (v & 0xFF_FFFF) | (dst & 0xFF00_0000);
@@ -1259,8 +1217,7 @@ impl Painter<'_> {
         let (cr, cg, cb, ca) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
         let tcc = pipe.tcc;
         let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
-        let (blend_a, blend_b, blend_c, blend_d, blend_fix) =
-            (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
+        let blend = Blend::new(pipe);
         let canvas = self.canvas;
         let fb24 = pipe.fb24;
         let ztest = ZTest::new(pipe);
@@ -1308,27 +1265,7 @@ impl Painter<'_> {
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
             let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
             if ABE {
-                let src = spread21(out & 0xFF_FFFF);
-                let dstc = spread21(dst & 0xFF_FFFF);
-                let pick = |k: u8| -> u64 {
-                    match k {
-                        0 => src,
-                        1 => dstc,
-                        _ => 0,
-                    }
-                };
-                let alpha = match blend_c {
-                    0 => a8 as u64,
-                    1 => (dst >> 24) as u64,
-                    _ => blend_fix,
-                };
-                const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
-                let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
-                let lane = |sh: u32| -> u32 {
-                    let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
-                    v.clamp(0, 255) as u32
-                };
-                out = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+                out = blend.apply(out, dst, a8);
             }
             if fb24 {
                 // PSMCT24 frame: the alpha byte belongs to whatever shares
@@ -1711,6 +1648,72 @@ impl TexFetch {
             minv: ti.minv,
             maxv: ti.maxv,
             texa: ti.texa,
+        }
+    }
+}
+
+/// ALPHA blending for the fast loops: `Cv = ((A - B) * C >> 7) + D` with
+/// the A/B/D sources and the C source decoded once. The SSE2 form pairs
+/// each channel's `A - B` with 128 and multiplies against `C` and `D` in
+/// one `pmaddwd`, so the 32-bit sum needs no lane bias; `packs`/`packus`
+/// clamp to 0..255 like the scalar path.
+#[derive(Clone, Copy)]
+struct Blend {
+    a: u8,
+    b: u8,
+    c: u8,
+    d: u8,
+    fix: u32,
+}
+
+impl Blend {
+    #[inline(always)]
+    fn new(pipe: &PixelPipe) -> Self {
+        Self { a: pipe.blend_a, b: pipe.blend_b, c: pipe.blend_c, d: pipe.blend_d, fix: pipe.blend_fix }
+    }
+
+    /// Blended RGB of `src` over `dst` (both RGBA8); the result keeps the
+    /// alpha byte of `src`. `src_a` is the (unsaturated) source alpha.
+    #[inline(always)]
+    fn apply(self, src: u32, dst: u32, src_a: u32) -> u32 {
+        let pick = |k: u8| -> u32 {
+            match k {
+                0 => src,
+                1 => dst,
+                _ => 0,
+            }
+        };
+        let alpha = match self.c {
+            0 => src_a,
+            1 => dst >> 24,
+            _ => self.fix,
+        };
+        let (a, b, d) = (pick(self.a), pick(self.b), pick(self.d));
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::*;
+            // SAFETY: SSE2 baseline; pure register arithmetic.
+            unsafe {
+                let zero = _mm_setzero_si128();
+                let a16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(a as i32), zero);
+                let b16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(b as i32), zero);
+                let d16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(d as i32), zero);
+                let diff = _mm_sub_epi16(a16, b16);
+                // [diff_r, 128, diff_g, 128, ...] . [C, d_r, C, d_g, ...]
+                let x = _mm_unpacklo_epi16(diff, _mm_set1_epi16(128));
+                let y = _mm_unpacklo_epi16(_mm_set1_epi16(alpha as i16), d16);
+                let acc = _mm_srai_epi32(_mm_madd_epi16(x, y), 7);
+                let packed = _mm_packus_epi16(_mm_packs_epi32(acc, acc), zero);
+                (_mm_cvtsi128_si32(packed) as u32 & 0xFF_FFFF) | (src & 0xFF00_0000)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let lane = |sh: u32| -> u32 {
+                let (av, bv, dv) = (((a >> sh) & 0xFF) as i32, ((b >> sh) & 0xFF) as i32, ((d >> sh) & 0xFF) as i32);
+                ((((av - bv) * alpha as i32) >> 7) + dv).clamp(0, 255) as u32
+            };
+            lane(0) | (lane(8) << 8) | (lane(16) << 16) | (src & 0xFF00_0000)
         }
     }
 }
