@@ -75,17 +75,18 @@ Planned crates:
    keyboard pad input, TTY and register panels (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel
    pipeline split across a rayon pool for large primitives, idle-loop
-   skipping on both cores that jumps straight to the next timer tick or
-   vblank, IMAGE uploads streamed as one command per run, and
-   specialised rasterizer row loops (flat fills, textured MODULATE
-   sprites with fixed-point u, incremental triangle spans) for the
-   setups the game and the OSD actually draw. Same-box A/B (loaded
-   machine): the OSD's blur-heavy boot screens went from ~40% to ~70%
-   of real time (their slowness is what starves the audio buffer during
-   the boot chime) and the game from ~1.8x to ~2.3x; expect more on an
-   idle box. Next: the periodic bus tick, the triangle texture sampling
-   (small rotated particles through the row cache / direct taps), and
-   the wasm front-end.
+   skipping on both cores that jumps straight to the next due bus tick
+   or vblank (the periodic tick itself runs only when a timer, SPU2
+   sample or deferred DMA completion is due), IMAGE uploads streamed as
+   one command per run, and specialised rasterizer row loops (flat
+   fills, textured MODULATE sprites with fixed-point u, incremental
+   triangle spans, SSE2 modulate/blend/16-bit bilinear) for the setups
+   the game and the OSD actually draw. Same-box A/B (loaded machine):
+   the OSD's blur-heavy boot screens went from ~40% to ~85% of real
+   time (their slowness is what starves the audio buffer during the
+   boot chime) and the game from ~1.8x to ~3.1x; expect more on an idle
+   box. Next: the IOP interpreter's in-situ cost, JIT leftovers, the
+   wasm front-end.
 
 ## Component map (ps2-core)
 
