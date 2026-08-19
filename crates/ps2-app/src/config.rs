@@ -26,7 +26,9 @@ volume = 0.5
 scaler = "sharp"
 
 # Interlaced output: "weave" (both fields, combs on motion), "bob" (latest
-# field only) or "adaptive" (weave where still, bob where moving).
+# field only, bobs by nature), "blend" (weave softened vertically),
+# "adaptive" (weave where still, bob where moving) or "adaptivedebug"
+# (adaptive with the rebuilt pixels tinted).
 deinterlace = "adaptive"
 
 # Memory card image (created and formatted automatically).
@@ -50,17 +52,28 @@ pub struct Config {
 pub enum DeinterlaceSetting {
     Weave,
     Bob,
+    Blend,
     Adaptive,
+    /// Adaptive with rebuilt pixels tinted, to see where it kicks in.
+    AdaptiveDebug,
 }
 
 impl DeinterlaceSetting {
-    pub const ALL: [DeinterlaceSetting; 3] = [DeinterlaceSetting::Weave, DeinterlaceSetting::Bob, DeinterlaceSetting::Adaptive];
+    pub const ALL: [DeinterlaceSetting; 5] = [
+        DeinterlaceSetting::Weave,
+        DeinterlaceSetting::Bob,
+        DeinterlaceSetting::Blend,
+        DeinterlaceSetting::Adaptive,
+        DeinterlaceSetting::AdaptiveDebug,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             DeinterlaceSetting::Weave => "Weave",
             DeinterlaceSetting::Bob => "Bob",
+            DeinterlaceSetting::Blend => "Blend",
             DeinterlaceSetting::Adaptive => "Adaptive",
+            DeinterlaceSetting::AdaptiveDebug => "Adaptive (show motion)",
         }
     }
 
@@ -69,7 +82,9 @@ impl DeinterlaceSetting {
         match self {
             DeinterlaceSetting::Weave => 0,
             DeinterlaceSetting::Bob => 1,
-            DeinterlaceSetting::Adaptive => 2,
+            DeinterlaceSetting::Blend => 2,
+            DeinterlaceSetting::Adaptive => 3,
+            DeinterlaceSetting::AdaptiveDebug => 4,
         }
     }
 }

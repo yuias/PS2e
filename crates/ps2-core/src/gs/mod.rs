@@ -793,12 +793,17 @@ impl Gs {
             let y = sy * 2 + field as u32;
             self.scan_line(&view, sy, &mut line);
             let row = &mut woven[y as usize * stride..][..stride];
-            if mode == Deinterlace::Adaptive {
+            if matches!(mode, Deinterlace::Adaptive | Deinterlace::AdaptiveDebug) {
                 let flags = &mut motion[(y * w) as usize..][..w as usize];
                 for (x, f) in flags.iter_mut().enumerate() {
                     let (a, b) = (&row[x * 4..x * 4 + 3], &line[x * 4..x * 4 + 3]);
-                    let diff: u32 = a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q) as u32).sum();
-                    *f = u8::from(diff > MOTION_THRESHOLD);
+                    let diff = a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q)).max().unwrap_or(0);
+                    // 0 = still, 1 = changed a little, 2 = moved.
+                    *f = if diff > MOTION_THRESHOLD {
+                        2
+                    } else {
+                        u8::from(diff != 0)
+                    };
                 }
             }
             row.copy_from_slice(&line);
@@ -806,17 +811,32 @@ impl Gs {
         let mut out = woven.clone();
         match mode {
             Deinterlace::Weave => {}
+            Deinterlace::Blend => {
+                for y in 0..h {
+                    let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+                    let (ra, rc, rb) = (
+                        &woven[ya as usize * stride..][..stride],
+                        &woven[y as usize * stride..][..stride],
+                        &woven[yb as usize * stride..][..stride],
+                    );
+                    let row = &mut out[y as usize * stride..][..stride];
+                    for i in 0..stride {
+                        row[i] = ((ra[i] as u16 + 2 * rc[i] as u16 + rb[i] as u16 + 2) >> 2) as u8;
+                    }
+                }
+            }
             Deinterlace::Bob => {
                 // Only the new field is real: rebuild the other rows from it.
                 for y in (0..h).filter(|y| (y & 1 != 0) != field) {
                     Self::interpolate_row(&woven, &mut out, w, h, y, None);
                 }
             }
-            Deinterlace::Adaptive => {
+            Deinterlace::Adaptive | Deinterlace::AdaptiveDebug => {
                 // Keep the old field where nothing moved, interpolate the new
                 // one where either neighbouring new row changed.
+                let debug = mode == Deinterlace::AdaptiveDebug;
                 for y in (0..h).filter(|y| (y & 1 != 0) != field) {
-                    Self::interpolate_row(&woven, &mut out, w, h, y, Some(&motion));
+                    Self::interpolate_row(&woven, &mut out, w, h, y, Some((&motion, debug)));
                 }
             }
         }
@@ -826,25 +846,47 @@ impl Gs {
     }
 
     /// Fill row `y` of `out` from the rows above and below in `woven` (the
-    /// current field), everywhere or only where `motion` flags either of
-    /// them.
-    fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<&[u8]>) {
+    /// current field): everywhere, or (motion-adaptive, after PCSX2's MAD
+    /// shader) only where those rows or this one moved, or where they
+    /// changed a little and this row combs against them — a static pixel
+    /// (no change at all) is always kept, so still images stay woven.
+    fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<(&[u8], bool)>) {
         let stride = (w * 4) as usize;
         let above = y.saturating_sub(1);
         let below = (y + 1).min(h - 1);
         // Edge rows have one real neighbour only.
         let (above, below) = if y == 0 { (below, below) } else if y == h - 1 { (above, above) } else { (above, below) };
         let (ra, rb) = (&woven[above as usize * stride..][..stride], &woven[below as usize * stride..][..stride]);
+        let cur = &woven[y as usize * stride..][..stride];
         let row = &mut out[y as usize * stride..][..stride];
+        let thr = MOTION_THRESHOLD;
         for x in 0..w as usize {
-            if let Some(m) = motion {
-                let moved = m[(above * w) as usize + x] | m[(below * w) as usize + x];
-                if moved == 0 {
-                    continue;
+            let mut debug = false;
+            if let Some((m, dbg)) = motion {
+                debug = dbg;
+                let flags = m[(above * w) as usize + x] | m[(below * w) as usize + x] | m[(y * w) as usize + x];
+                if flags == 0 {
+                    continue; // completely still
+                }
+                if flags < 2 {
+                    // Small change only: rebuild just where this row combs
+                    // against neighbours that agree with each other.
+                    let (p, q) = (&ra[x * 4..x * 4 + 3], &rb[x * 4..x * 4 + 3]);
+                    let c = &cur[x * 4..x * 4 + 3];
+                    let hl = p.iter().zip(q).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
+                    let hc = p.iter().zip(c).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
+                    if !(hl <= thr && hc > thr) {
+                        continue;
+                    }
                 }
             }
             for c in 0..4 {
                 row[x * 4 + c] = ((ra[x * 4 + c] as u16 + rb[x * 4 + c] as u16 + 1) >> 1) as u8;
+            }
+            if debug {
+                row[x * 4] = 255;
+                row[x * 4 + 1] = 0;
+                row[x * 4 + 2] = 255;
             }
         }
     }
@@ -927,12 +969,17 @@ pub enum Deinterlace {
     /// Latest field only, the other rows interpolated from it: no combing,
     /// half the vertical detail.
     Bob,
+    /// Weave filtered vertically (1-2-1 over the woven rows): no combing,
+    /// no bobbing, a little softer.
+    Blend,
     /// Weave where nothing moved, bob where it did.
     Adaptive,
+    /// Adaptive, with the pixels it rebuilt tinted magenta (tuning aid).
+    AdaptiveDebug,
 }
 
-/// Summed RGB difference above which a pixel counts as moving.
-const MOTION_THRESHOLD: u32 = 24;
+/// Per-channel difference above which a pixel counts as moving.
+const MOTION_THRESHOLD: u8 = 24;
 
 /// Read-circuit parameters for scanout.
 struct DisplayView {
@@ -983,11 +1030,18 @@ mod tests {
         let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Bob);
         assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x40, 0x40));
         // Adaptive: field 0 moves (0x30 -> 0x50) so the odd rows (0x40) are
-        // replaced by interpolation of the new even rows; then a still
-        // field 1 (0x40 again) keeps the woven even rows.
+        // replaced by interpolation of the new even rows. The next still
+        // field 1 (0x40 again) still sees the even rows as moving (their own
+        // last change), and only once field 0 repeats does the frame weave.
         fill(&mut gs, 0x50);
         let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Adaptive);
         assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x50));
+        fill(&mut gs, 0x40);
+        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Adaptive);
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x40, 0x40));
+        fill(&mut gs, 0x50);
+        let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Adaptive);
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x40));
         fill(&mut gs, 0x40);
         let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Adaptive);
         assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x40));

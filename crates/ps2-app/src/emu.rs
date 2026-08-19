@@ -104,8 +104,13 @@ pub struct Shared {
 }
 
 /// Deinterlace modes in UI/config order, indexed by `Shared::deinterlace`.
-pub const DEINTERLACE_MODES: [ps2_core::gs::Deinterlace; 3] =
-    [ps2_core::gs::Deinterlace::Weave, ps2_core::gs::Deinterlace::Bob, ps2_core::gs::Deinterlace::Adaptive];
+pub const DEINTERLACE_MODES: [ps2_core::gs::Deinterlace; 5] = [
+    ps2_core::gs::Deinterlace::Weave,
+    ps2_core::gs::Deinterlace::Bob,
+    ps2_core::gs::Deinterlace::Blend,
+    ps2_core::gs::Deinterlace::Adaptive,
+    ps2_core::gs::Deinterlace::AdaptiveDebug,
+];
 
 pub fn deinterlace_mode(index: u8) -> ps2_core::gs::Deinterlace {
     DEINTERLACE_MODES.get(index as usize).copied().unwrap_or_default()
