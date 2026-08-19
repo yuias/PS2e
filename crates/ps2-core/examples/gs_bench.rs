@@ -108,4 +108,16 @@ fn main() {
     bench("sprite psmct32 bilinear + blend", &mut gs, 0x56, 0x20, tex0_psmct32(), sprite);
     bench("tri gouraud untextured", &mut gs, 0xB, 0, 0, quad);
     bench("tri psmt8 bilinear + blend", &mut gs, 0x5B, 0x20, tex0_psmt8(), quad);
+    // Amagami's in-game setup: Z writes masked (ZTE ALWAYS), no frame mask,
+    // modulate by a non-neutral colour; its blended layers alpha-test.
+    gs.write_reg(0x4E, 280 | (1 << 24) | (1 << 32)); // ZBUF_1: ZMSK
+    gs.write_reg(0x01, 0x3F80_0000_8060_7080); // RGBAQ: tinted modulate
+    bench("game sprite psmt8 nearest", &mut gs, 0x16, 0, tex0_psmt8(), sprite);
+    gs.write_reg(0x01, 0x3F80_0000_8080_8080); // RGBAQ: unity
+    gs.write_reg(0x47, 0x30000 | 1 | (6 << 1) | (0 << 4)); // TEST_1: ATE GREATER 0
+    bench("game sprite psmt8 nearest+blend+ate", &mut gs, 0x56, 0, tex0_psmt8(), sprite);
+    gs.write_reg(0x47, 0x30000);
+    bench("game sprite psmct32 bilinear+blend", &mut gs, 0x56, 0x20, tex0_psmct32(), sprite);
+    bench("game sprite psmt8 bilinear", &mut gs, 0x16, 0x20, tex0_psmt8(), sprite);
+    bench("game tri psmt8 bilinear + blend", &mut gs, 0x5B, 0x20, tex0_psmt8(), quad);
 }

@@ -183,13 +183,13 @@ pub fn step_parts(parts: [u64; 4]) {
 }
 
 #[cfg(feature = "profile")]
-static PIXELS: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+static PIXELS: [AtomicU64; 1 << 19] = [const { AtomicU64::new(0) }; 1 << 19];
 
 /// Record one shaded pixel under a small setup key.
 #[inline(always)]
 pub fn count_pixel(key: usize) {
     #[cfg(feature = "profile")]
-    PIXELS[key & 4095].fetch_add(1, Ordering::Relaxed);
+    PIXELS[key & ((1 << 19) - 1)].fetch_add(1, Ordering::Relaxed);
     #[cfg(not(feature = "profile"))]
     let _ = key;
 }
@@ -269,13 +269,14 @@ pub fn report() -> Option<String> {
             PIXELS.iter().enumerate().map(|(k, a)| (k, a.load(Ordering::Relaxed))).filter(|&(_, n)| n > 0).collect();
         let px_total: u64 = px.iter().map(|&(_, n)| n).sum::<u64>().max(1);
         px.sort_by(|a, b| b.1.cmp(&a.1));
-        out.push_str("GS pixels by setup (kind, tme, bilinear, abe, psm):
+        out.push_str("GS pixels by setup (kind, tme, bilinear, abe, psm, tfx, ate, zread, zwrite, fbmsk, fb24, neutral rgba):
 ");
-        for (k, n) in px.iter().take(16) {
+        for (k, n) in px.iter().take(24) {
             out.push_str(&format!(
-                "  kind={} tme={} bil={} abe={} psm={:#04x} {:5.1}%
+                "  kind={} tme={} bil={} abe={} psm={:#04x} tfx={} ate={} zr={} zw={} fbmsk={} fb24={} neutral={} {:5.1}%
 ",
                 k & 3, (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 0x3F,
+                (k >> 11) & 3, (k >> 13) & 1, (k >> 14) & 1, (k >> 15) & 1, (k >> 16) & 1, (k >> 17) & 1, (k >> 18) & 1,
                 *n as f64 * 100.0 / px_total as f64
             ));
         }

@@ -837,7 +837,9 @@ impl Painter<'_> {
         let zmask = pipe.zmask;
         let z_off = (row.z_base + layout::col_off32(y, x, true)) & (VRAM_SIZE - 1);
         let fb_off = (row.fb_base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
-        if pipe.zte {
+        // ZTST ALWAYS with the Z write masked touches nothing: skip the Z
+        // read (every in-game sprite of Amagami draws that way).
+        if pipe.zte && !(pipe.ztst == 1 && pipe.zmsk) {
             let zcur = self.canvas.rd32(z_off);
             let z = frag.z & zmask;
             let pass = match pipe.ztst {
@@ -854,8 +856,8 @@ impl Painter<'_> {
             }
         }
 
-        // Destination blend.
-        let dst = self.canvas.rd32(fb_off);
+        // Destination pixel, only when something depends on it.
+        let dst = if pipe.abe || pipe.fbmsk != 0 || pipe.fb24 { self.canvas.rd32(fb_off) } else { 0 };
 
         if pipe.abe {
             // ALPHA: Cv = ((A - B) * C >> 7) + D, on three 21-bit lanes of a
