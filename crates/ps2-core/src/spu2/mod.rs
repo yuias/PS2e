@@ -125,6 +125,11 @@ impl Spu2 {
         usize::from((0x400..0x760).contains(&off))
     }
 
+    /// Output sample index of the last mixed sample, for log timestamps.
+    fn t(&self) -> u64 {
+        self.last_sample / EE_CYCLES_PER_SAMPLE
+    }
+
     fn reg16(&self, off: usize) -> u16 {
         self.regs[(off & 0xFFE) >> 1]
     }
@@ -225,7 +230,7 @@ impl Spu2 {
                 self.set_reg16(off, v);
                 let new_mode = (v >> 4) & 3;
                 if new_mode != (old >> 4) & 3 {
-                    debug!(target: "ps2_core::spu2", core, mode = new_mode, "transfer mode");
+                    debug!(target: "ps2_core::spu2", t = self.t(), core, mode = new_mode, "transfer mode");
                 }
                 // Dropping IRQ enable acknowledges the IRQ.
                 if old & 0x40 != 0 && v & 0x40 == 0 {
@@ -258,9 +263,10 @@ impl Spu2 {
                         let a = base + voice * 12;
                         let ssa = (u32::from(self.reg16(a) & 0xF) << 16) | u32::from(self.reg16(a + 2));
                         self.cores[core].voices[voice].key_on(ssa);
-                        trace!(target: "ps2_core::spu2", core, voice, ssa = format_args!("{ssa:#x}"), "key on");
+                        trace!(target: "ps2_core::spu2", t = self.t(), core, voice, ssa = format_args!("{ssa:#x}"), "key on");
                     } else {
                         self.cores[core].voices[voice].key_off();
+                        trace!(target: "ps2_core::spu2", t = self.t(), core, voice, "key off");
                     }
                 }
             }
@@ -278,7 +284,7 @@ impl Spu2 {
                 }
             }
             REG_ADMAS => {
-                debug!(target: "ps2_core::spu2", core, value = format_args!("{v:#06x}"), "ADMAS");
+                debug!(target: "ps2_core::spu2", t = self.t(), core, value = format_args!("{v:#06x}"), "ADMAS");
                 let was = self.adma_enabled(core);
                 self.set_reg16(off, v);
                 if !was && self.adma_enabled(core) {
@@ -293,11 +299,11 @@ impl Spu2 {
                 }
             }
             REG_MMIX | 0x188 | 0x18C | 0x190 | 0x194 => {
-                debug!(target: "ps2_core::spu2", core, reg = format_args!("{local:#x}"), value = format_args!("{v:#06x}"), "mix control");
+                debug!(target: "ps2_core::spu2", t = self.t(), core, reg = format_args!("{local:#x}"), value = format_args!("{v:#06x}"), "mix control");
                 self.set_reg16(off, v);
             }
             REG_MVOL..=0x7AF => {
-                debug!(target: "ps2_core::spu2", reg = format_args!("{off:#x}"), value = format_args!("{v:#06x}"), "volume");
+                debug!(target: "ps2_core::spu2", t = self.t(), reg = format_args!("{off:#x}"), value = format_args!("{v:#06x}"), "volume");
                 self.set_reg16(off, v);
             }
             _ => self.set_reg16(off, v),
@@ -318,7 +324,7 @@ impl Spu2 {
             if self.attr(c) & 0x40 != 0 && self.irqa(c) == hw && !self.cores[c].irq_flag {
                 self.cores[c].irq_flag = true;
                 self.irq_edge = true;
-                debug!(target: "ps2_core::spu2", core = c, addr = format_args!("{hw:#x}"), "IRQA hit");
+                debug!(target: "ps2_core::spu2", t = self.t(), core = c, addr = format_args!("{hw:#x}"), "IRQA hit");
             }
         }
     }
@@ -330,13 +336,13 @@ impl Spu2 {
             2 => u32::from(self.read16(off)),
             _ => u32::from(self.read16(off)) | (u32::from(self.read16(off + 2)) << 16),
         };
-        trace!(target: "ps2_core::spu2", off = format_args!("{off:#05x}"), value = format_args!("{v:#x}"), "read");
+        trace!(target: "ps2_core::spu2", t = self.t(), off = format_args!("{off:#05x}"), value = format_args!("{v:#x}"), "read");
         v
     }
 
     /// Register write of `N` bytes at byte offset `off` (0..0x1000).
     pub fn write<const N: usize>(&mut self, off: usize, v: u32) {
-        trace!(target: "ps2_core::spu2", off = format_args!("{off:#05x}"), value = format_args!("{v:#x}"), "write");
+        trace!(target: "ps2_core::spu2", t = self.t(), off = format_args!("{off:#05x}"), value = format_args!("{v:#x}"), "write");
         match N {
             1 => {
                 let shift = (off & 1) * 8;
@@ -414,7 +420,7 @@ impl Spu2 {
                 self.cores[core].adma_pending.push_back(block.to_vec());
             }
             self.adma_fill(core);
-            debug!(target: "ps2_core::spu2", core, bytes, "ADMA block(s) queued");
+            debug!(target: "ps2_core::spu2", t = self.t(), core, bytes, "ADMA block(s) queued");
             self.adma_due(core, now)
         } else {
             let start_at = self.cores[core].dma_due.map_or(now, |due| due.max(now));
@@ -432,7 +438,7 @@ impl Spu2 {
                     self.cores[core].tsa = (self.cores[core].tsa + 1) & 0xF_FFFF;
                 }
             }
-            debug!(target: "ps2_core::spu2", core, to_spu, bytes, tsa = format_args!("{start:#x}"), "DMA");
+            debug!(target: "ps2_core::spu2", t = self.t(), core, to_spu, bytes, tsa = format_args!("{start:#x}"), "DMA");
             start_at + bytes * EE_CYCLES_PER_DMA_BYTE
         };
         self.cores[core].dma_due = Some(due);
@@ -503,7 +509,7 @@ impl Spu2 {
                     if irqa.wrapping_sub(start) & 0xF_FFFF < 8 && !self.cores[c].irq_flag {
                         self.cores[c].irq_flag = true;
                         self.irq_edge = true;
-                        debug!(target: "ps2_core::spu2", core = c, voice = v, addr = format_args!("{irqa:#x}"), "IRQA hit by voice");
+                        debug!(target: "ps2_core::spu2", t = self.t(), core = c, voice = v, addr = format_args!("{irqa:#x}"), "IRQA hit by voice");
                     }
                 }
                 if sample == 0 || mmix & MMIX_VOICE_DRY == 0 {
