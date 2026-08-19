@@ -37,14 +37,21 @@ pub enum Slot {
     Spu2,
     /// GS worker thread waiting for commands.
     GsIdle,
+    /// Rasterizer row loops: flat fills, the textured sprite and triangle
+    /// fast loops, and the generic per-pixel path (self time nested in
+    /// GsDraw, which keeps the setup and row decode).
+    GsFlat,
+    GsFastSprite,
+    GsFastTri,
+    GsGeneric,
 }
 
 #[cfg(feature = "profile")]
-const N: usize = 12;
+const N: usize = 16;
 #[cfg(feature = "profile")]
 const NAMES: [&str; N] = [
     "other", "EE", "IOP", "timers", "VIF1", "GIF", "SIF", "VU1", "GS draw", "GS xfer", "SPU2",
-    "GS idle",
+    "GS idle", "GS flat", "GS sprite", "GS tri", "GS generic",
 ];
 
 #[cfg(feature = "profile")]
@@ -188,10 +195,18 @@ static PIXELS: [AtomicU64; 1 << 20] = [const { AtomicU64::new(0) }; 1 << 20];
 /// Record one shaded pixel under a small setup key.
 #[inline(always)]
 pub fn count_pixel(key: usize) {
+    count_pixels(key, 1);
+}
+
+/// Record `n` shaded pixels under a small setup key (one atomic add: the
+/// fast row loops count per row, which keeps the histogram from turning
+/// into a contended per-pixel RMW across the worker pool).
+#[inline(always)]
+pub fn count_pixels(key: usize, n: u64) {
     #[cfg(feature = "profile")]
-    PIXELS[key & ((1 << 20) - 1)].fetch_add(1, Ordering::Relaxed);
+    PIXELS[key & ((1 << 20) - 1)].fetch_add(n, Ordering::Relaxed);
     #[cfg(not(feature = "profile"))]
-    let _ = key;
+    let _ = (key, n);
 }
 
 /// Record one EE instruction for the profile report.

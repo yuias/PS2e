@@ -625,6 +625,7 @@ impl Painter<'_> {
                         self.scratch.tex_rows = [row0, row1];
                         continue;
                     }
+                    let _p = crate::prof::scope(crate::prof::Slot::GsGeneric);
                     for px in pxa..pxb {
                         let fu = fu_at(px);
                         let texel = if pipe.bilinear {
@@ -650,6 +651,7 @@ impl Painter<'_> {
                 self.flat_sprite_row(&row, pxa, pxb, &frag);
                 continue;
             }
+            let _p = crate::prof::scope(crate::prof::Slot::GsGeneric);
             for px in pxa..pxb {
                 let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * g.inv_wid;
                 let frag = Frag {
@@ -728,6 +730,7 @@ impl Painter<'_> {
                 }
                 continue;
             }
+            let _p = crate::prof::scope(crate::prof::Slot::GsGeneric);
             let n = (xs - g.minx) as i64;
             let (mut w0, mut w1, mut w2) = (w[0] + g.dx[0] * n, w[1] + g.dx[1] * n, w[2] + g.dx[2] * n);
             for px in xs..=xe {
@@ -764,6 +767,7 @@ impl Painter<'_> {
     /// choices (see [`Painter::fast_sprite_row`]).
     #[inline(never)]
     fn fast_tri_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastTri) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsFastTri);
         let pipe = self.pipe;
         let row = a.row;
         let y = row.y;
@@ -773,9 +777,7 @@ impl Painter<'_> {
         #[cfg(feature = "profile")]
         {
             let k = pipe.profile_key(false);
-            for _ in 0..n {
-                crate::prof::count_pixel(k);
-            }
+            crate::prof::count_pixels(k, n);
         }
         let tcc = pipe.tcc;
         let fst = pipe.fst;
@@ -790,15 +792,39 @@ impl Painter<'_> {
         let mut stqu = a.stqu;
         let mut v = a.v;
         let mut zf = a.z;
-        for px in a.xs..=a.xe {
-            let (fu, fv) = if fst {
+        let uv_at = |stqu: &[f32; 4], v: f32| -> (f32, f32) {
+            if fst {
                 (stqu[3] / 16.0, v / 16.0)
             } else {
                 let q = if stqu[2].abs() < 1e-9 { 1.0 } else { stqu[2] };
                 let inv_q = 1.0 / q;
                 (stqu[0] * inv_q * tw, stqu[1] * inv_q * th)
+            }
+        };
+        // The decoded-row cache pays off when the span stays on one or two
+        // texture rows and is magnified (it decodes each texel once); a
+        // mapping that walks v along the row, or a minified one that skips
+        // texels, would refill the 32-texel chunks every few pixels, so
+        // those sample VRAM directly.
+        let direct = {
+            let span = (a.xe - a.xs) as f32;
+            let mut stqu_e = a.stqu;
+            for i in 0..4 {
+                stqu_e[i] += a.d_stqu[i] * span;
+            }
+            let (fu_s, fv_s) = uv_at(&a.stqu, a.v);
+            let (fu_e, fv_e) = uv_at(&stqu_e, a.v + a.d_v * span);
+            (fv_e - fv_s).abs() >= 1.0 || (fu_e - fu_s).abs() > 2.0 * span + 8.0
+        };
+        for px in a.xs..=a.xe {
+            let (fu, fv) = uv_at(&stqu, v);
+            let texel = if direct {
+                if BIL { self.sample_bilinear_direct(fu, fv) } else { self.texel(floor_i32(fu), floor_i32(fv)) }
+            } else if BIL {
+                self.sample_bilinear_cached(fu, fv)
+            } else {
+                self.cached_texel(0, floor_i32(fu), floor_i32(fv))
             };
-            let texel = if BIL { self.sample_bilinear_cached(fu, fv) } else { self.cached_texel(0, floor_i32(fu), floor_i32(fv)) };
             let (cr, cg, cb, ca) = (rgba[0] as u32, rgba[1] as u32, rgba[2] as u32, rgba[3] as u32);
             let z = (zf as u32) & pipe.zmask;
             for i in 0..4 {
@@ -990,6 +1016,7 @@ impl Painter<'_> {
     /// [`Painter::shade_row_px`].
     #[inline(never)]
     fn flat_sprite_row(&mut self, row: &Row, pxa: i32, pxb: i32, frag: &Frag) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsFlat);
         let pipe = self.pipe;
         let y = row.y;
         let n = (pxb - pxa) as u64;
@@ -997,9 +1024,7 @@ impl Painter<'_> {
         #[cfg(feature = "profile")]
         {
             let k = pipe.profile_key(false);
-            for _ in 0..n {
-                crate::prof::count_pixel(k);
-            }
+            crate::prof::count_pixels(k, n);
         }
         let (r, g, b, a) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
         if pipe.ate {
@@ -1121,6 +1146,7 @@ impl Painter<'_> {
     /// level.
     #[inline(never)]
     fn fast_sprite_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsFastSprite);
         let pipe = self.pipe;
         let (row, frag) = (a.row, a.frag);
         let y = row.y;
@@ -1131,9 +1157,7 @@ impl Painter<'_> {
         {
             let neutral = frag.r == 128.0 && frag.g == 128.0 && frag.b == 128.0 && frag.a == 128.0;
             let k = pipe.profile_key(neutral);
-            for _ in 0..n {
-                crate::prof::count_pixel(k);
-            }
+            crate::prof::count_pixels(k, n);
         }
         let (cr, cg, cb, ca) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
         let tcc = pipe.tcc;
@@ -1381,6 +1405,12 @@ impl Painter<'_> {
         if !pipe.bilinear {
             return self.texel(floor_i32(fu), floor_i32(fv));
         }
+        self.sample_bilinear_direct(fu, fv)
+    }
+
+    /// Bilinear texel at texel-space `(fu, fv)` straight from VRAM.
+    #[inline(always)]
+    fn sample_bilinear_direct(&self, fu: f32, fv: f32) -> u32 {
         let x = fu - 0.5;
         let y = fv - 0.5;
         let (x0, y0) = (floor_i32(x), floor_i32(y));
