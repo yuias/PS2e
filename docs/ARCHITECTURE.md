@@ -75,10 +75,16 @@ Planned crates:
    keyboard pad input, TTY and register panels (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel
    pipeline split across a rayon pool for large primitives, idle-loop
-   skipping on both cores; Amagami runs at ~1.9x real time headless (the
-   OSD's blur-heavy boot screens at ~50%, which is what starves the
-   audio buffer during the boot chime). Next: the IOP interpreter, OSD
-   sprite throughput, and the wasm front-end.
+   skipping on both cores that jumps straight to the next timer tick or
+   vblank, IMAGE uploads streamed as one command per run, and
+   specialised rasterizer row loops (flat fills, textured MODULATE
+   sprites with fixed-point u, incremental triangle spans) for the
+   setups the game and the OSD actually draw. Amagami ran at ~1.9x real
+   time headless before the rasterizer work (exact figures pending an
+   idle box); the OSD's blur-heavy boot screens were at ~50%, which is
+   what starves the audio buffer during the boot chime. Next: the
+   periodic bus tick, remaining generic pixel paths (bilinear cache
+   sampling in triangles), and the wasm front-end.
 
 ## Component map (ps2-core)
 
@@ -103,7 +109,7 @@ ps2-core/src/
 │   ├── front.rs  # EE-side GS: privileged registers, CSR/IMR, command stream to the worker
 │   ├── mod.rs    # Registers, vertex kick, IMAGE/local transfers, VRAM accessors, scanout
 │   ├── layout.rs # Hardware page/block/column addressing for every pixel format
-│   └── raster.rs # Triangle/sprite rasterization, texture sampling, tests, blending
+│   └── raster.rs # Triangle/sprite rasterization, texture row cache, fast row loops, blending
 └── spu2/
     ├── mod.rs    # Registers, transfer engine, ADMA ring, MMIX routing, mixer
     ├── voice.rs  # ADPCM decode, Gaussian interpolation, ADSR envelopes
