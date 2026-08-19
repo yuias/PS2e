@@ -79,12 +79,13 @@ Planned crates:
    vblank, IMAGE uploads streamed as one command per run, and
    specialised rasterizer row loops (flat fills, textured MODULATE
    sprites with fixed-point u, incremental triangle spans) for the
-   setups the game and the OSD actually draw. Amagami ran at ~1.9x real
-   time headless before the rasterizer work (exact figures pending an
-   idle box); the OSD's blur-heavy boot screens were at ~50%, which is
-   what starves the audio buffer during the boot chime. Next: the
-   periodic bus tick, remaining generic pixel paths (bilinear cache
-   sampling in triangles), and the wasm front-end.
+   setups the game and the OSD actually draw. Same-box A/B (loaded
+   machine): the OSD's blur-heavy boot screens went from ~40% to ~70%
+   of real time (their slowness is what starves the audio buffer during
+   the boot chime) and the game from ~1.8x to ~2.3x; expect more on an
+   idle box. Next: the periodic bus tick, the triangle texture sampling
+   (small rotated particles through the row cache / direct taps), and
+   the wasm front-end.
 
 ## Component map (ps2-core)
 
