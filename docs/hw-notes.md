@@ -384,6 +384,30 @@ each wait):
   fire before that — an instant completion turns the handler into an
   IOP interrupt storm that starves the RPC thread, which is what the
   "game hangs on its sound-init thread" symptom was.
+  The ring must be written in stream order with a write cursor that
+  alternates halves, starting at half 0 with the read position reset
+  to 0 when ADMAS is switched on, and the IOP's completion must be
+  tied to the moment the last block actually lands (each waiting block
+  needs one more half boundary of playback). Filling "whichever half
+  is free, the non-playing one first" swapped each 2 KiB kick's blocks
+  and overwrote the playing half at a slowly sliding offset, and a
+  byte-count completion time let the IOP's re-arm drift half a sample
+  per kick: together a constant "trembling" smear under the music.
+  Verified against the IOP's own decode: the game streams MUSIC.AFS
+  ADX (CRI type-8 encrypted, vgmstream key "mituba" = 0x5a17/0x509f/
+  0x5bfd, key stream advancing per frame across channels) through
+  CRI_ADXI.IRX at volume 0x3D80/0x8000, and the SPU2 output now equals
+  that stream to within BVOL rounding (`tools/` has no script for this;
+  the comparison was a scratch numpy cross-correlation).
+- Voices interpolate with the 4-tap Gaussian table (phase = pitch
+  counter bits 4..11, weights oldest-first, output centred two samples
+  behind the newest); nearest sampling left strong aliasing above 8 kHz
+  on the boot chime.
+- The OSD stops a voice by writing ADSR1/ADSR2 = 0 and then keying it
+  off: release shift 0 drops the envelope to zero in two samples, so
+  when a disc is present the SCE chime is cut hard at 5.0 s (right
+  before the IOP reboot for the game), which is intended behaviour, not
+  an underrun.
 - IRQs: intrman 0x24/0x28 (DMA ch4/ch7), 9 (SPU IRQA). libspu2 also
   toggles ATTR bit 6 to arm/clear the IRQ ("wait (IRQ/ON)" / "IRQ/OFF"
   read the bit back).
