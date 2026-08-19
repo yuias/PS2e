@@ -1,14 +1,17 @@
 //! SPU2 (sound processor): register file, 2 MiB sound RAM, the transfer
 //! engine (manual STD writes, DMA ch4/ch7, AutoDMA streaming), the IRQA
 //! interrupt and a 48 kHz mixer for the 2x24 ADPCM voices plus AutoDMA
-//! input. Transfer timing matters as much as data: libspu2 polls STATX
+//! input, with the reverb unit (see `reverb.rs`) fed by the MMIX wet
+//! paths. Transfer timing matters as much as data: libspu2 polls STATX
 //! after reset and after transfers, and its AutoDMA streaming re-arms the
 //! DMA from the completion interrupt, so a transfer that completes
 //! instantly turns into an interrupt storm that starves every other IOP
 //! thread.
 
+mod reverb;
 mod voice;
 
+use reverb::{Reverb, ReverbRegs};
 use tracing::{debug, trace};
 use voice::{Voice, VoiceRegs};
 
@@ -44,9 +47,20 @@ const REG_MVOL: usize = 0x760;
 const CORE_VOL_STRIDE: usize = 0x28;
 const REG_IRQINFO: usize = 0x7C2;
 
-/// MMIX gates for the dry paths we mix (no reverb): voices and AutoDMA input.
-const MMIX_VOICE_DRY: u16 = 0x0C00;
-const MMIX_INPUT_DRY: u16 = 0x00C0;
+/// MMIX gate bits, left channel; the right channel is the bit below. Dry
+/// goes to the core output, wet to the reverb input.
+const MMIX_VOICE_DRY: u16 = 0x0800;
+const MMIX_VOICE_WET: u16 = 0x0200;
+const MMIX_INPUT_DRY: u16 = 0x0080;
+const MMIX_INPUT_WET: u16 = 0x0020;
+const MMIX_EXT_DRY: u16 = 0x0008;
+const MMIX_EXT_WET: u16 = 0x0002;
+
+/// Reverb registers per core: ESA, 22 address registers, EEA.
+const REG_ESA: usize = 0x2E0;
+const REG_EEA: usize = 0x33C;
+/// Reverb coefficients (vIIR..vRIN) in the per-core volume block.
+const REG_RVOL: usize = 0x774;
 
 /// ATTR transfer modes (bits 5:4); 0 = stop, 1 = manual write.
 const MODE_DMA_WRITE: u16 = 2;
@@ -71,6 +85,7 @@ struct Core {
     /// AutoDMA input read position (0..0x200 halfwords into the L/R areas).
     adma_pos: usize,
     voices: [Voice; 24],
+    reverb: Reverb,
 }
 
 pub struct Spu2 {
@@ -479,19 +494,61 @@ impl Spu2 {
         i32::from(v as i16)
     }
 
-    /// One 48 kHz output sample: voices and AutoDMA input per core, master
-    /// volume, core 0 folded into core 1 (its "external input", AVOL).
+    /// 32-bit register pair, low halfword first (KON/KOFF/VMIX*/ENDX style).
+    fn addr_reg32(&self, off: usize) -> u32 {
+        u32::from(self.reg16(off)) | (u32::from(self.reg16(off + 2)) << 16)
+    }
+
+    /// 20-bit halfword address register pair (high halfword first).
+    fn addr_reg(&self, off: usize) -> u32 {
+        (u32::from(self.reg16(off) & 0xF) << 16) | u32::from(self.reg16(off + 2))
+    }
+
+    fn reverb_regs(&self, core: usize) -> ReverbRegs {
+        let base = core * 0x400;
+        let mut regs = ReverbRegs {
+            esa: self.addr_reg(base + REG_ESA),
+            eea: (u32::from(self.reg16(base + REG_EEA) & 0xF) << 16) | 0xFFFF,
+            ..Default::default()
+        };
+        for (i, a) in regs.addr.iter_mut().enumerate() {
+            *a = self.addr_reg(base + REG_ESA + 4 + i * 4);
+        }
+        for (i, v) in regs.vol.iter_mut().enumerate() {
+            *v = Self::volume16(self.reg16(REG_RVOL + core * CORE_VOL_STRIDE + i * 2));
+        }
+        regs
+    }
+
+    /// Sum of a stereo pair into `dry`/`wet` under an MMIX gate pair
+    /// (`gate` is the left bit, the right bit is the one below).
+    fn route(mmix: u16, gate: u16, l: i32, r: i32, acc: &mut [i32; 2]) {
+        if mmix & gate != 0 {
+            acc[0] += l;
+        }
+        if mmix & (gate >> 1) != 0 {
+            acc[1] += r;
+        }
+    }
+
+    /// One 48 kHz output sample: voices and AutoDMA input per core routed
+    /// dry and wet by MMIX, reverb at EVOL, master volume, core 0 folded
+    /// into core 1 as its "external input" (AVOL).
     fn mix_sample(&mut self) {
-        let mut core_out = [[0i32; 2]; 2];
+        let mut ext = [0i32; 2];
+        let mut final_out = [0i32; 2];
         for c in 0..2 {
             let base = c * 0x400;
             let attr = self.attr(c);
             let mmix = self.reg16(REG_MMIX + base);
             let irq_enabled = attr & 0x40 != 0;
             let irqa = self.irqa(c);
-            let vmixl = u32::from(self.reg16(REG_VMIXL + base)) | (u32::from(self.reg16(REG_VMIXL + base + 2)) << 16);
-            let vmixr = u32::from(self.reg16(REG_VMIXR + base)) | (u32::from(self.reg16(REG_VMIXR + base + 2)) << 16);
-            let (mut l, mut r) = (0i32, 0i32);
+            let vmixl = self.addr_reg32(REG_VMIXL + base);
+            let vmixr = self.addr_reg32(REG_VMIXR + base);
+            let vmixel = self.addr_reg32(REG_VMIXL + base + 4);
+            let vmixer = self.addr_reg32(REG_VMIXR + base + 4);
+            let mut dry = [0i32; 2];
+            let mut wet = [0i32; 2];
             for v in 0..24 {
                 let vb = base + v * 0x10;
                 let regs = VoiceRegs {
@@ -512,14 +569,23 @@ impl Spu2 {
                         debug!(target: "ps2_core::spu2", t = self.t(), core = c, voice = v, addr = format_args!("{irqa:#x}"), "IRQA hit by voice");
                     }
                 }
-                if sample == 0 || mmix & MMIX_VOICE_DRY == 0 {
+                if sample == 0 {
                     continue;
                 }
-                if vmixl & (1 << v) != 0 {
-                    l += (sample * Self::volume(self.reg16(vb))) >> 15;
+                let bit = 1u32 << v;
+                let l = if (vmixl | vmixel) & bit != 0 { (sample * Self::volume(self.reg16(vb))) >> 15 } else { 0 };
+                let r = if (vmixr | vmixer) & bit != 0 { (sample * Self::volume(self.reg16(vb + 2))) >> 15 } else { 0 };
+                if vmixl & bit != 0 && mmix & MMIX_VOICE_DRY != 0 {
+                    dry[0] += l;
                 }
-                if vmixr & (1 << v) != 0 {
-                    r += (sample * Self::volume(self.reg16(vb + 2))) >> 15;
+                if vmixr & bit != 0 && mmix & (MMIX_VOICE_DRY >> 1) != 0 {
+                    dry[1] += r;
+                }
+                if vmixel & bit != 0 && mmix & MMIX_VOICE_WET != 0 {
+                    wet[0] += l;
+                }
+                if vmixer & bit != 0 && mmix & (MMIX_VOICE_WET >> 1) != 0 {
+                    wet[1] += r;
                 }
             }
             let vol_base = REG_MVOL + c * CORE_VOL_STRIDE;
@@ -536,22 +602,36 @@ impl Spu2 {
                     self.cores[c].adma_filled[pos >> 8] = false;
                     self.adma_fill(c);
                 }
-                if mmix & MMIX_INPUT_DRY != 0 {
-                    l += (il * Self::volume16(self.reg16(vol_base + 12))) >> 15;
-                    r += (ir * Self::volume16(self.reg16(vol_base + 14))) >> 15;
-                }
+                let il = (il * Self::volume16(self.reg16(vol_base + 12))) >> 15;
+                let ir = (ir * Self::volume16(self.reg16(vol_base + 14))) >> 15;
+                Self::route(mmix, MMIX_INPUT_DRY, il, ir, &mut dry);
+                Self::route(mmix, MMIX_INPUT_WET, il, ir, &mut wet);
+            }
+            if c == 1 {
+                let el = (ext[0] * Self::volume16(self.reg16(vol_base + 8))) >> 15;
+                let er = (ext[1] * Self::volume16(self.reg16(vol_base + 10))) >> 15;
+                Self::route(mmix, MMIX_EXT_DRY, el, er, &mut dry);
+                Self::route(mmix, MMIX_EXT_WET, el, er, &mut wet);
+            }
+            // Reverb: ATTR bit 7 enables the unit; EVOL scales its output.
+            if attr & 0x80 != 0 {
+                let regs = self.reverb_regs(c);
+                let Self { ram, cores, .. } = self;
+                let rv = cores[c].reverb.sample(ram, &regs, wet[0], wet[1]);
+                dry[0] += (rv[0] * Self::volume16(self.reg16(vol_base + 4))) >> 15;
+                dry[1] += (rv[1] * Self::volume16(self.reg16(vol_base + 6))) >> 15;
             }
             let mvoll = Self::volume(self.reg16(vol_base));
             let mvolr = Self::volume(self.reg16(vol_base + 2));
-            core_out[c] = [(l * mvoll) >> 15, (r * mvolr) >> 15];
+            let out = [(dry[0] * mvoll) >> 15, (dry[1] * mvolr) >> 15];
+            if c == 0 {
+                ext = out;
+            } else {
+                final_out = out;
+            }
         }
-        let vol_base = REG_MVOL + CORE_VOL_STRIDE;
-        let avoll = Self::volume16(self.reg16(vol_base + 8));
-        let avolr = Self::volume16(self.reg16(vol_base + 10));
-        let l = core_out[1][0] + ((core_out[0][0] * avoll) >> 15);
-        let r = core_out[1][1] + ((core_out[0][1] * avolr) >> 15);
-        self.out.push(l.clamp(-0x8000, 0x7FFF) as i16);
-        self.out.push(r.clamp(-0x8000, 0x7FFF) as i16);
+        self.out.push(final_out[0].clamp(-0x8000, 0x7FFF) as i16);
+        self.out.push(final_out[1].clamp(-0x8000, 0x7FFF) as i16);
     }
 }
 
@@ -622,7 +702,11 @@ mod tests {
         spu.write::<2>(REG_VADDR + 2, 0x1000);
         spu.write::<2>(REG_VMIXL, 1);
         spu.write::<2>(REG_VMIXR, 1);
-        spu.write::<2>(REG_MMIX, u32::from(MMIX_VOICE_DRY));
+        spu.write::<2>(REG_MMIX, u32::from(MMIX_VOICE_DRY | MMIX_VOICE_DRY >> 1));
+        // Core 0 reaches the output through core 1's external input.
+        spu.write::<2>(REG_MMIX + 0x400, u32::from(MMIX_EXT_DRY | MMIX_EXT_DRY >> 1));
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE, 0x3FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 2, 0x3FFF);
         spu.write::<2>(REG_MVOL, 0x3FFF);
         spu.write::<2>(REG_MVOL + 2, 0x3FFF);
         spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 8, 0x7FFF);
@@ -654,7 +738,11 @@ mod tests {
     fn adma_plays_blocks_in_order() {
         let mut spu = Spu2::new();
         spu.write::<2>(REG_ADMAS, 1);
-        spu.write::<2>(REG_MMIX, u32::from(MMIX_INPUT_DRY));
+        spu.write::<2>(REG_MMIX, u32::from(MMIX_INPUT_DRY | MMIX_INPUT_DRY >> 1));
+        // Core 0 reaches the output through core 1's external input.
+        spu.write::<2>(REG_MMIX + 0x400, u32::from(MMIX_EXT_DRY | MMIX_EXT_DRY >> 1));
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE, 0x3FFF);
+        spu.write::<2>(REG_MVOL + CORE_VOL_STRIDE + 2, 0x3FFF);
         spu.write::<2>(REG_MVOL, 0x3FFF);
         spu.write::<2>(REG_MVOL + 2, 0x3FFF);
         // BVOL for core 0 and AVOL on core 1 (core 0 feeds core 1's input).
