@@ -794,16 +794,23 @@ impl Gs {
             self.scan_line(&view, sy, &mut line);
             let row = &mut woven[y as usize * stride..][..stride];
             if matches!(mode, Deinterlace::Adaptive | Deinterlace::AdaptiveDebug) {
+                // Motion weight 0..=255 per pixel: the change against the
+                // same field two vblanks ago mapped through a soft ramp,
+                // spread two pixels sideways so edges are not speckled, and
+                // decaying over the field's later updates so a pixel that
+                // just stopped stays rebuilt a little longer.
                 let flags = &mut motion[(y * w) as usize..][..w as usize];
-                for (x, f) in flags.iter_mut().enumerate() {
+                let mut fresh = vec![0u8; w as usize];
+                for (x, f) in fresh.iter_mut().enumerate() {
                     let (a, b) = (&row[x * 4..x * 4 + 3], &line[x * 4..x * 4 + 3]);
                     let diff = a.iter().zip(b).map(|(&p, &q)| p.abs_diff(q)).max().unwrap_or(0);
-                    // 0 = still, 1 = changed a little, 2 = moved.
-                    *f = if diff > MOTION_THRESHOLD {
-                        2
-                    } else {
-                        u8::from(diff != 0)
-                    };
+                    *f = ((u32::from(diff.saturating_sub(MOTION_LO)) * 255) / u32::from(MOTION_HI - MOTION_LO)).min(255) as u8;
+                }
+                for x in 0..w as usize {
+                    let lo = x.saturating_sub(2);
+                    let hi = (x + 2).min(w as usize - 1);
+                    let spread = fresh[lo..=hi].iter().copied().max().unwrap_or(0);
+                    flags[x] = spread.max(flags[x] / 2);
                 }
             }
             row.copy_from_slice(&line);
@@ -832,8 +839,8 @@ impl Gs {
                 }
             }
             Deinterlace::Adaptive | Deinterlace::AdaptiveDebug => {
-                // Keep the old field where nothing moved, interpolate the new
-                // one where either neighbouring new row changed.
+                // Keep the old field where nothing moved, rebuild from the
+                // new one where it did, mixing by the motion weight.
                 let debug = mode == Deinterlace::AdaptiveDebug;
                 for y in (0..h).filter(|y| (y & 1 != 0) != field) {
                     Self::interpolate_row(&woven, &mut out, w, h, y, Some((&motion, debug)));
@@ -846,10 +853,10 @@ impl Gs {
     }
 
     /// Fill row `y` of `out` from the rows above and below in `woven` (the
-    /// current field): everywhere, or (motion-adaptive, after PCSX2's MAD
-    /// shader) only where those rows or this one moved, or where they
-    /// changed a little and this row combs against them — a static pixel
-    /// (no change at all) is always kept, so still images stay woven.
+    /// current field): everywhere (bob), or weighted by the motion of this
+    /// row and its neighbours (adaptive). Rebuilt pixels use edge-directed
+    /// interpolation (the best-matching of five directions between the
+    /// rows, as in yadif's spatial predictor) so diagonals do not stair.
     fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<(&[u8], bool)>) {
         let stride = (w * 4) as usize;
         let above = y.saturating_sub(1);
@@ -859,33 +866,48 @@ impl Gs {
         let (ra, rb) = (&woven[above as usize * stride..][..stride], &woven[below as usize * stride..][..stride]);
         let cur = &woven[y as usize * stride..][..stride];
         let row = &mut out[y as usize * stride..][..stride];
-        let thr = MOTION_THRESHOLD;
+        let wmax = w as usize - 1;
+        fn px(r: &[u8], x: usize) -> &[u8] {
+            &r[x * 4..x * 4 + 3]
+        }
         for x in 0..w as usize {
-            let mut debug = false;
-            if let Some((m, dbg)) = motion {
-                debug = dbg;
-                let flags = m[(above * w) as usize + x] | m[(below * w) as usize + x] | m[(y * w) as usize + x];
-                if flags == 0 {
-                    continue; // completely still
-                }
-                if flags < 2 {
-                    // Small change only: rebuild just where this row combs
-                    // against neighbours that agree with each other.
-                    let (p, q) = (&ra[x * 4..x * 4 + 3], &rb[x * 4..x * 4 + 3]);
-                    let c = &cur[x * 4..x * 4 + 3];
-                    let hl = p.iter().zip(q).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
-                    let hc = p.iter().zip(c).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
-                    if !(hl <= thr && hc > thr) {
+            let weight = match motion {
+                None => 255u32,
+                Some((m, _)) => {
+                    let wgt = m[(above * w) as usize + x].max(m[(below * w) as usize + x]).max(m[(y * w) as usize + x]);
+                    if wgt == 0 {
                         continue;
                     }
+                    u32::from(wgt)
+                }
+            };
+            // Edge-directed: pick the direction whose three-pixel windows
+            // on the rows above and below agree best.
+            let mut best = (u32::MAX, 0i32);
+            for j in -2i32..=2 {
+                let mut score = 0u32;
+                for k in -1i32..=1 {
+                    let xa = (x as i32 + j + k).clamp(0, wmax as i32) as usize;
+                    let xb = (x as i32 - j + k).clamp(0, wmax as i32) as usize;
+                    score += px(ra, xa).iter().zip(px(rb, xb)).map(|(&a, &b)| u32::from(a.abs_diff(b))).sum::<u32>();
+                }
+                // Prefer the vertical direction on ties, then nearer ones.
+                let score = score * 4 + j.unsigned_abs();
+                if score < best.0 {
+                    best = (score, j);
                 }
             }
+            let xa = (x as i32 + best.1).clamp(0, wmax as i32) as usize;
+            let xb = (x as i32 - best.1).clamp(0, wmax as i32) as usize;
             for c in 0..4 {
-                row[x * 4 + c] = ((ra[x * 4 + c] as u16 + rb[x * 4 + c] as u16 + 1) >> 1) as u8;
+                let interp = (u32::from(ra[xa * 4 + c]) + u32::from(rb[xb * 4 + c]) + 1) >> 1;
+                let keep = u32::from(cur[x * 4 + c]);
+                row[x * 4 + c] = ((keep * (255 - weight) + interp * weight + 127) / 255) as u8;
             }
-            if debug {
+            if let Some((_, true)) = motion {
+                // Tint by weight so the mask is visible.
                 row[x * 4] = 255;
-                row[x * 4 + 1] = 0;
+                row[x * 4 + 1] = (255 - weight) as u8;
                 row[x * 4 + 2] = 255;
             }
         }
@@ -978,8 +1000,11 @@ pub enum Deinterlace {
     AdaptiveDebug,
 }
 
-/// Per-channel difference above which a pixel counts as moving.
-const MOTION_THRESHOLD: u8 = 24;
+/// Per-channel change below which a pixel counts as still, and above
+/// which it is fully rebuilt; in between the weave and the rebuilt value
+/// are mixed.
+const MOTION_LO: u8 = 6;
+const MOTION_HI: u8 = 40;
 
 /// Read-circuit parameters for scanout.
 struct DisplayView {
@@ -1029,22 +1054,31 @@ mod tests {
         fill(&mut gs, 0x40);
         let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Bob);
         assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x40, 0x40));
-        // Adaptive: field 0 moves (0x30 -> 0x50) so the odd rows (0x40) are
-        // replaced by interpolation of the new even rows. The next still
-        // field 1 (0x40 again) still sees the even rows as moving (their own
-        // last change), and only once field 0 repeats does the frame weave.
-        fill(&mut gs, 0x50);
+        // Adaptive: field 0 moves a lot (0x30 -> 0x80) so the odd rows
+        // (0x40) are rebuilt from the new even rows; the motion weight then
+        // decays over the following still fields until the frame weaves.
+        fill(&mut gs, 0x80);
         let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Adaptive);
-        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x50));
-        fill(&mut gs, 0x40);
-        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Adaptive);
-        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x40, 0x40));
-        fill(&mut gs, 0x50);
-        let (_, _, f) = gs.framebuffer_woven(false, Deinterlace::Adaptive);
-        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x40));
-        fill(&mut gs, 0x40);
-        let (_, _, f) = gs.framebuffer_woven(true, Deinterlace::Adaptive);
-        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x50, 0x40));
+        assert_eq!((px(&f, 64, 5, 2), px(&f, 64, 5, 3)), (0x80, 0x80));
+        // Per frame the missing rows (the other field's) head back from the
+        // rebuilt value to their woven value as the weight decays.
+        let (mut last_even, mut last_odd) = (0x40u8, 0x80u8);
+        for i in 0..16 {
+            let field1 = i % 2 == 0;
+            fill(&mut gs, if field1 { 0x40 } else { 0x80 });
+            let (_, _, f) = gs.framebuffer_woven(field1, Deinterlace::Adaptive);
+            let (even, odd) = (px(&f, 64, 5, 2), px(&f, 64, 5, 3));
+            if field1 {
+                assert_eq!(odd, 0x40);
+                assert!(even >= last_even, "even row drifts back up: {even:#x} after {last_even:#x}");
+                last_even = even;
+            } else {
+                assert_eq!(even, 0x80);
+                assert!(odd <= last_odd, "odd row drifts back down: {odd:#x} after {last_odd:#x}");
+                last_odd = odd;
+            }
+        }
+        assert_eq!((last_even, last_odd), (0x80, 0x40), "settles back to the weave");
     }
 
     /// Full-screen textured sprite copying one 640x224 buffer into another
