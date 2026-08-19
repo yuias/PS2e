@@ -62,6 +62,10 @@ impl Stats {
 enum Cmd {
     /// General register write (GIF/VIF/VU1 paths).
     Reg(u8, u64),
+    /// A run of HWREG words (IMAGE transfer payload), kept as one command
+    /// so the renderer decodes the transfer setup once per run instead of
+    /// once per 64 bits.
+    Image(Vec<u64>),
     /// Privileged display register (PMODE, DISPFB, ...), kept in order
     /// with the drawing that precedes it.
     Priv(u32, u64),
@@ -78,6 +82,9 @@ enum Cmd {
 
 /// Flush a batch to the worker once it holds this many commands.
 const BATCH_MAX: usize = 4096;
+/// HWREG words per Image command at most (512 KiB), so a long upload
+/// streams to the worker instead of landing all at once.
+const IMAGE_RUN_MAX: usize = 65536;
 /// Batches the worker may fall behind before the EE side blocks. A frame
 /// of full-screen IMAGE uploads is ~150k commands, so this holds a few
 /// frames and lets the EE run ahead through GS-heavy bursts.
@@ -97,6 +104,8 @@ pub struct GsFront {
     #[cfg(feature = "threads")]
     worker: Option<Worker>,
     batch: Vec<Cmd>,
+    /// HWREG words accumulated since the last other command.
+    image: Vec<u64>,
     // Privileged registers (EE-visible copies).
     pub pmode: u64,
     pub smode1: u64,
@@ -182,6 +191,7 @@ impl GsFront {
             #[cfg(feature = "threads")]
             worker: None,
             batch: Vec::with_capacity(BATCH_MAX),
+            image: Vec::new(),
             pmode: 0,
             smode1: 0,
             smode2: 0,
@@ -203,6 +213,7 @@ impl GsFront {
     fn run_cmd(gs: &mut Gs, cmd: Cmd, latest: &std::sync::Mutex<Option<Frame>>) {
         match cmd {
             Cmd::Reg(reg, v) => gs.write_reg(reg, v),
+            Cmd::Image(data) => gs.image(&data),
             Cmd::Priv(addr, v) => gs.priv_write(addr, v),
             Cmd::Vblank(field) => {
                 let frame = gs.framebuffer_woven(field);
@@ -226,14 +237,25 @@ impl GsFront {
             Self::run_cmd(gs, cmd, &self.latest_frame);
             return;
         }
+        self.flush_image();
         self.batch.push(cmd);
         if self.batch.len() >= BATCH_MAX {
             self.flush();
         }
     }
 
+    /// Queue the accumulated HWREG words as one command.
+    #[inline]
+    fn flush_image(&mut self) {
+        if !self.image.is_empty() {
+            let data = std::mem::take(&mut self.image);
+            self.batch.push(Cmd::Image(data));
+        }
+    }
+
     /// Hand the pending batch to the worker (no-op inline).
     pub fn flush(&mut self) {
+        self.flush_image();
         #[cfg(feature = "threads")]
         if let Some(w) = &mut self.worker
             && !self.batch.is_empty()
@@ -266,6 +288,13 @@ impl GsFront {
             0x60 => self.raise_int(0), // SIGNAL
             0x61 => self.raise_int(1), // FINISH
             0x62 => {}                 // LABEL
+            0x54 if self.inline.is_none() => {
+                // HWREG: collect the run (see Cmd::Image).
+                self.image.push(v);
+                if self.image.len() >= IMAGE_RUN_MAX {
+                    self.flush_image();
+                }
+            }
             _ => self.push(Cmd::Reg(reg, v)),
         }
     }

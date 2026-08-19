@@ -453,6 +453,78 @@ impl Gs {
 
     // --- transfers -------------------------------------------------------
 
+    /// A run of HWREG words. PSMT8 and PSMCT32 destinations (textures and
+    /// frame-sized uploads) keep a per-row base address and step through
+    /// the column table, the rest go word by word through [`Gs::hwreg`].
+    pub fn image(&mut self, data: &[u64]) {
+        if self.trxdir != 0 {
+            return;
+        }
+        let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
+        if dpsm != PSMT8 && dpsm != PSMCT32 {
+            for &v in data {
+                self.hwreg(v);
+            }
+            return;
+        }
+        let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        self.clut_dirty = true;
+        let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
+        let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
+        let dsax = ((self.trxpos >> 32) & 0x7FF) as u32;
+        let dsay = ((self.trxpos >> 48) & 0x7FF) as u32;
+        let rrw = (self.trxreg & 0xFFF) as u32;
+        let rrh = ((self.trxreg >> 32) & 0xFFF) as u32;
+        if rrw == 0 {
+            return;
+        }
+        let (mut x, mut y) = (self.trx_x, self.trx_y);
+        let canvas = &self.canvas;
+        match dpsm {
+            PSMT8 => {
+                let mut base = layout::row_base8(dbp, dbw, dsay + y);
+                'words: for &w in data {
+                    for i in 0..8 {
+                        if y >= rrh {
+                            break 'words;
+                        }
+                        let ay = dsay + y;
+                        canvas.wr8((base + layout::col_off8(ay, dsax + x)) & (VRAM_SIZE - 1), (w >> (i * 8)) as u8);
+                        x += 1;
+                        if x >= rrw {
+                            x = 0;
+                            y += 1;
+                            base = layout::row_base8(dbp, dbw, dsay + y);
+                        }
+                    }
+                }
+            }
+            _ => {
+                let mut base = layout::row_base32(dbp, dbw, dsay + y, false);
+                'words: for &w in data {
+                    for i in 0..2 {
+                        if y >= rrh {
+                            break 'words;
+                        }
+                        let ay = dsay + y;
+                        canvas.wr32(
+                            (base + layout::col_off32(ay, dsax + x, false)) & (VRAM_SIZE - 1),
+                            (w >> (i * 32)) as u32,
+                        );
+                        x += 1;
+                        if x >= rrw {
+                            x = 0;
+                            y += 1;
+                            base = layout::row_base32(dbp, dbw, dsay + y, false);
+                        }
+                    }
+                }
+            }
+        }
+        self.trx_x = x;
+        self.trx_y = y;
+    }
+
     /// HWREG: one 64-bit chunk of a HOST->LOCAL image transfer.
     fn hwreg(&mut self, v: u64) {
         if self.trxdir != 0 {
