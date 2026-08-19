@@ -1,10 +1,39 @@
-//! SPU2 voice: ADPCM block decoding, pitch stepping and the ADSR envelope.
-//! Same scheme as the PS1 SPU (16-byte blocks of 28 nibbles, 4-bit shift +
-//! filter, loop flags), with SPU2's 20-bit halfword addressing.
+//! SPU2 voice: ADPCM block decoding, pitch stepping with 4-tap Gaussian
+//! interpolation and the ADSR envelope. Same scheme as the PS1 SPU
+//! (16-byte blocks of 28 nibbles, 4-bit shift + filter, loop flags), with
+//! SPU2's 20-bit halfword addressing.
+
+use std::sync::LazyLock;
 
 /// ADPCM prediction filter coefficients (x64), indexed by the block's
 /// filter nibble.
 const FILTERS: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, -60)];
+
+/// Gaussian interpolation weights per 8-bit phase, for the four most
+/// recent samples oldest first (the output tracks the third-newest sample
+/// at phase 0 and the second-newest at phase 1, like the hardware table).
+/// Generated from the windowed-sinc fit of the SPU ROM table by Near,
+/// nocash and Ryphecha rather than copied from it; 15-bit weights summing
+/// to 0x7F80.
+static GAUSS: LazyLock<[[i32; 4]; 256]> = LazyLock::new(|| {
+    use std::f64::consts::PI;
+    let mut table = [0f64; 512];
+    for (n, slot) in table.iter_mut().rev().enumerate() {
+        let k = 0.5 + n as f64;
+        let s = (PI * k * 2.048 / 1024.0).sin();
+        let t = ((PI * k * 2.0 / 1023.0).cos() - 1.0) * 0.5;
+        let u = ((PI * k * 4.0 / 1023.0).cos() - 1.0) * 0.08;
+        *slot = s * (t + u + 1.0) / k;
+    }
+    let scale = f64::from(0x7F80 * 128) / table.iter().sum::<f64>();
+    let mut out = [[0i32; 4]; 256];
+    for phase in 0..256 {
+        let taps = [table[phase], table[phase + 256], table[511 - phase], table[255 - phase]].map(|v| v * scale);
+        let diff = (taps.iter().sum::<f64>() - f64::from(0x7F80)) / 4.0;
+        out[255 - phase] = taps.map(|v| (v - diff).round() as i32);
+    }
+    out
+});
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -27,8 +56,11 @@ pub struct Voice {
     /// Decoded samples of the current block and the read position within.
     block: [i16; 28],
     pos: usize,
-    /// Last two output samples, for the prediction filter.
+    /// Last two decoded samples, for the prediction filter.
     hist: [i32; 2],
+    /// The four most recently stepped-to samples, newest first, for the
+    /// interpolator.
+    recent: [i32; 4],
     /// Pitch phase accumulator (12 fractional bits).
     counter: u32,
     pub phase: Phase,
@@ -51,6 +83,7 @@ impl Default for Voice {
             block: [0; 28],
             pos: 28,
             hist: [0; 2],
+            recent: [0; 4],
             counter: 0,
             phase: Phase::Off,
             level: 0,
@@ -77,6 +110,7 @@ impl Voice {
         self.lsax_pinned = false;
         self.pos = 28;
         self.hist = [0; 2];
+        self.recent = [0; 4];
         self.counter = 0;
         self.phase = Phase::Attack;
         self.level = 0;
@@ -97,9 +131,9 @@ impl Voice {
         self.phase != Phase::Off
     }
 
-    /// Advance one output sample. Returns the sample after the envelope
-    /// (16-bit range) and whether a new block was fetched at `nax` (for
-    /// IRQA checks by the caller, which sees the updated `nax`).
+    /// Advance one output sample. Returns the interpolated sample after the
+    /// envelope (16-bit range) and whether a new block was fetched at `nax`
+    /// (for IRQA checks by the caller, which sees the updated `nax`).
     pub fn step(&mut self, ram: &[u8], regs: VoiceRegs) -> (i32, bool) {
         if self.phase == Phase::Off {
             return (0, false);
@@ -119,8 +153,11 @@ impl Voice {
                     return (0, fetched);
                 }
             }
+            self.recent = [i32::from(self.block[self.pos]), self.recent[0], self.recent[1], self.recent[2]];
         }
-        let sample = i32::from(self.block[self.pos.min(27)]);
+        let g = &GAUSS[(self.counter >> 4) as usize & 0xFF];
+        let sample =
+            (g[0] * self.recent[3] + g[1] * self.recent[2] + g[2] * self.recent[1] + g[3] * self.recent[0]) >> 15;
         self.step_envelope(regs);
         ((sample * self.level) >> 15, fetched)
     }
@@ -283,6 +320,42 @@ mod tests {
         }
         assert!(v.endx);
         assert!(!v.active());
+    }
+
+    #[test]
+    fn interpolates_between_samples_at_unity_pitch() {
+        // Alternating +1/-1 nibbles at shift 0: a square wave at half the
+        // sample rate, which the Gaussian taps attenuate, followed by a
+        // constant block they pass through at the table's DC gain.
+        let mut ram = vec![0u8; 0x100];
+        ram[0x00] = 0x00;
+        ram[0x01] = 0x00;
+        for b in &mut ram[2..16] {
+            *b = 0xF1; // nibbles 1, -1 (low first)
+        }
+        ram[0x10..0x20].copy_from_slice(&block(0x03, 0x1));
+        let mut v = Voice::default();
+        v.key_on(0);
+        let r = regs();
+        // Attack takes a while; look at the raw sample before the envelope.
+        let mut raw = vec![];
+        for _ in 0..80 {
+            v.step(&ram, r);
+            raw.push(v.recent);
+        }
+        // Block 1 (samples 28..) is the constant 0x1000: once the four
+        // recent samples are all constant, the interpolated value is
+        // 0x1000 * 0x7F80 / 0x8000.
+        let g = &GAUSS[0];
+        assert_eq!(g.iter().sum::<i32>(), 0x7F80);
+        assert_eq!(raw[40], [0x1000; 4]);
+        let weighted = ((g[0] + g[1] + g[2] + g[3]) * 0x1000) >> 15;
+        assert_eq!(weighted, (0x1000 * 0x7F80) >> 15);
+        // Alternating block: the taps on (+,-,+,-) partly cancel, so the
+        // Nyquist square is attenuated (to ~40% at phase 0).
+        assert_eq!(raw[20][0], -raw[20][1]);
+        let s = (g[0] * raw[20][3] + g[1] * raw[20][2] + g[2] * raw[20][1] + g[3] * raw[20][0]) >> 15;
+        assert!(s.abs() < 0x1000 / 2, "{s:#x}");
     }
 
     #[test]
