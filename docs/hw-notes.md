@@ -403,6 +403,17 @@ each wait):
   counter bits 4..11, weights oldest-first, output centred two samples
   behind the newest); nearest sampling left strong aliasing above 8 kHz
   on the boot chime.
+- Reverb: per-core ESA (0x2E0 H/L) .. EEA (0x33C, low halfword implied
+  0xFFFF), the 22 address registers at 0x2E4.. in nocash's PS1 order as
+  20-bit halfword offsets relative to ESA (the PS1 presets times four:
+  the OSD's hall has dAPF1 = 0x38C = PS1 0xE3 * 4), coefficients vIIR..
+  vRIN at 0x774 (+0x28 for core 1), EVOL at 0x764/0x78C, ATTR bit 7
+  enables. MMIX routes per channel: bits 11/10 voice dry, 9/8 voice
+  wet (VMIXEL/VMIXER select voices), 7/6 input dry, 5/4 input wet,
+  3/2 external (core 0 -> core 1, AVOL) dry, 1/0 external wet; core 1's
+  MVOL is the final one. Amagami uses MMIX 0x0FFC on core 1 — its ADX
+  music (core 0 ADMA) stays dry, only core 1's voices get the hall
+  (ESA 0xEDBE0, EVOL 0x3FFF); the OSD fades EVOL in under the chime.
 - The OSD stops a voice by writing ADSR1/ADSR2 = 0 and then keying it
   off: release shift 0 drops the envelope to zero in two samples, so
   when a disc is present the SCE chime is cut hard at 5.0 s (right

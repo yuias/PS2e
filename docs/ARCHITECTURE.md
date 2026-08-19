@@ -66,17 +66,19 @@ Planned crates:
    (MagicGate replies), 2048-byte-sector ISO streaming, disc key,
    DEC-SET, PS2LOGO → LoadExecPS2 → EELOAD → game ELF.
 5. **VU/VIF/IPU/SPU2/pads** *(mostly done)* — SIO2 pads and cards, SPU2
-   voices/ADMA/mixer with WAV capture and live cpal output; Amagami
-   (SLPS-25918) is playable through its title, menus, name entry and
-   prologue. Not yet: IPU, VU1 timing, SPU2 sweep volumes.
+   voices (Gaussian-interpolated) / ADMA / MMIX routing / reverb with
+   WAV capture and live cpal output; Amagami (SLPS-25918) is playable
+   through its title, menus, name entry and prologue, and its streamed
+   music reaches the output bit-exact (`tools/adxcmp.py`). Not yet: IPU,
+   VU1 timing, SPU2 sweep volumes, reverb input/output resampling FIRs.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
    keyboard pad input, TTY and register panels (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel
    pipeline split across a rayon pool for large primitives, idle-loop
    skipping on both cores; Amagami runs at ~1.9x real time headless (the
-   OSD's blur-heavy boot screens at ~40%). Next: SPU2 audio quality (a
-   constant noise under music, boot chime starvation), the IOP
-   interpreter, and the wasm front-end.
+   OSD's blur-heavy boot screens at ~50%, which is what starves the
+   audio buffer during the boot chime). Next: the IOP interpreter, OSD
+   sprite throughput, and the wasm front-end.
 
 ## Component map (ps2-core)
 
@@ -103,8 +105,9 @@ ps2-core/src/
 │   ├── layout.rs # Hardware page/block/column addressing for every pixel format
 │   └── raster.rs # Triangle/sprite rasterization, texture sampling, tests, blending
 └── spu2/
-    ├── mod.rs    # Registers, transfer engine, ADMA, mixer
-    └── voice.rs  # ADPCM decode, ADSR envelopes
+    ├── mod.rs    # Registers, transfer engine, ADMA ring, MMIX routing, mixer
+    ├── voice.rs  # ADPCM decode, Gaussian interpolation, ADSR envelopes
+    └── reverb.rs # Reverb unit (nocash formula at 24 kHz over ESA..EEA)
 ```
 
 Not yet split out: `ipu/` (absent), a full 10-channel `dmac/` (channels live in
