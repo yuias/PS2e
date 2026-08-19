@@ -57,6 +57,7 @@ pub struct App {
     last_screenshot: Option<String>,
     show_tty: bool,
     show_regs: bool,
+    fullscreen: bool,
 }
 
 impl App {
@@ -71,6 +72,7 @@ impl App {
             last_screenshot: None,
             show_tty: false,
             show_regs: false,
+            fullscreen: false,
         }
     }
 
@@ -132,73 +134,108 @@ impl eframe::App for App {
             self.take_screenshot();
         }
 
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // The debugger owns run control while attached
-                ui.add_enabled_ui(!debugger_active, |ui| {
-                    let label = if status.running {
-                        "\u{23f8} Pause"
-                    } else {
-                        "\u{25b6} Run"
-                    };
-                    if ui.button(label).clicked() {
-                        self.emu.send(Command::SetRunning(!status.running));
-                    }
-                    if ui.button("Step").clicked() {
-                        self.emu.send(Command::Step);
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.emu.send(Command::Reset);
-                    }
+        // F11 toggles fullscreen; the chrome (menu, status bar, panels)
+        // hides while fullscreen so only the display shows.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        let chrome = !self.fullscreen;
+
+        if chrome {
+            egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button("Emulation", |ui| {
+                        // The debugger owns run control while attached.
+                        ui.add_enabled_ui(!debugger_active, |ui| {
+                            let label = if status.running { "Pause" } else { "Run" };
+                            if ui.button(label).clicked() {
+                                self.emu.send(Command::SetRunning(!status.running));
+                                ui.close();
+                            }
+                            if ui.button("Step").clicked() {
+                                self.emu.send(Command::Step);
+                                ui.close();
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.emu.send(Command::Reset);
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("Screenshot	F12").clicked() {
+                            self.take_screenshot();
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("View", |ui| {
+                        if ui.button("Fullscreen	F11").clicked() {
+                            self.fullscreen = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                            ui.close();
+                        }
+                        ui.separator();
+                        ui.label("Scaler");
+                        for mode in crate::display::ScaleMode::ALL {
+                            ui.radio_value(&mut self.scale_mode, mode, mode.label());
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.show_tty, "TTY panel");
+                        ui.checkbox(&mut self.show_regs, "Registers panel");
+                    });
+                    ui.menu_button("Audio", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                                .text("volume")
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        );
+                    });
+                    ui.menu_button("Help", |ui| {
+                        ui.label("Pad: arrows = d-pad, Z/X/C/V = cross/circle/square/triangle,");
+                        ui.label("Q/W/E/R = L1/R1/L2/R2, Enter = start, Backspace = select.");
+                        ui.label("F11 fullscreen (Esc leaves), F12 screenshot.");
+                    });
                 });
-                ui.separator();
-                if ui.button("Screenshot (F12)").clicked() {
-                    self.take_screenshot();
-                }
-                if status.debugger != DebuggerState::None {
-                    ui.separator();
-                    ui.label(match status.debugger {
+            });
+
+            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let state = match status.debugger {
                         DebuggerState::Halted => "debugger: halted",
                         DebuggerState::Running => "debugger: running",
                         DebuggerState::Waiting => "waiting for debugger",
+                        DebuggerState::None if status.running => "running",
+                        DebuggerState::None => "paused",
                         _ => "debugger: listening",
-                    });
-                }
-                ui.separator();
-                egui::ComboBox::from_label("Scaler")
-                    .selected_text(self.scale_mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in crate::display::ScaleMode::ALL {
-                            ui.selectable_value(&mut self.scale_mode, mode, mode.label());
+                    };
+                    ui.monospace(state);
+                    ui.separator();
+                    ui.monospace(format!(
+                        "speed {:3.0}% ({:.0} fps)   audio {:3} ms{}",
+                        status.speed * 100.0,
+                        status.speed * 60.0,
+                        status.audio_buffered * 1000 / 48_000,
+                        if status.audio_underruns > 0 {
+                            format!("   underruns {}", status.audio_underruns)
+                        } else {
+                            String::new()
                         }
-                    });
-                ui.separator();
-                ui.checkbox(&mut self.show_tty, "TTY");
-                ui.checkbox(&mut self.show_regs, "Registers");
-                ui.separator();
-                ui.label("volume");
-                ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                        .show_value(false)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
-                ui.separator();
-                ui.monospace(format!(
-                    "cycles {}   speed {:3.0}% ({:.0} fps)   audio {:3}ms{}",
-                    status.cycles,
-                    status.speed * 100.0,
-                    status.speed * 60.0,
-                    status.audio_buffered * 1000 / 48_000,
-                    if status.audio_underruns > 0 {
-                        format!("   underruns {}", status.audio_underruns)
-                    } else {
-                        String::new()
+                    ));
+                    ui.separator();
+                    ui.monospace(format!("cycles {}", status.cycles));
+                    if let Some(path) = &self.last_screenshot {
+                        ui.separator();
+                        ui.monospace(format!("saved {path}"));
                     }
-                ));
+                });
             });
-        });
+        }
 
-        if self.show_regs {
+        if chrome && self.show_regs {
             egui::SidePanel::right("registers")
                 .default_width(280.0)
                 .show(ctx, |ui| {
@@ -262,7 +299,7 @@ impl eframe::App for App {
                 });
         }
 
-        if self.show_tty {
+        if chrome && self.show_tty {
             egui::TopBottomPanel::bottom("tty")
                 .resizable(true)
                 .default_height(160.0)
@@ -287,7 +324,12 @@ impl eframe::App for App {
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central = if self.fullscreen {
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+        } else {
+            egui::CentralPanel::default()
+        };
+        central.show(ctx, |ui| {
             let (width, height, rgba, seq) = {
                 let frame = self.emu.shared.frame.lock().unwrap();
                 (frame.width, frame.height, frame.rgba.clone(), frame.seq)

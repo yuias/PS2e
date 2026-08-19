@@ -72,7 +72,10 @@ Planned crates:
    music reaches the output bit-exact (`tools/adxcmp.py`). Not yet: IPU,
    VU1 timing, SPU2 sweep volumes, reverb input/output resampling FIRs.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
-   keyboard pad input, TTY and register panels (done). Speed: EE x86-64
+   keyboard pad input, menu/status bar, TTY and register panels, F11
+   fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest)
+   and audio rate control that slows playback instead of starving when
+   the machine lags (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel
    pipeline split across a rayon pool for large primitives, idle-loop
    skipping on both cores that jumps straight to the next due bus tick
