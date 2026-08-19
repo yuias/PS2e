@@ -183,13 +183,13 @@ pub fn step_parts(parts: [u64; 4]) {
 }
 
 #[cfg(feature = "profile")]
-static PIXELS: [AtomicU64; 1 << 19] = [const { AtomicU64::new(0) }; 1 << 19];
+static PIXELS: [AtomicU64; 1 << 20] = [const { AtomicU64::new(0) }; 1 << 20];
 
 /// Record one shaded pixel under a small setup key.
 #[inline(always)]
 pub fn count_pixel(key: usize) {
     #[cfg(feature = "profile")]
-    PIXELS[key & ((1 << 19) - 1)].fetch_add(1, Ordering::Relaxed);
+    PIXELS[key & ((1 << 20) - 1)].fetch_add(1, Ordering::Relaxed);
     #[cfg(not(feature = "profile"))]
     let _ = key;
 }
@@ -275,8 +275,8 @@ pub fn report() -> Option<String> {
             out.push_str(&format!(
                 "  kind={} tme={} bil={} abe={} psm={:#04x} tfx={} ate={} zr={} zw={} fbmsk={} fb24={} neutral={} {:5.1}%
 ",
-                k & 3, (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 0x3F,
-                (k >> 11) & 3, (k >> 13) & 1, (k >> 14) & 1, (k >> 15) & 1, (k >> 16) & 1, (k >> 17) & 1, (k >> 18) & 1,
+                k & 7, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, (k >> 6) & 0x3F,
+                (k >> 12) & 3, (k >> 14) & 1, (k >> 15) & 1, (k >> 16) & 1, (k >> 17) & 1, (k >> 18) & 1, (k >> 19) & 1,
                 *n as f64 * 100.0 / px_total as f64
             ));
         }

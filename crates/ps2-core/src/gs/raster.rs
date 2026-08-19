@@ -109,11 +109,12 @@ struct TriGeom {
     sa: [f32; 4],
     sb: [f32; 4],
     sc: [f32; 4],
-    /// Per-pixel steps of the colour and STQU attributes and of v along a
+    /// Per-pixel steps of the colour and STQU attributes, v and z along a
     /// row, for the incremental fast loop.
     d_rgba: [f32; 4],
     d_stqu: [f32; 4],
     d_v: f32,
+    d_z: f64,
 }
 
 impl Gs {
@@ -378,6 +379,7 @@ impl Gs {
             d_rgba: step(col(&a), col(&b), col(&c)),
             d_stqu: step(stq(&a), stq(&b), stq(&c)),
             d_v: a.v as f32 * dl[0] + b.v as f32 * dl[1] + c.v as f32 * dl[2],
+            d_z: a.z as f64 * dl[0] as f64 + b.z as f64 * dl[1] as f64 + c.z as f64 * dl[2] as f64,
         };
         let th = pipe.tex.th as f32;
         let tex_v = if pipe.fst {
@@ -484,14 +486,16 @@ impl Gs {
             blend_c: ((ctx.alpha >> 4) & 3) as u8,
             blend_d: ((ctx.alpha >> 6) & 3) as u8,
             blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
+            z_touched: false,
             fast: false,
             flat_fill: false,
         };
         let z_touched = pipe.zte && !(pipe.ztst == 1 && pipe.zmsk);
-        pipe.fast = pipe.tme && pipe.tfx == 0 && !z_touched && pipe.fbmsk == 0;
+        pipe.z_touched = z_touched;
+        pipe.fast = pipe.tme && pipe.tfx == 0 && pipe.fbmsk == 0;
         // Z may be written (ALWAYS) but never tested; the alpha test on a
         // flat colour is decided once per row by the loop itself.
-        pipe.flat_fill = !pipe.tme && !pipe.abe && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0 && !pipe.fb24;
+        pipe.flat_fill = !pipe.tme && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0;
         pipe
     }
 
@@ -607,7 +611,7 @@ impl Painter<'_> {
                         let fb = f64::from(fu_at(pxb - 1));
                         let du = ((fb - fa) / f64::from(pxb - 1 - pxa) * 4294967296.0) as i64;
                         let ua = (fa * 4294967296.0).floor() as i64;
-                        let args = FastRow { row: &row, pxa, pxb, frag: &frag, row0: &row0.data, row1: &row1.data, u_lo, wy, ua, du };
+                        let args = FastRow { row: &row, pxa, pxb, frag: &frag, row0: &row0.data, row1: &row1.data, u_lo, wy, ua, du, z: frag.z };
                         match (pipe.bilinear, pipe.abe, pipe.ate) {
                             (false, false, false) => self.fast_sprite_row::<false, false, false>(&args),
                             (false, false, true) => self.fast_sprite_row::<false, false, true>(&args),
@@ -706,9 +710,11 @@ impl Painter<'_> {
                     rgba: interp3(&g.ca, &g.cb, &g.cc, l0, l1, l2),
                     stqu: interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2),
                     v: a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2,
+                    z: a.z as f64 * l0 as f64 + b.z as f64 * l1 as f64 + c.z as f64 * l2 as f64,
                     d_rgba: g.d_rgba,
                     d_stqu: g.d_stqu,
                     d_v: g.d_v,
+                    d_z: g.d_z,
                 };
                 match (pipe.bilinear, pipe.abe, pipe.ate) {
                     (false, false, false) => self.fast_tri_row::<false, false, false>(&args),
@@ -766,9 +772,7 @@ impl Painter<'_> {
         self.scratch.tex_samples[pipe.tex.psm as usize] += n;
         #[cfg(feature = "profile")]
         {
-            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
-                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5)
-                | ((pipe.tfx as usize & 3) << 11) | ((pipe.ate as usize) << 13);
+            let k = pipe.profile_key(false);
             for _ in 0..n {
                 crate::prof::count_pixel(k);
             }
@@ -781,9 +785,11 @@ impl Painter<'_> {
             (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
         let canvas = self.canvas;
         let fb24 = pipe.fb24;
+        let ztest = ZTest::new(pipe);
         let mut rgba = a.rgba;
         let mut stqu = a.stqu;
         let mut v = a.v;
+        let mut zf = a.z;
         for px in a.xs..=a.xe {
             let (fu, fv) = if fst {
                 (stqu[3] / 16.0, v / 16.0)
@@ -794,11 +800,13 @@ impl Painter<'_> {
             };
             let texel = if BIL { self.sample_bilinear_cached(fu, fv) } else { self.cached_texel(0, floor_i32(fu), floor_i32(fv)) };
             let (cr, cg, cb, ca) = (rgba[0] as u32, rgba[1] as u32, rgba[2] as u32, rgba[3] as u32);
+            let z = (zf as u32) & pipe.zmask;
             for i in 0..4 {
                 rgba[i] += a.d_rgba[i];
                 stqu[i] += a.d_stqu[i];
             }
             v += a.d_v;
+            zf += a.d_z;
             let ta = texel >> 24;
             let a8 = if tcc { (ta * ca) >> 7 } else { ca };
             if ATE {
@@ -815,6 +823,9 @@ impl Painter<'_> {
                 if !pass && (afail == 0 || afail == 2) {
                     continue;
                 }
+            }
+            if ztest.on && !ztest.pass(canvas, row, px as u32, z) {
+                continue;
             }
             let mut out = Modulate::new(cr, cg, cb, ca, tcc).apply(texel);
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
@@ -974,7 +985,8 @@ impl Painter<'_> {
     /// Constant-colour sprite row (`PixelPipe::flat_fill`): the alpha test
     /// is evaluated once, then the colour (and Z when ZTE ALWAYS writes it)
     /// is stored two pixels at a time — a 32-bit column holds pixel pairs
-    /// (x even, x+1) in adjacent words. Same results as
+    /// (x even, x+1) in adjacent words. Blending or a 24-bit frame read
+    /// the destination per pixel instead. Same results as
     /// [`Painter::shade_row_px`].
     #[inline(never)]
     fn flat_sprite_row(&mut self, row: &Row, pxa: i32, pxb: i32, frag: &Frag) {
@@ -984,8 +996,7 @@ impl Painter<'_> {
         self.scratch.pixels += n;
         #[cfg(feature = "profile")]
         {
-            let k = (pipe.kind as usize) | ((pipe.abe as usize) << 4) | ((pipe.ate as usize) << 13)
-                | (((pipe.zte && !pipe.zmsk) as usize) << 15);
+            let k = pipe.profile_key(false);
             for _ in 0..n {
                 crate::prof::count_pixel(k);
             }
@@ -1022,6 +1033,47 @@ impl Painter<'_> {
                 canvas.wr32(o, z);
             }
         };
+        if pipe.abe || pipe.fb24 {
+            // Destination-dependent: blend the constant colour per pixel.
+            let src = spread21(out & 0xFF_FFFF);
+            let (blend_a, blend_b, blend_c, blend_d) = (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d);
+            let fix = pipe.blend_fix as u64;
+            for px in pxa..pxb {
+                let o = fb_at(px);
+                let dst = canvas.rd32(o);
+                let mut v = out;
+                if pipe.abe {
+                    let dstc = spread21(dst & 0xFF_FFFF);
+                    let pick = |k: u8| -> u64 {
+                        match k {
+                            0 => src,
+                            1 => dstc,
+                            _ => 0,
+                        }
+                    };
+                    let alpha = match blend_c {
+                        0 => a as u64,
+                        1 => (dst >> 24) as u64,
+                        _ => fix,
+                    };
+                    const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
+                    let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
+                    let lane = |sh: u32| -> u32 {
+                        let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
+                        v.clamp(0, 255) as u32
+                    };
+                    v = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+                }
+                if pipe.fb24 {
+                    v = (v & 0xFF_FFFF) | (dst & 0xFF00_0000);
+                }
+                canvas.wr32(o, v);
+                if write_z {
+                    put_z(px);
+                }
+            }
+            return;
+        }
         let mut px = pxa;
         if px & 1 != 0 {
             canvas.wr32(fb_at(px), out);
@@ -1078,9 +1130,7 @@ impl Painter<'_> {
         #[cfg(feature = "profile")]
         {
             let neutral = frag.r == 128.0 && frag.g == 128.0 && frag.b == 128.0 && frag.a == 128.0;
-            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
-                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5)
-                | ((pipe.tfx as usize & 3) << 11) | ((pipe.ate as usize) << 13) | ((neutral as usize) << 18);
+            let k = pipe.profile_key(neutral);
             for _ in 0..n {
                 crate::prof::count_pixel(k);
             }
@@ -1092,6 +1142,8 @@ impl Painter<'_> {
             (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
         let canvas = self.canvas;
         let fb24 = pipe.fb24;
+        let ztest = ZTest::new(pipe);
+        let z = a.z & pipe.zmask;
         let (row0, row1) = (a.row0, a.row1);
         let last0 = row0.len().saturating_sub(if BIL { 2 } else { 1 });
         let mut u = a.ua - if BIL { 1i64 << 31 } else { 0 };
@@ -1127,6 +1179,9 @@ impl Painter<'_> {
                 if !pass && (afail == 0 || afail == 2) {
                     continue;
                 }
+            }
+            if ztest.on && !ztest.pass(canvas, row, px as u32, z) {
+                continue;
             }
             let mut out = mod_lanes.apply(texel);
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
@@ -1174,9 +1229,8 @@ impl Painter<'_> {
         self.scratch.pixels += 1;
         #[cfg(feature = "profile")]
         {
-            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
-                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5);
-            crate::prof::count_pixel(k);
+            let neutral = frag.r == 128.0 && frag.g == 128.0 && frag.b == 128.0 && frag.a == 128.0;
+            crate::prof::count_pixel(pipe.profile_key(neutral));
         }
 
         // Source color: vertex color, optionally combined with a texel.
@@ -1380,6 +1434,29 @@ struct Row {
     z_base: usize,
 }
 
+impl PixelPipe {
+    /// Histogram key for the profile report: kind (3 bits), tme, bilinear,
+    /// abe, texture psm (6), tfx (2), ate, Z read, Z write, frame mask,
+    /// 24-bit frame, neutral vertex colour.
+    #[cfg(feature = "profile")]
+    fn profile_key(&self, neutral: bool) -> usize {
+        let zread = self.zte && !(self.ztst == 1 && self.zmsk);
+        let zwrite = self.zte && !self.zmsk;
+        (self.kind as usize & 7)
+            | ((self.tme as usize) << 3)
+            | ((self.bilinear as usize) << 4)
+            | ((self.abe as usize) << 5)
+            | ((self.tex.psm as usize & 0x3F) << 6)
+            | ((self.tfx as usize & 3) << 12)
+            | ((self.ate as usize) << 14)
+            | ((zread as usize) << 15)
+            | ((zwrite as usize) << 16)
+            | (((self.fbmsk != 0) as usize) << 17)
+            | ((self.fb24 as usize) << 18)
+            | ((neutral as usize) << 19)
+    }
+}
+
 impl Row {
     #[inline(always)]
     fn new(pipe: &PixelPipe, y: u32) -> Self {
@@ -1407,6 +1484,8 @@ struct FastRow<'a> {
     /// Texel u of the first pixel and its per-pixel step, 32.32 fixed.
     ua: i64,
     du: i64,
+    /// The sprite's (constant) Z.
+    z: u32,
 }
 
 /// Arguments of [`Painter::fast_tri_row`]: the span and the attributes at
@@ -1418,9 +1497,46 @@ struct FastTri<'a> {
     rgba: [f32; 4],
     stqu: [f32; 4],
     v: f32,
+    z: f64,
     d_rgba: [f32; 4],
     d_stqu: [f32; 4],
     d_v: f32,
+    d_z: f64,
+}
+
+/// Per-pixel depth test and write for the fast loops, decoded once.
+#[derive(Clone, Copy)]
+struct ZTest {
+    /// Anything to do at all (`PixelPipe::z_touched`).
+    on: bool,
+    ztst: u8,
+    write: bool,
+    zmask: u32,
+}
+
+impl ZTest {
+    #[inline(always)]
+    fn new(pipe: &PixelPipe) -> Self {
+        Self { on: pipe.z_touched, ztst: pipe.ztst, write: pipe.zte && !pipe.zmsk, zmask: pipe.zmask }
+    }
+
+    /// Test `z` (already masked) against the buffer; writes it when the
+    /// pixel passes and writes are enabled. Same as the generic path.
+    #[inline(always)]
+    fn pass(self, canvas: &Canvas, row: &Row, x: u32, z: u32) -> bool {
+        let z_off = (row.z_base + layout::col_off32(row.y, x, true)) & (VRAM_SIZE - 1);
+        let zcur = canvas.rd32(z_off);
+        let pass = match self.ztst {
+            0 => false,
+            1 => true,
+            2 => z >= (zcur & self.zmask),
+            _ => z > (zcur & self.zmask),
+        };
+        if pass && self.write {
+            canvas.wr32(z_off, (zcur & !self.zmask) | z);
+        }
+        pass
+    }
 }
 
 /// MODULATE colour lanes: `(texel * colour) >> 7` per channel saturated
@@ -1512,13 +1628,15 @@ struct PixelPipe {
     blend_c: u8,
     blend_d: u8,
     blend_fix: u32,
-    /// Textured MODULATE drawing that touches nothing but the colour
-    /// buffer (no Z test/write, no frame mask): eligible for the
+    /// The Z buffer is read or written per pixel (ZTE with a real test,
+    /// or unmasked writes).
+    z_touched: bool,
+    /// Textured MODULATE drawing without a frame mask: eligible for the
     /// specialised row loops (`Painter::fast_sprite_row`,
     /// `Painter::fast_tri_row`).
     fast: bool,
-    /// Untextured, unblended sprite whose only per-pixel work is storing a
-    /// constant colour (and maybe Z): `Painter::flat_sprite_row`.
+    /// Untextured sprite with a constant colour per row (blended or not)
+    /// and no Z test: `Painter::flat_sprite_row`.
     flat_fill: bool,
 }
 
