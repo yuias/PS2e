@@ -397,8 +397,8 @@ each wait):
   ADX (CRI type-8 encrypted, vgmstream key "mituba" = 0x5a17/0x509f/
   0x5bfd, key stream advancing per frame across channels) through
   CRI_ADXI.IRX at volume 0x3D80/0x8000, and the SPU2 output now equals
-  that stream to within BVOL rounding (`tools/` has no script for this;
-  the comparison was a scratch numpy cross-correlation).
+  that stream to within BVOL rounding (`tools/adxcmp.py` decodes the
+  track and reports gain/residual per window against a `--wav` capture).
 - Voices interpolate with the 4-tap Gaussian table (phase = pitch
   counter bits 4..11, weights oldest-first, output centred two samples
   behind the newest); nearest sampling left strong aliasing above 8 kHz
