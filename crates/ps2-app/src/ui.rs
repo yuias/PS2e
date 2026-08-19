@@ -51,6 +51,7 @@ pub struct App {
     emu: Emu,
     scale_mode: crate::display::ScaleMode,
     deinterlace: crate::config::DeinterlaceSetting,
+    swap_fields: bool,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
     config: Config,
@@ -68,6 +69,7 @@ impl App {
             emu,
             scale_mode: config.scaler,
             deinterlace: config.deinterlace,
+            swap_fields: config.swap_fields,
             volume,
             config,
             config_path,
@@ -108,11 +110,13 @@ impl Drop for App {
         if let Some(path) = &self.config_path
             && ((self.config.volume - self.volume).abs() > f32::EPSILON
                 || self.config.scaler != self.scale_mode
-                || self.config.deinterlace != self.deinterlace)
+                || self.config.deinterlace != self.deinterlace
+                || self.config.swap_fields != self.swap_fields)
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
             self.config.deinterlace = self.deinterlace;
+            self.config.swap_fields = self.swap_fields;
             self.config.save(path);
         }
     }
@@ -132,6 +136,7 @@ impl eframe::App for App {
             .volume
             .store(self.volume.to_bits(), Ordering::Relaxed);
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
+        self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
         let debugger_active = self.emu.shared.debugger_active.load(Ordering::Relaxed);
@@ -194,6 +199,7 @@ impl eframe::App for App {
                         for mode in crate::config::DeinterlaceSetting::ALL {
                             ui.radio_value(&mut self.deinterlace, mode, mode.label());
                         }
+                        ui.checkbox(&mut self.swap_fields, "Swap field order");
                         ui.separator();
                         ui.checkbox(&mut self.show_tty, "TTY panel");
                         ui.checkbox(&mut self.show_regs, "Registers panel");

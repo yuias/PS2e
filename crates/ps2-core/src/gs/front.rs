@@ -126,6 +126,8 @@ pub struct GsFront {
     publish_frames: bool,
     /// How the published frame treats interlaced field buffers.
     pub deinterlace: super::Deinterlace,
+    /// Flip which rows each field lands on (see `vblank`).
+    pub swap_fields: bool,
 }
 
 impl Default for GsFront {
@@ -209,6 +211,7 @@ impl GsFront {
             latest_frame: Default::default(),
             publish_frames: false,
             deinterlace: super::Deinterlace::default(),
+            swap_fields: false,
         }
     }
 
@@ -367,7 +370,11 @@ impl GsFront {
         self.csr ^= 1 << 13;
         self.raise_int(3);
         if self.publish_frames {
-            self.push(Cmd::Vblank(self.csr & (1 << 13) != 0, self.deinterlace));
+            // CSR FIELD=1 holds the even rows (measured on SLPS-25918: the
+            // field arriving with FIELD set sits between the other field's
+            // lines k-1 and k); `swap_fields` flips that.
+            let odd_rows = (self.csr & (1 << 13) == 0) != self.swap_fields;
+            self.push(Cmd::Vblank(odd_rows, self.deinterlace));
         }
         self.flush();
     }

@@ -449,6 +449,12 @@ each wait):
   cld=1, index 0x40.. = coverage; the same CLUT slot is re-uploaded per
   use, so the CLUT cache is keyed by CBP/CPSM/CSM/CSA/TEXA and flushed
   on any transfer.
+- Interlaced field buffers (SMODE2 INT+FFMD): the field that arrives
+  while CSR FIELD is *set* holds the even display rows — its line k sits
+  between the other field's lines k-1 and k (|odd_k - avg(even_k-1,
+  even_k)| = 1.6-2.7 vs 4-9 for any other placement on the title and
+  prologue screens). Weaving it the other way round looks fine on still
+  anime art but makes every bob-style deinterlacer jitter by a line.
 - The game idles in the EE kernel idle thread (`b .-32` over nops at
   0x81fc0) ~62% of the time and the IOP in `j .; nop` (0xae94) ~92%;
   both are skipped until an interrupt is pending without changing

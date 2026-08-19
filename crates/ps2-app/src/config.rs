@@ -33,6 +33,10 @@ scaler = "sharp"
 # display latency).
 deinterlace = "yadif"
 
+# Flip the field order (which rows the odd field lands on) if interlaced
+# output looks line-swapped or bobs by a whole line.
+swap_fields = false
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -46,6 +50,7 @@ pub struct Config {
     pub memcard: Option<PathBuf>,
     pub scaler: crate::display::ScaleMode,
     pub deinterlace: DeinterlaceSetting,
+    pub swap_fields: bool,
 }
 
 /// Config/UI form of [`ps2_core::gs::Deinterlace`].
@@ -103,6 +108,7 @@ impl Default for Config {
             memcard: None,
             scaler: crate::display::ScaleMode::Sharp,
             deinterlace: DeinterlaceSetting::Yadif,
+            swap_fields: false,
         }
     }
 }

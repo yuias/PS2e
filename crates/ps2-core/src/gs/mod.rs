@@ -781,6 +781,10 @@ impl Gs {
         if !view.field_buffer {
             return self.framebuffer();
         }
+        if w == 0 || h < 2 {
+            // Nothing displayable yet (DISPLAY not programmed).
+            return (w, h, vec![0u8; (w * h * 4) as usize]);
+        }
         if self.woven_dims != (w, h) {
             self.woven = vec![0u8; (w * h * 4) as usize];
             self.motion = vec![0u8; (w * h) as usize];
