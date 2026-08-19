@@ -12,6 +12,7 @@
 
 use super::*;
 
+
 /// Interpolated per-pixel attributes.
 #[derive(Clone, Copy)]
 struct Frag {
@@ -421,7 +422,7 @@ impl Gs {
         if attrs & (1 << 4) != 0 && tex.clut_bits != 0 {
             self.refresh_clut(&tex);
         }
-        PixelPipe {
+        let mut pipe = PixelPipe {
             kind: (self.prim & 7) as u8,
             scx0: (ctx.scissor & 0x7FF) as i32,
             scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
@@ -460,7 +461,15 @@ impl Gs {
             blend_c: ((ctx.alpha >> 4) & 3) as u8,
             blend_d: ((ctx.alpha >> 6) & 3) as u8,
             blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
-        }
+            fast: false,
+            flat_fill: false,
+        };
+        let z_touched = pipe.zte && !(pipe.ztst == 1 && pipe.zmsk);
+        pipe.fast = pipe.tme && pipe.tfx == 0 && !z_touched && pipe.fbmsk == 0 && !pipe.fb24;
+        // Z may be written (ALWAYS) but never tested; the alpha test on a
+        // flat colour is decided once per row by the loop itself.
+        pipe.flat_fill = !pipe.tme && !pipe.abe && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0 && !pipe.fb24;
+        pipe
     }
 
     /// Re-decode the CLUT cache when the palette setup changed or a
@@ -568,6 +577,27 @@ impl Painter<'_> {
                         self.fill_tex_row(1, y_row + 1, u_lo, u_hi);
                     }
                     let [row0, row1] = std::mem::take(&mut self.scratch.tex_rows);
+                    if pipe.fast && pxb - pxa >= 2 {
+                        // Fixed-point u (32.32 texels) stepped across the row
+                        // between the same endpoints the float path uses.
+                        let fa = f64::from(fu_at(pxa));
+                        let fb = f64::from(fu_at(pxb - 1));
+                        let du = ((fb - fa) / f64::from(pxb - 1 - pxa) * 4294967296.0) as i64;
+                        let ua = (fa * 4294967296.0).floor() as i64;
+                        let args = FastRow { row: &row, pxa, pxb, frag: &frag, row0: &row0.data, row1: &row1.data, u_lo, wy, ua, du };
+                        match (pipe.bilinear, pipe.abe, pipe.ate) {
+                            (false, false, false) => self.fast_sprite_row::<false, false, false>(&args),
+                            (false, false, true) => self.fast_sprite_row::<false, false, true>(&args),
+                            (false, true, false) => self.fast_sprite_row::<false, true, false>(&args),
+                            (false, true, true) => self.fast_sprite_row::<false, true, true>(&args),
+                            (true, false, false) => self.fast_sprite_row::<true, false, false>(&args),
+                            (true, false, true) => self.fast_sprite_row::<true, false, true>(&args),
+                            (true, true, false) => self.fast_sprite_row::<true, true, false>(&args),
+                            (true, true, true) => self.fast_sprite_row::<true, true, true>(&args),
+                        }
+                        self.scratch.tex_rows = [row0, row1];
+                        continue;
+                    }
                     for px in pxa..pxb {
                         let fu = fu_at(px);
                         let texel = if pipe.bilinear {
@@ -588,6 +618,10 @@ impl Painter<'_> {
                     self.scratch.tex_rows = [row0, row1];
                     continue;
                 }
+            }
+            if pipe.flat_fill && pxb > pxa {
+                self.flat_sprite_row(&row, pxa, pxb, &frag);
+                continue;
             }
             for px in pxa..pxb {
                 let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * g.inv_wid;
@@ -753,6 +787,192 @@ impl Painter<'_> {
         }
         self.fill_tex_row(slot, y, u - 8, u + 23);
         self.scratch.tex_rows[slot].data[8]
+    }
+
+    /// Constant-colour sprite row (`PixelPipe::flat_fill`): the alpha test
+    /// is evaluated once, then the colour (and Z when ZTE ALWAYS writes it)
+    /// is stored two pixels at a time — a 32-bit column holds pixel pairs
+    /// (x even, x+1) in adjacent words. Same results as
+    /// [`Painter::shade_row_px`].
+    #[inline(never)]
+    fn flat_sprite_row(&mut self, row: &Row, pxa: i32, pxb: i32, frag: &Frag) {
+        let pipe = self.pipe;
+        let y = row.y;
+        let n = (pxb - pxa) as u64;
+        self.scratch.pixels += n;
+        #[cfg(feature = "profile")]
+        {
+            let k = (pipe.kind as usize) | ((pipe.abe as usize) << 4) | ((pipe.ate as usize) << 13)
+                | (((pipe.zte && !pipe.zmsk) as usize) << 15);
+            for _ in 0..n {
+                crate::prof::count_pixel(k);
+            }
+        }
+        let (r, g, b, a) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
+        if pipe.ate {
+            let aref = pipe.aref;
+            let pass = match pipe.atst {
+                0 => false,
+                1 => true,
+                2 => a < aref,
+                3 => a <= aref,
+                4 => a == aref,
+                5 => a >= aref,
+                6 => a > aref,
+                _ => a != aref,
+            };
+            if !pass && (pipe.afail == 0 || pipe.afail == 2) {
+                return;
+            }
+        }
+        let out = r | (g << 8) | (b << 16) | (a.min(255) << 24);
+        let write_z = pipe.zte && !pipe.zmsk;
+        let z = frag.z & pipe.zmask;
+        let z_merge = pipe.zmask != u32::MAX;
+        let canvas = self.canvas;
+        let fb_at = |x: i32| (row.fb_base + layout::col_off32(y, x as u32, false)) & (VRAM_SIZE - 1);
+        let z_at = |x: i32| (row.z_base + layout::col_off32(y, x as u32, true)) & (VRAM_SIZE - 1);
+        let put_z = |x: i32| {
+            let o = z_at(x);
+            if z_merge {
+                canvas.wr32(o, (canvas.rd32(o) & !pipe.zmask) | z);
+            } else {
+                canvas.wr32(o, z);
+            }
+        };
+        let mut px = pxa;
+        if px & 1 != 0 {
+            canvas.wr32(fb_at(px), out);
+            if write_z {
+                put_z(px);
+            }
+            px += 1;
+        }
+        let pair = u64::from(out) | (u64::from(out) << 32);
+        let zpair = u64::from(z) | (u64::from(z) << 32);
+        while px + 1 < pxb {
+            // Even x: its pair partner sits in the next word (unless the
+            // pair straddles the end of VRAM).
+            let o = fb_at(px);
+            if o + 8 <= VRAM_SIZE {
+                canvas.wr64(o, pair);
+            } else {
+                canvas.wr32(o, out);
+                canvas.wr32(fb_at(px + 1), out);
+            }
+            if write_z {
+                let zo = z_at(px);
+                if z_merge || zo + 8 > VRAM_SIZE {
+                    put_z(px);
+                    put_z(px + 1);
+                } else {
+                    canvas.wr64(zo, zpair);
+                }
+            }
+            px += 2;
+        }
+        if px < pxb {
+            canvas.wr32(fb_at(px), out);
+            if write_z {
+                put_z(px);
+            }
+        }
+    }
+
+    /// The textured sprite row loop for `PixelPipe::fast` setups: u is
+    /// stepped in fixed point, the Z / frame-mask / 24-bit paths are gone,
+    /// the filter, alpha test and blend are compile-time choices and the
+    /// colour modulation runs on SSE2 lanes. Same results as
+    /// [`Painter::shade_row_px`] apart from the u rounding at the 2^-32
+    /// level.
+    #[inline(never)]
+    fn fast_sprite_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
+        let pipe = self.pipe;
+        let (row, frag) = (a.row, a.frag);
+        let y = row.y;
+        let n = (a.pxb - a.pxa) as u64;
+        self.scratch.pixels += n;
+        self.scratch.tex_samples[pipe.tex.psm as usize] += n;
+        #[cfg(feature = "profile")]
+        {
+            let neutral = frag.r == 128.0 && frag.g == 128.0 && frag.b == 128.0 && frag.a == 128.0;
+            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
+                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5)
+                | ((pipe.tfx as usize & 3) << 11) | ((pipe.ate as usize) << 13) | ((neutral as usize) << 18);
+            for _ in 0..n {
+                crate::prof::count_pixel(k);
+            }
+        }
+        let (cr, cg, cb, ca) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
+        let tcc = pipe.tcc;
+        let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
+        let (blend_a, blend_b, blend_c, blend_d, blend_fix) =
+            (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
+        let canvas = self.canvas;
+        let (row0, row1) = (a.row0, a.row1);
+        let last0 = row0.len().saturating_sub(if BIL { 2 } else { 1 });
+        let mut u = a.ua - if BIL { 1i64 << 31 } else { 0 };
+        let mod_lanes = Modulate::new(cr, cg, cb, ca, tcc);
+        for px in a.pxa..a.pxb {
+            // Texel: floor(u) (nearest) or the four taps around u - 0.5.
+            let ix = (u >> 32) as i32;
+            let i = ((ix - a.u_lo).max(0) as usize).min(last0);
+            let texel = if BIL {
+                let wx = ((u >> 24) & 0xFF) as u32;
+                if wx | a.wy == 0 {
+                    row0[i]
+                } else {
+                    bilerp_rgba(row0[i], row0[i + 1], row1[i], row1[i + 1], wx, a.wy)
+                }
+            } else {
+                row0[i]
+            };
+            u += a.du;
+            let ta = texel >> 24;
+            let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            if ATE {
+                let pass = match atst {
+                    0 => false,
+                    1 => true,
+                    2 => a8 < aref,
+                    3 => a8 <= aref,
+                    4 => a8 == aref,
+                    5 => a8 >= aref,
+                    6 => a8 > aref,
+                    _ => a8 != aref,
+                };
+                if !pass && (afail == 0 || afail == 2) {
+                    continue;
+                }
+            }
+            let mut out = mod_lanes.apply(texel);
+            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
+            if ABE {
+                let dst = canvas.rd32(fb_off);
+                let src = spread21(out & 0xFF_FFFF);
+                let dstc = spread21(dst & 0xFF_FFFF);
+                let pick = |k: u8| -> u64 {
+                    match k {
+                        0 => src,
+                        1 => dstc,
+                        _ => 0,
+                    }
+                };
+                let alpha = match blend_c {
+                    0 => a8 as u64,
+                    1 => (dst >> 24) as u64,
+                    _ => blend_fix,
+                };
+                const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
+                let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
+                let lane = |sh: u32| -> u32 {
+                    let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
+                    v.clamp(0, 255) as u32
+                };
+                out = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+            }
+            canvas.wr32(fb_off, out);
+        }
     }
 
     /// The pixel pipeline proper: `row` carries the scanline's frame/Z
@@ -983,6 +1203,76 @@ impl Row {
     }
 }
 
+/// Arguments of [`Painter::fast_sprite_row`].
+struct FastRow<'a> {
+    row: &'a Row,
+    pxa: i32,
+    pxb: i32,
+    frag: &'a Frag,
+    /// Decoded texture rows (the second only for bilinear) and the texel
+    /// index their first entry holds.
+    row0: &'a [u32],
+    row1: &'a [u32],
+    u_lo: i32,
+    /// Bilinear row weight (1/256).
+    wy: u32,
+    /// Texel u of the first pixel and its per-pixel step, 32.32 fixed.
+    ua: i64,
+    du: i64,
+}
+
+/// MODULATE colour lanes: `(texel * colour) >> 7` per channel saturated
+/// to 255, alpha from the texel (TCC) or the vertex.
+#[derive(Clone, Copy)]
+struct Modulate {
+    #[cfg(target_arch = "x86_64")]
+    lanes: core::arch::x86_64::__m128i,
+    #[cfg(not(target_arch = "x86_64"))]
+    c: [u32; 4],
+    /// Texel alpha stands in for 128 when TCC is off, so one multiply
+    /// yields the vertex alpha.
+    tex_mask: u32,
+    tex_or: u32,
+}
+
+impl Modulate {
+    #[inline(always)]
+    fn new(cr: u32, cg: u32, cb: u32, ca: u32, tcc: bool) -> Self {
+        let (tex_mask, tex_or) = if tcc { (u32::MAX, 0) } else { (0x00FF_FFFF, 0x8000_0000) };
+        Self {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: SSE2 is x86-64 baseline.
+            lanes: unsafe { core::arch::x86_64::_mm_set_epi16(0, 0, 0, 0, ca as i16, cb as i16, cg as i16, cr as i16) },
+            #[cfg(not(target_arch = "x86_64"))]
+            c: [cr, cg, cb, ca],
+            tex_mask,
+            tex_or,
+        }
+    }
+
+    #[inline(always)]
+    fn apply(self, texel: u32) -> u32 {
+        let t = (texel & self.tex_mask) | self.tex_or;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::*;
+            // SAFETY: SSE2 baseline; 255*255 fits the 16-bit lanes and
+            // packus saturates like `.min(255)`.
+            unsafe {
+                let zero = _mm_setzero_si128();
+                let lanes = _mm_unpacklo_epi8(_mm_cvtsi32_si128(t as i32), zero);
+                let m = _mm_srli_epi16(_mm_mullo_epi16(lanes, self.lanes), 7);
+                _mm_cvtsi128_si32(_mm_packus_epi16(m, m)) as u32
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let ch = |sh: u32, c: u32| ((((t >> sh) & 0xFF) * c) >> 7).min(255) << sh;
+            ch(0, self.c[0]) | ch(8, self.c[1]) | ch(16, self.c[2]) | ch(24, self.c[3])
+        }
+    }
+}
+
 /// Drawing environment decoded once per primitive (see `pixel_pipe`).
 struct PixelPipe {
     /// Primitive kind being drawn (PRIM bits 0-2), for the pixel histogram.
@@ -1020,6 +1310,13 @@ struct PixelPipe {
     blend_c: u8,
     blend_d: u8,
     blend_fix: u32,
+    /// Textured MODULATE drawing that touches nothing but the colour
+    /// buffer: eligible for the specialised sprite loops
+    /// (`Painter::fast_sprite_row`).
+    fast: bool,
+    /// Untextured, unblended sprite whose only per-pixel work is storing a
+    /// constant colour (and maybe Z): `Painter::flat_sprite_row`.
+    flat_fill: bool,
 }
 
 /// TEX0/CLAMP fields decoded once per primitive.

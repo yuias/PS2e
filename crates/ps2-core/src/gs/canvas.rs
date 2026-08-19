@@ -54,6 +54,12 @@ impl Canvas {
         unsafe { (self.ptr.add(o) as *mut u32).write_unaligned(v) }
     }
     #[inline(always)]
+    pub fn wr64(&self, o: usize, v: u64) {
+        debug_assert!(o + 8 <= VRAM_SIZE);
+        // SAFETY: in-bounds, unaligned write of our buffer.
+        unsafe { (self.ptr.add(o) as *mut u64).write_unaligned(v) }
+    }
+    #[inline(always)]
     pub fn rd16(&self, o: usize) -> u16 {
         debug_assert!(o + 2 <= VRAM_SIZE);
         // SAFETY: in-bounds, unaligned read of our buffer.
