@@ -28,6 +28,11 @@ fn setup() -> Gs {
             gs.write_psmct32(2240, 10, x, y, 0x8060_7080 ^ (x * 3 + y * 7));
         }
     }
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            gs.write_psmct16(12320, 1, x, y, 0x02, (0x8000 | (x * 31 / 63) | ((y * 31 / 63) << 5) | (((x ^ y) & 31) << 10)) as u16);
+        }
+    }
     gs.write_reg(0x1A, 1); // PRMODECONT: PRIM
     gs.write_reg(0x4C, 210 | (10 << 16)); // FRAME_1: 6720, fbw 10, PSMCT32
     gs.write_reg(0x4E, 280 | (1 << 24)); // ZBUF_1: 8960, Z24, writes on
@@ -48,6 +53,11 @@ fn tex0_psmt8() -> u64 {
 fn tex0_psmct32() -> u64 {
     // tbp 2240, tbw 10, PSMCT32, 1024x256, TCC
     2240 | (10 << 14) | (10 << 26) | (8 << 30) | (1 << 34)
+}
+
+fn tex0_psmct16() -> u64 {
+    // tbp 12320, tbw 1, PSMCT16, 64x64, TCC
+    12320 | (1 << 14) | (0x02 << 20) | (6 << 26) | (6 << 30) | (1 << 34)
 }
 
 fn xyz(x: u64, y: u64, z: u64) -> u64 {
@@ -73,6 +83,35 @@ fn quad(gs: &mut Gs) {
         gs.write_reg(0x02, s.to_bits() as u64 | ((t.to_bits() as u64) << 32));
         gs.write_reg(0x01, 0x3F80_0000_8080_8080 ^ (x + y));
         gs.write_reg(0x05, xyz(x, y, 0xFF_FFFF));
+    }
+}
+
+/// Many small rotated particle quads (two triangles each) over the screen,
+/// the way the game's effects draw their 64x64 PSMCT16 sprites.
+fn particles(gs: &mut Gs) {
+    let mut seed = 12345u64;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as u64
+    };
+    for _ in 0..1500 {
+        let cx = (rnd() % (W - 64)) as f32 + 32.0;
+        let cy = (rnd() % (H - 64)) as f32 + 32.0;
+        let ang = (rnd() % 628) as f32 / 100.0;
+        let r = 24.0f32;
+        let (sn, cs) = ang.sin_cos();
+        let corner = |dx: f32, dy: f32| -> (u64, u64) {
+            let x = cx + dx * cs - dy * sn;
+            let y = cy + dx * sn + dy * cs;
+            (x.max(0.0) as u64, y.max(0.0) as u64)
+        };
+        let pts = [(-r, -r, 0.0f32, 0.0f32), (r, -r, 1.0, 0.0), (-r, r, 0.0, 1.0), (r, -r, 1.0, 0.0), (r, r, 1.0, 1.0), (-r, r, 0.0, 1.0)];
+        for (dx, dy, s, t) in pts {
+            let (x, y) = corner(dx, dy);
+            gs.write_reg(0x02, s.to_bits() as u64 | ((t.to_bits() as u64) << 32));
+            gs.write_reg(0x01, 0x3F80_0000_8000_0000 | 0x80); // RGBAQ: black, alpha 128, q 1
+            gs.write_reg(0x05, xyz(x.min(W - 1), y.min(H - 1), 0x80_0000));
+        }
     }
 }
 
@@ -120,4 +159,7 @@ fn main() {
     bench("game sprite psmct32 bilinear+blend", &mut gs, 0x56, 0x20, tex0_psmct32(), sprite);
     bench("game sprite psmt8 bilinear", &mut gs, 0x16, 0x20, tex0_psmt8(), sprite);
     bench("game tri psmt8 bilinear + blend", &mut gs, 0x5B, 0x20, tex0_psmt8(), quad);
+    // Particles: Z test GEQUAL with writes masked, blend, rotated PSMCT16.
+    gs.write_reg(0x47, 0x50000); // TEST_1: ZTE GEQUAL
+    bench("game particles psmct16 bilinear+blend+z", &mut gs, 0x5B, 0x20, tex0_psmct16(), particles);
 }

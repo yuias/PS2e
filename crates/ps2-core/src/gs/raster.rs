@@ -447,6 +447,7 @@ impl Gs {
         if attrs & (1 << 4) != 0 && tex.clut_bits != 0 {
             self.refresh_clut(&tex);
         }
+
         let mut pipe = PixelPipe {
             kind: (self.prim & 7) as u8,
             scx0: (ctx.scissor & 0x7FF) as i32,
@@ -718,6 +719,9 @@ impl Painter<'_> {
                     d_v: g.d_v,
                     d_z: g.d_z,
                 };
+                if self.sprite_like_tri_row(&args) {
+                    continue;
+                }
                 match (pipe.bilinear, pipe.abe, pipe.ate) {
                     (false, false, false) => self.fast_tri_row::<false, false, false>(&args),
                     (false, false, true) => self.fast_tri_row::<false, false, true>(&args),
@@ -761,6 +765,98 @@ impl Painter<'_> {
         }
     }
 
+    /// A triangle span with a flat colour, constant texture row and
+    /// linear u — an axis-aligned quad drawn as triangles, the common 2D
+    /// case — is a sprite row: decode its texture row(s) once and run
+    /// [`Painter::fast_sprite_row`]. Returns false when the span does not
+    /// qualify.
+    fn sprite_like_tri_row(&mut self, a: &FastTri) -> bool {
+        let pipe = self.pipe;
+        if a.d_rgba != [0.0; 4] || (pipe.z_touched && a.d_z != 0.0) || (!pipe.fst && a.d_stqu[2] != 0.0) {
+            return false;
+        }
+        let span = (a.xe - a.xs) as f32;
+        let uv = |k: f32| -> (f32, f32) {
+            if pipe.fst {
+                ((a.stqu[3] + a.d_stqu[3] * k) / 16.0, (a.v + a.d_v * k) / 16.0)
+            } else {
+                let q = if a.stqu[2].abs() < 1e-9 { 1.0 } else { a.stqu[2] };
+                let inv_q = 1.0 / q;
+                (
+                    (a.stqu[0] + a.d_stqu[0] * k) * inv_q * pipe.tex.tw as f32,
+                    (a.stqu[1] + a.d_stqu[1] * k) * inv_q * pipe.tex.th as f32,
+                )
+            }
+        };
+        let (fu_a, fv_a) = uv(0.0);
+        let (fu_b, fv_b) = uv(span);
+        let (fu_lo, fu_hi) = (fu_a.min(fu_b), fu_a.max(fu_b));
+        // The texture row(s) must be the same at both ends (v is monotonic
+        // along the span, so then everywhere between).
+        let (y_row, wy, u_lo, u_hi) = if pipe.bilinear {
+            let (ya, yb) = (fv_a - 0.5, fv_b - 0.5);
+            let (ra, rb) = (floor_i32(ya), floor_i32(yb));
+            let (wa, wb) = (((ya - ra as f32) * 256.0) as u32, ((yb - rb as f32) * 256.0) as u32);
+            if ra != rb || wa != wb {
+                return false;
+            }
+            (ra, wa, floor_i32(fu_lo - 0.5), floor_i32(fu_hi - 0.5) + 1)
+        } else {
+            let (ra, rb) = (floor_i32(fv_a), floor_i32(fv_b));
+            if ra != rb {
+                return false;
+            }
+            (ra, 0, floor_i32(fu_lo), floor_i32(fu_hi))
+        };
+        if u_hi - u_lo >= 4096 {
+            return false;
+        }
+        self.fill_tex_row(0, y_row, u_lo, u_hi);
+        if pipe.bilinear {
+            self.fill_tex_row(1, y_row + 1, u_lo, u_hi);
+        }
+        let [row0, row1] = std::mem::take(&mut self.scratch.tex_rows);
+        let du = if span > 0.0 { ((f64::from(fu_b) - f64::from(fu_a)) / f64::from(span) * 4294967296.0) as i64 } else { 0 };
+        let ua = (f64::from(fu_a) * 4294967296.0).floor() as i64;
+        let frag = Frag {
+            r: a.rgba[0],
+            g: a.rgba[1],
+            b: a.rgba[2],
+            a: a.rgba[3],
+            z: a.z as u32,
+            s: 0.0,
+            t: 0.0,
+            q: 1.0,
+            u: 0.0,
+            v: 0.0,
+        };
+        let args = FastRow {
+            row: a.row,
+            pxa: a.xs,
+            pxb: a.xe + 1,
+            frag: &frag,
+            row0: &row0.data,
+            row1: &row1.data,
+            u_lo,
+            wy,
+            ua,
+            du,
+            z: frag.z,
+        };
+        match (pipe.bilinear, pipe.abe, pipe.ate) {
+            (false, false, false) => self.fast_sprite_row::<false, false, false>(&args),
+            (false, false, true) => self.fast_sprite_row::<false, false, true>(&args),
+            (false, true, false) => self.fast_sprite_row::<false, true, false>(&args),
+            (false, true, true) => self.fast_sprite_row::<false, true, true>(&args),
+            (true, false, false) => self.fast_sprite_row::<true, false, false>(&args),
+            (true, false, true) => self.fast_sprite_row::<true, false, true>(&args),
+            (true, true, false) => self.fast_sprite_row::<true, true, false>(&args),
+            (true, true, true) => self.fast_sprite_row::<true, true, true>(&args),
+        }
+        self.scratch.tex_rows = [row0, row1];
+        true
+    }
+
     /// Textured MODULATE triangle span for `PixelPipe::fast` setups: the
     /// attributes step incrementally along the row, texels come through the
     /// row cache, and the filter / alpha test / blend are compile-time
@@ -792,6 +888,7 @@ impl Painter<'_> {
         let mut stqu = a.stqu;
         let mut v = a.v;
         let mut zf = a.z;
+        let tf = TexFetch::new(&pipe.tex);
         let uv_at = |stqu: &[f32; 4], v: f32| -> (f32, f32) {
             if fst {
                 (stqu[3] / 16.0, v / 16.0)
@@ -819,7 +916,7 @@ impl Painter<'_> {
         for px in a.xs..=a.xe {
             let (fu, fv) = uv_at(&stqu, v);
             let texel = if direct {
-                if BIL { self.sample_bilinear_direct(fu, fv) } else { self.texel(floor_i32(fu), floor_i32(fv)) }
+                if BIL { self.sample_bilinear_direct(tf, fu, fv) } else { self.texel(floor_i32(fu), floor_i32(fv)) }
             } else if BIL {
                 self.sample_bilinear_cached(fu, fv)
             } else {
@@ -1405,12 +1502,14 @@ impl Painter<'_> {
         if !pipe.bilinear {
             return self.texel(floor_i32(fu), floor_i32(fv));
         }
-        self.sample_bilinear_direct(fu, fv)
+        self.sample_bilinear_direct(TexFetch::new(&pipe.tex), fu, fv)
     }
 
-    /// Bilinear texel at texel-space `(fu, fv)` straight from VRAM.
+    /// Bilinear texel at texel-space `(fu, fv)` straight from VRAM: the
+    /// four taps share their wrapped coordinates and row bases, and the
+    /// common formats address through the column tables.
     #[inline(always)]
-    fn sample_bilinear_direct(&self, fu: f32, fv: f32) -> u32 {
+    fn sample_bilinear_direct(&self, ti: TexFetch, fu: f32, fv: f32) -> u32 {
         let x = fu - 0.5;
         let y = fv - 0.5;
         let (x0, y0) = (floor_i32(x), floor_i32(y));
@@ -1420,10 +1519,54 @@ impl Painter<'_> {
         if fx | fy == 0 {
             return self.texel(x0, y0);
         }
-        let t00 = self.texel(x0, y0);
-        let t10 = self.texel(x0 + 1, y0);
-        let t01 = self.texel(x0, y0 + 1);
-        let t11 = self.texel(x0 + 1, y0 + 1);
+        let cv = self.canvas;
+        let u0 = wrap(x0, ti.wms, ti.tw, ti.minu, ti.maxu) as u32;
+        let u1 = wrap(x0 + 1, ti.wms, ti.tw, ti.minu, ti.maxu) as u32;
+        let v0 = wrap(y0, ti.wmt, ti.th, ti.minv, ti.maxv) as u32;
+        let v1 = wrap(y0 + 1, ti.wmt, ti.th, ti.minv, ti.maxv) as u32;
+        let (tbp, tbw) = (ti.tbp, ti.tbw);
+        let m = VRAM_SIZE - 1;
+        let [t00, t10, t01, t11] = match ti.psm {
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                let (s, z) = (ti.psm & 8 != 0, ti.psm & 0x30 != 0);
+                let (r0, r1) = (layout::row_base16(tbp, tbw, v0), layout::row_base16(tbp, tbw, v1));
+                let p = [
+                    cv.rd16((r0 + layout::col_off16(v0, u0, s, z)) & m),
+                    cv.rd16((r0 + layout::col_off16(v0, u1, s, z)) & m),
+                    cv.rd16((r1 + layout::col_off16(v1, u0, s, z)) & m),
+                    cv.rd16((r1 + layout::col_off16(v1, u1, s, z)) & m),
+                ];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // SAFETY: SSE2 baseline.
+                    return unsafe { bilerp16_sse2(p, ti.texa, fx, fy) };
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    [expand16(p[0], ti.texa), expand16(p[1], ti.texa), expand16(p[2], ti.texa), expand16(p[3], ti.texa)]
+                }
+            }
+            PSMT8 => {
+                let (r0, r1) = (layout::row_base8(tbp, tbw, v0), layout::row_base8(tbp, tbw, v1));
+                let clut = self.clut;
+                [
+                    clut[cv.rd8((r0 + layout::col_off8(v0, u0)) & m) as usize],
+                    clut[cv.rd8((r0 + layout::col_off8(v0, u1)) & m) as usize],
+                    clut[cv.rd8((r1 + layout::col_off8(v1, u0)) & m) as usize],
+                    clut[cv.rd8((r1 + layout::col_off8(v1, u1)) & m) as usize],
+                ]
+            }
+            PSMCT32 => {
+                let (r0, r1) = (layout::row_base32(tbp, tbw, v0, false), layout::row_base32(tbp, tbw, v1, false));
+                [
+                    cv.rd32((r0 + layout::col_off32(v0, u0, false)) & m),
+                    cv.rd32((r0 + layout::col_off32(v0, u1, false)) & m),
+                    cv.rd32((r1 + layout::col_off32(v1, u0, false)) & m),
+                    cv.rd32((r1 + layout::col_off32(v1, u1, false)) & m),
+                ]
+            }
+            _ => [self.texel(x0, y0), self.texel(x0 + 1, y0), self.texel(x0, y0 + 1), self.texel(x0 + 1, y0 + 1)],
+        };
         bilerp_rgba(t00, t10, t01, t11, fx, fy)
     }
 
@@ -1532,6 +1675,44 @@ struct FastTri<'a> {
     d_stqu: [f32; 4],
     d_v: f32,
     d_z: f64,
+}
+
+/// Texture addressing parameters copied out of the pipe for the fast
+/// loops, so they live in registers rather than behind the pipe pointer.
+#[derive(Clone, Copy)]
+struct TexFetch {
+    psm: u32,
+    tbp: u32,
+    tbw: u32,
+    tw: i32,
+    th: i32,
+    wms: u64,
+    wmt: u64,
+    minu: i32,
+    maxu: i32,
+    minv: i32,
+    maxv: i32,
+    texa: u64,
+}
+
+impl TexFetch {
+    #[inline(always)]
+    fn new(ti: &TexInfo) -> Self {
+        Self {
+            psm: ti.psm,
+            tbp: ti.tbp,
+            tbw: ti.tbw,
+            tw: ti.tw as i32,
+            th: ti.th as i32,
+            wms: ti.wms,
+            wmt: ti.wmt,
+            minu: ti.minu,
+            maxu: ti.maxu,
+            minv: ti.minv,
+            maxv: ti.maxv,
+            texa: ti.texa,
+        }
+    }
 }
 
 /// Per-pixel depth test and write for the fast loops, decoded once.
@@ -1776,6 +1957,55 @@ unsafe fn bilerp_sse2(t00: u32, t10: u32, t01: u32, t11: u32, wx: u32, wy: u32) 
             _mm_add_epi16(
                 _mm_mullo_epi16(top, _mm_set1_epi16((256 - wy) as i16)),
                 _mm_mullo_epi16(bottom, _mm_set1_epi16(wy as i16)),
+            ),
+            8,
+        );
+        _mm_cvtsi128_si32(_mm_packus_epi16(y, y)) as u32
+    }
+}
+
+/// Bilinear blend of four 16-bit texels (`p[0] p[1]` top, `p[2] p[3]`
+/// bottom), expanding them under TEXA in 16-bit lanes on the way: 5-bit
+/// channels scale by 8, alpha is TA1 for set MSBs, TA0 otherwise, and 0
+/// for all-zero texels when AEM is on. Same output as `expand16` +
+/// [`bilerp_sse2`].
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn bilerp16_sse2(p: [u16; 4], texa: u64, wx: u32, wy: u32) -> u32 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 baseline; pure register arithmetic.
+    unsafe {
+        let t = _mm_set_epi16(0, 0, 0, 0, p[3] as i16, p[2] as i16, p[1] as i16, p[0] as i16);
+        let m5 = _mm_set1_epi16(0x1F);
+        let r = _mm_slli_epi16(_mm_and_si128(t, m5), 3);
+        let g = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(t, 5), m5), 3);
+        let b = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(t, 10), m5), 3);
+        let ta0 = _mm_set1_epi16((texa & 0xFF) as i16);
+        let ta1 = _mm_set1_epi16(((texa >> 32) & 0xFF) as i16);
+        let msb = _mm_srai_epi16(t, 15);
+        let mut a = _mm_or_si128(_mm_and_si128(msb, ta1), _mm_andnot_si128(msb, ta0));
+        if texa & (1 << 15) != 0 {
+            let zero = _mm_cmpeq_epi16(_mm_and_si128(t, _mm_set1_epi16(0x7FFF)), _mm_setzero_si128());
+            a = _mm_andnot_si128(zero, a);
+        }
+        // Channel-major -> pixel-major: [r g b a] per texel, texels 0,1 in
+        // `top`, 2,3 in `bottom`.
+        let rg = _mm_unpacklo_epi16(r, g);
+        let ba = _mm_unpacklo_epi16(b, a);
+        let top = _mm_unpacklo_epi32(rg, ba);
+        let bottom = _mm_unpackhi_epi32(rg, ba);
+        let wxl = _mm_set1_epi16((256 - wx) as i16);
+        let wxr = _mm_set1_epi16(wx as i16);
+        let hx = |row: __m128i| -> __m128i {
+            let left = row;
+            let right = _mm_srli_si128(row, 8);
+            _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(left, wxl), _mm_mullo_epi16(right, wxr)), 8)
+        };
+        let (ht, hb) = (hx(top), hx(bottom));
+        let y = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_mullo_epi16(ht, _mm_set1_epi16((256 - wy) as i16)),
+                _mm_mullo_epi16(hb, _mm_set1_epi16(wy as i16)),
             ),
             8,
         );

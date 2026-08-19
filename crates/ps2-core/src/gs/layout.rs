@@ -146,6 +146,46 @@ const COL_OFF32: [[[u16; 64]; 4]; 2] = {
     t
 };
 
+/// Row-based 16-bit addressing: `row_base16(bp, bw, y) + col_off16(y, x,
+/// s, z)` (`s` = PSMCT16S/PSMZ16S block order, `z` = the Z formats).
+#[inline(always)]
+pub(super) fn row_base16(bp: u32, bw: u32, y: u32) -> usize {
+    let bw = bw.max(1);
+    let block = bp.wrapping_add((y >> 6) * bw * 32);
+    let col = ((y & 7) >> 1) * 32 + (y & 1) * 4;
+    (block as usize) * 256 + col as usize * 2
+}
+
+/// Byte offset of pixel `x` within its 16-bit scanline (see [`row_base16`]).
+#[inline(always)]
+pub(super) fn col_off16(y: u32, x: u32, s: bool, z: bool) -> usize {
+    ((x >> 6) as usize) * 8192
+        + COL_OFF16[((s as usize) << 1) | z as usize][((y >> 3) & 7) as usize][(x & 63) as usize] as usize
+}
+
+/// `col_off16` per (table, block row, x & 63): block entry times 256 plus
+/// the x-dependent part of the 16x8 column swizzle.
+const COL_OFF16: [[[u16; 64]; 8]; 4] = {
+    let mut t = [[[0u16; 64]; 8]; 4];
+    let mut k = 0;
+    while k < 4 {
+        let table = if k & 2 != 0 { &BLOCK16S } else { &BLOCK16 };
+        let mut j = 0;
+        while j < 8 {
+            let mut x = 0;
+            while x < 64 {
+                let block = table[j][x >> 4] ^ if k & 1 != 0 { Z_FLIP } else { 0 };
+                let xs = x as u32;
+                t[k][j][x] = (block * 256 + (((xs & 7) >> 1) * 8 + (xs & 1) * 2 + ((xs & 15) >> 3)) * 2) as u16;
+                x += 1;
+            }
+            j += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 /// Row-based PSMT8 addressing: `row_base8(bp, bw, y) + col_off8(y, x)`.
 #[inline(always)]
 pub(super) fn row_base8(bp: u32, bw: u32, y: u32) -> usize {
@@ -284,6 +324,23 @@ mod tests {
                         let want = addr32(bp, bw, x, y, z);
                         let got = (row_base32(bp, bw, y, z) + col_off32(y, x, z)) & (VRAM_SIZE - 1);
                         assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y} z {z}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_addressing16_matches() {
+        for &(bp, bw) in &[(0u32, 10u32), (12320, 1), (4480, 8), (7840, 6)] {
+            for y in [0u32, 1, 2, 7, 8, 15, 63, 64, 200] {
+                for x in [0u32, 1, 7, 8, 15, 16, 63, 64, 127, 511] {
+                    for s in [false, true] {
+                        for z in [false, true] {
+                            let want = addr16(bp, bw, x, y, s, z);
+                            let got = (row_base16(bp, bw, y) + col_off16(y, x, s, z)) & (VRAM_SIZE - 1);
+                            assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y} s {s} z {z}");
+                        }
                     }
                 }
             }
