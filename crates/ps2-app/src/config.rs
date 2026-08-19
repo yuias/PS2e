@@ -27,9 +27,11 @@ scaler = "sharp"
 
 # Interlaced output: "weave" (both fields, combs on motion), "bob" (latest
 # field only, bobs by nature), "blend" (weave softened vertically),
-# "adaptive" (weave where still, bob where moving) or "adaptivedebug"
-# (adaptive with the rebuilt pixels tinted).
-deinterlace = "adaptive"
+# "adaptive" (weave where still, bob where moving), "adaptivedebug"
+# (adaptive with the rebuilt pixels tinted) or "yadif" (ffmpeg's filter:
+# edge-directed rebuild clamped by the neighbouring fields, one field of
+# display latency).
+deinterlace = "yadif"
 
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
@@ -56,15 +58,17 @@ pub enum DeinterlaceSetting {
     Adaptive,
     /// Adaptive with rebuilt pixels tinted, to see where it kicks in.
     AdaptiveDebug,
+    Yadif,
 }
 
 impl DeinterlaceSetting {
-    pub const ALL: [DeinterlaceSetting; 5] = [
+    pub const ALL: [DeinterlaceSetting; 6] = [
         DeinterlaceSetting::Weave,
         DeinterlaceSetting::Bob,
         DeinterlaceSetting::Blend,
         DeinterlaceSetting::Adaptive,
         DeinterlaceSetting::AdaptiveDebug,
+        DeinterlaceSetting::Yadif,
     ];
 
     pub fn label(self) -> &'static str {
@@ -74,6 +78,7 @@ impl DeinterlaceSetting {
             DeinterlaceSetting::Blend => "Blend",
             DeinterlaceSetting::Adaptive => "Adaptive",
             DeinterlaceSetting::AdaptiveDebug => "Adaptive (show motion)",
+            DeinterlaceSetting::Yadif => "Yadif (1 field late)",
         }
     }
 
@@ -85,6 +90,7 @@ impl DeinterlaceSetting {
             DeinterlaceSetting::Blend => 2,
             DeinterlaceSetting::Adaptive => 3,
             DeinterlaceSetting::AdaptiveDebug => 4,
+            DeinterlaceSetting::Yadif => 5,
         }
     }
 }
@@ -96,7 +102,7 @@ impl Default for Config {
             volume: 0.5,
             memcard: None,
             scaler: crate::display::ScaleMode::Sharp,
-            deinterlace: DeinterlaceSetting::Adaptive,
+            deinterlace: DeinterlaceSetting::Yadif,
         }
     }
 }

@@ -137,6 +137,9 @@ pub struct Gs {
     /// Per-pixel motion flags of the last composited frame (see
     /// [`Deinterlace::Adaptive`]), one byte per pixel of `woven`.
     motion: Vec<u8>,
+    /// Per field parity, the field before the one now in `woven` (rows of
+    /// that parity only), for [`Deinterlace::Yadif`]'s temporal taps.
+    history: [Vec<u8>; 2],
     woven_dims: (u32, u32),
     /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
     /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
@@ -205,6 +208,7 @@ impl Gs {
             },
             woven: Vec::new(),
             motion: Vec::new(),
+            history: [Vec::new(), Vec::new()],
             woven_dims: (0, 0),
             clut: Box::new([0; 512]),
             clut_key: u64::MAX,
@@ -780,10 +784,12 @@ impl Gs {
         if self.woven_dims != (w, h) {
             self.woven = vec![0u8; (w * h * 4) as usize];
             self.motion = vec![0u8; (w * h) as usize];
+            self.history = [vec![0u8; (w * h * 4) as usize], vec![0u8; (w * h * 4) as usize]];
             self.woven_dims = (w, h);
         }
         let mut woven = std::mem::take(&mut self.woven);
         let mut motion = std::mem::take(&mut self.motion);
+        let mut history = std::mem::take(&mut self.history);
         let stride = (w * 4) as usize;
         // The new field lands on its rows; the other rows keep the previous
         // field. Motion is the change against the same field two vblanks
@@ -793,6 +799,11 @@ impl Gs {
             let y = sy * 2 + field as u32;
             self.scan_line(&view, sy, &mut line);
             let row = &mut woven[y as usize * stride..][..stride];
+            if mode == Deinterlace::Yadif {
+                // Keep the field this one replaces: it is the temporal
+                // neighbour of the same parity.
+                history[field as usize][y as usize * stride..][..stride].copy_from_slice(row);
+            }
             if matches!(mode, Deinterlace::Adaptive | Deinterlace::AdaptiveDebug) {
                 // Motion weight 0..=255 per pixel: the change against the
                 // same field two vblanks ago mapped through a soft ramp,
@@ -818,6 +829,37 @@ impl Gs {
         let mut out = woven.clone();
         match mode {
             Deinterlace::Weave => {}
+            Deinterlace::Yadif => {
+                // Deinterlace the *previous* field (one vblank late): its
+                // missing rows are the parity that just arrived, so both
+                // temporal neighbours of those rows are known. Bands of rows
+                // go to the worker pool when there is one.
+                let missing = field;
+                let bands = if cfg!(feature = "threads") && !self.pool.is_empty() { 4 } else { 1 };
+                let rows_per_band = (h as usize).div_ceil(bands);
+                let run_band = |band: usize, out_band: &mut [u8]| {
+                    let y0 = band * rows_per_band;
+                    for (i, row) in out_band.chunks_mut(stride).enumerate() {
+                        let y = (y0 + i) as u32;
+                        if (y & 1 != 0) == missing {
+                            Self::yadif_row(&woven, &history, row, w, h, y, missing);
+                        }
+                    }
+                };
+                #[cfg(feature = "threads")]
+                if bands > 1 {
+                    rayon::scope(|sc| {
+                        for (band, out_band) in out.chunks_mut(rows_per_band * stride).enumerate() {
+                            let run_band = &run_band;
+                            sc.spawn(move |_| run_band(band, out_band));
+                        }
+                    });
+                } else {
+                    run_band(0, &mut out);
+                }
+                #[cfg(not(feature = "threads"))]
+                run_band(0, &mut out);
+            }
             Deinterlace::Blend => {
                 for y in 0..h {
                     let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
@@ -849,7 +891,99 @@ impl Gs {
         }
         self.woven = woven;
         self.motion = motion;
+        self.history = history;
         (w, h, out)
+    }
+
+    /// yadif (ffmpeg's "yet another deinterlacing filter") for one missing
+    /// row: the spatial prediction is the best-matching of five directions
+    /// between the rows above and below (from the field being shown), and
+    /// it is clamped to the range the temporal neighbours of the row (the
+    /// same field one vblank before and after) allow, so slow motion keeps
+    /// its true lines instead of bobbing. Missing rows have parity
+    /// `missing`; their temporal neighbours are `history[missing]` (before)
+    /// and `woven` (after); the shown field's previous instance is
+    /// `history[!missing]`. Without a look-ahead field the "next" term of
+    /// the motion estimate is dropped.
+    fn yadif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool) {
+        let stride = (w * 4) as usize;
+        let wmax = w as usize - 1;
+        let hmax = h - 1;
+        // Rows beyond the edges mirror, which keeps their field parity.
+        fn rowof(buf: &[u8], yy: i64, hmax: u32, stride: usize) -> &[u8] {
+            let yy = if yy < 0 { -yy } else if yy > hmax as i64 { 2 * hmax as i64 - yy } else { yy };
+            let yy = yy.clamp(0, hmax as i64) as usize;
+            &buf[yy * stride..][..stride]
+        }
+        let y = y as i64;
+        // Rows of the shown field around the missing one, and its own row in
+        // the fields before and after.
+        let (cm1, cp1) = (rowof(woven, y - 1, hmax, stride), rowof(woven, y + 1, hmax, stride));
+        let prev2 = &history[missing as usize];
+        let (p0, pm2, pp2) =
+            (rowof(prev2, y, hmax, stride), rowof(prev2, y - 2, hmax, stride), rowof(prev2, y + 2, hmax, stride));
+        let (n0, nm2, np2) =
+            (rowof(woven, y, hmax, stride), rowof(woven, y - 2, hmax, stride), rowof(woven, y + 2, hmax, stride));
+        let prev = &history[!missing as usize];
+        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, stride), rowof(prev, y + 1, hmax, stride));
+        let interior = 3..(w as usize).saturating_sub(3);
+        for x in 0..w as usize {
+            let xi = x as i64;
+            let clamp_needed = !interior.contains(&x);
+            for ch in 0..3 {
+                // Horizontal taps: plain indexing inside, clamped at the
+                // edges.
+                macro_rules! at {
+                    ($r:expr, $dx:expr) => {{
+                        let xx = if clamp_needed { (xi + ($dx)).clamp(0, wmax as i64) as usize } else { (xi + ($dx)) as usize };
+                        i32::from($r[xx * 4 + ch])
+                    }};
+                }
+                let c = at!(cm1, 0);
+                let e = at!(cp1, 0);
+                let (p, n) = (at!(p0, 0), at!(n0, 0));
+                let d = (p + n) >> 1;
+                let temporal_diff0 = (p - n).abs();
+                let temporal_diff1 = ((at!(pvm1, 0) - c).abs() + (at!(pvp1, 0) - e).abs()) >> 1;
+                let mut diff = (temporal_diff0 >> 1).max(temporal_diff1);
+                // Spatial prediction: vertical, then the diagonals whose
+                // three-pixel windows match better.
+                let mut spatial_pred = (c + e) >> 1;
+                let mut spatial_score = (at!(cm1, -1) - at!(cp1, -1)).abs() + (c - e).abs() + (at!(cm1, 1) - at!(cp1, 1)).abs() - 1;
+                macro_rules! check {
+                    ($j:expr) => {{
+                        let j: i64 = $j;
+                        let score = (at!(cm1, -1 + j) - at!(cp1, -1 - j)).abs()
+                            + (at!(cm1, j) - at!(cp1, -j)).abs()
+                            + (at!(cm1, 1 + j) - at!(cp1, 1 - j)).abs();
+                        if score < spatial_score {
+                            spatial_score = score;
+                            spatial_pred = (at!(cm1, j) + at!(cp1, -j)) >> 1;
+                            true
+                        } else {
+                            false
+                        }
+                    }};
+                }
+                if check!(-1) {
+                    check!(-2);
+                }
+                if check!(1) {
+                    check!(2);
+                }
+                let _ = spatial_score;
+                // Temporal clamp widened by what the rows two above/below
+                // suggest (the "spatial check" of yadif mode 0).
+                let b = (at!(pm2, 0) + at!(nm2, 0)) >> 1;
+                let f = (at!(pp2, 0) + at!(np2, 0)) >> 1;
+                let max_ = (d - e).max(d - c).max((b - c).min(f - e));
+                let min_ = (d - e).min(d - c).min((b - c).max(f - e));
+                diff = diff.max(min_).max(-max_);
+                let v = spatial_pred.clamp(d - diff, d + diff);
+                row[x * 4 + ch] = v.clamp(0, 255) as u8;
+            }
+            row[x * 4 + 3] = 255;
+        }
     }
 
     /// Fill row `y` of `out` from the rows above and below in `woven` (the
@@ -998,6 +1132,9 @@ pub enum Deinterlace {
     Adaptive,
     /// Adaptive, with the pixels it rebuilt tinted magenta (tuning aid).
     AdaptiveDebug,
+    /// ffmpeg's yadif: edge-directed rebuild clamped by the previous and
+    /// next field of the same parity; shows each field one vblank late.
+    Yadif,
 }
 
 /// Per-channel change below which a pixel counts as still, and above
@@ -1079,6 +1216,49 @@ mod tests {
             }
         }
         assert_eq!((last_even, last_odd), (0x80, 0x40), "settles back to the weave");
+        // Yadif: a still vertical ramp (each field holding its lines of it)
+        // comes out as the exact weave, one field late.
+        let ramp = |gs: &mut Gs, field: bool| {
+            for y in 0..4 {
+                for x in 0..64 {
+                    gs.write_psmct32(0, 1, x, y, 0x40 + (2 * y + field as u32) * 8);
+                }
+            }
+        };
+        for i in 0..6 {
+            let field1 = i % 2 == 0;
+            ramp(&mut gs, field1);
+            let (_, _, f) = gs.framebuffer_woven(field1, Deinterlace::Yadif);
+            // The first frames still see the change from the earlier
+            // fills in their temporal taps.
+            if i >= 4 {
+                let rows: Vec<u8> = (0..8).map(|y| px(&f, 64, 5, y)).collect();
+                let want: Vec<u8> = (0..8).map(|y| (0x40 + y * 8) as u8).collect();
+                assert_eq!(rows, want, "yadif on a still ramp");
+            }
+        }
+    }
+
+    /// Yadif must stay cheap enough for the GS thread at 60 vblanks/s.
+    #[test]
+    fn yadif_full_frame_cost() {
+        let mut gs = Gs::new();
+        gs.priv_write(0x0000, 1);
+        gs.priv_write(0x0020, 3);
+        gs.priv_write(0x0070, 10 << 9);
+        gs.priv_write(0x0080, (639u64 << 32) | (447u64 << 44));
+        for y in 0..224u32 {
+            for x in 0..640u32 {
+                gs.write_psmct32(0, 10, x, y, (x * 7 + y * 13) & 0xFF);
+            }
+        }
+        let t = std::time::Instant::now();
+        for i in 0..20 {
+            gs.framebuffer_woven(i % 2 == 0, Deinterlace::Yadif);
+        }
+        let per = t.elapsed() / 20;
+        eprintln!("yadif 640x448: {per:?} per vblank");
+        assert!(per.as_millis() < 16, "{per:?}");
     }
 
     /// Full-screen textured sprite copying one 640x224 buffer into another
