@@ -162,4 +162,8 @@ fn main() {
     // Particles: Z test GEQUAL with writes masked, blend, rotated PSMCT16.
     gs.write_reg(0x47, 0x50000); // TEST_1: ZTE GEQUAL
     bench("game particles psmct16 bilinear+blend+z", &mut gs, 0x5B, 0x20, tex0_psmct16(), particles);
+    gs.write_reg(0x47, 0x30000); // ZTE ALWAYS (masked: no Z traffic)
+    bench("game particles psmct16 bilinear+blend", &mut gs, 0x5B, 0x20, tex0_psmct16(), particles);
+    bench("game particles psmct16 bilinear", &mut gs, 0x1B, 0x20, tex0_psmct16(), particles);
+    bench("game particles psmct16 nearest", &mut gs, 0x1B, 0, tex0_psmct16(), particles);
 }
