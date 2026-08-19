@@ -109,6 +109,11 @@ struct TriGeom {
     sa: [f32; 4],
     sb: [f32; 4],
     sc: [f32; 4],
+    /// Per-pixel steps of the colour and STQU attributes and of v along a
+    /// row, for the incremental fast loop.
+    d_rgba: [f32; 4],
+    d_stqu: [f32; 4],
+    d_v: f32,
 }
 
 impl Gs {
@@ -336,11 +341,26 @@ impl Gs {
         let (sx0, sy0) = ((minx << 4) + 8, (miny << 4) + 8);
         let col = |v: &Vertex| [v.r as f32, v.g as f32, v.b as f32, v.a as f32];
         let stq = |v: &Vertex| [v.s, v.t, v.q, v.u as f32];
+        let inv_area = 1.0 / area as f32;
+        // Barycentric weights change by dx[i] * inv_area per pixel, so any
+        // attribute changes by the weighted sum of its vertex values.
+        let dl = [
+            -(c.y - b.y) as f32 * 16.0 * inv_area,
+            -(a.y - c.y) as f32 * 16.0 * inv_area,
+            -(b.y - a.y) as f32 * 16.0 * inv_area,
+        ];
+        let step = |pa: [f32; 4], pb: [f32; 4], pc: [f32; 4]| -> [f32; 4] {
+            let mut d = [0f32; 4];
+            for i in 0..4 {
+                d[i] = pa[i] * dl[0] + pb[i] * dl[1] + pc[i] * dl[2];
+            }
+            d
+        };
         let geom = TriGeom {
             a,
             b,
             c,
-            inv_area: 1.0 / area as f32,
+            inv_area,
             minx,
             maxx,
             miny,
@@ -355,6 +375,9 @@ impl Gs {
             sa: stq(&a),
             sb: stq(&b),
             sc: stq(&c),
+            d_rgba: step(col(&a), col(&b), col(&c)),
+            d_stqu: step(stq(&a), stq(&b), stq(&c)),
+            d_v: a.v as f32 * dl[0] + b.v as f32 * dl[1] + c.v as f32 * dl[2],
         };
         let th = pipe.tex.th as f32;
         let tex_v = if pipe.fst {
@@ -465,7 +488,7 @@ impl Gs {
             flat_fill: false,
         };
         let z_touched = pipe.zte && !(pipe.ztst == 1 && pipe.zmsk);
-        pipe.fast = pipe.tme && pipe.tfx == 0 && !z_touched && pipe.fbmsk == 0 && !pipe.fb24;
+        pipe.fast = pipe.tme && pipe.tfx == 0 && !z_touched && pipe.fbmsk == 0;
         // Z may be written (ALWAYS) but never tested; the alpha test on a
         // flat colour is decided once per row by the loop itself.
         pipe.flat_fill = !pipe.tme && !pipe.abe && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0 && !pipe.fb24;
@@ -643,20 +666,71 @@ impl Painter<'_> {
         let (a, b, c) = (g.a, g.b, g.c);
         for py in rows.iter() {
             let k = (py - g.miny) as i64;
-            let (mut w0, mut w1, mut w2) = (g.w0 + g.dy[0] * k, g.w1 + g.dy[1] * k, g.w2 + g.dy[2] * k);
-            let row = Row::new(pipe, py as u32);
-            for px in g.minx..=g.maxx {
-                let (cw0, cw1, cw2) = (w0, w1, w2);
-                w0 += g.dx[0];
-                w1 += g.dx[1];
-                w2 += g.dx[2];
-                if cw0 < 0 || cw1 < 0 || cw2 < 0 {
-                    continue;
+            let w = [g.w0 + g.dy[0] * k, g.w1 + g.dy[1] * k, g.w2 + g.dy[2] * k];
+            // Covered span: each edge function is affine in x, so the
+            // pixels with all three >= 0 form one interval (the same set
+            // the per-pixel test would accept).
+            let (mut xs, mut xe) = (g.minx, g.maxx);
+            for i in 0..3 {
+                let d = g.dx[i];
+                if d > 0 {
+                    // w + d*n >= 0  <=>  n >= ceil(-w / d)
+                    let span = (g.maxx - g.minx + 1) as i64;
+                    let n = ((-w[i]).div_euclid(d) + ((-w[i]).rem_euclid(d) != 0) as i64).clamp(0, span);
+                    xs = xs.max(g.minx + n as i32);
+                } else if d < 0 {
+                    // w + d*n >= 0  <=>  n <= floor(w / -d)
+                    if w[i] < 0 {
+                        xe = g.minx - 1;
+                    } else {
+                        xe = xe.min(g.minx + (w[i] / -d).min((g.maxx - g.minx + 1) as i64) as i32);
+                    }
+                } else if w[i] < 0 {
+                    xe = g.minx - 1;
                 }
-                let (w0, w1, w2) = (cw0, cw1, cw2);
+            }
+            if xs > xe {
+                continue;
+            }
+            let row = Row::new(pipe, py as u32);
+            if pipe.fast {
+                let n = (xs - g.minx) as i64;
+                let (w0, w1, w2) = (w[0] + g.dx[0] * n, w[1] + g.dx[1] * n, w[2] + g.dx[2] * n);
                 let l0 = w0 as f32 * g.inv_area;
                 let l1 = w1 as f32 * g.inv_area;
                 let l2 = w2 as f32 * g.inv_area;
+                let args = FastTri {
+                    row: &row,
+                    xs,
+                    xe,
+                    rgba: interp3(&g.ca, &g.cb, &g.cc, l0, l1, l2),
+                    stqu: interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2),
+                    v: a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2,
+                    d_rgba: g.d_rgba,
+                    d_stqu: g.d_stqu,
+                    d_v: g.d_v,
+                };
+                match (pipe.bilinear, pipe.abe, pipe.ate) {
+                    (false, false, false) => self.fast_tri_row::<false, false, false>(&args),
+                    (false, false, true) => self.fast_tri_row::<false, false, true>(&args),
+                    (false, true, false) => self.fast_tri_row::<false, true, false>(&args),
+                    (false, true, true) => self.fast_tri_row::<false, true, true>(&args),
+                    (true, false, false) => self.fast_tri_row::<true, false, false>(&args),
+                    (true, false, true) => self.fast_tri_row::<true, false, true>(&args),
+                    (true, true, false) => self.fast_tri_row::<true, true, false>(&args),
+                    (true, true, true) => self.fast_tri_row::<true, true, true>(&args),
+                }
+                continue;
+            }
+            let n = (xs - g.minx) as i64;
+            let (mut w0, mut w1, mut w2) = (w[0] + g.dx[0] * n, w[1] + g.dx[1] * n, w[2] + g.dx[2] * n);
+            for px in xs..=xe {
+                let l0 = w0 as f32 * g.inv_area;
+                let l1 = w1 as f32 * g.inv_area;
+                let l2 = w2 as f32 * g.inv_area;
+                w0 += g.dx[0];
+                w1 += g.dx[1];
+                w2 += g.dx[2];
                 let rgba = interp3(&g.ca, &g.cb, &g.cc, l0, l1, l2);
                 let stqu = interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2);
                 let frag = Frag {
@@ -676,6 +750,138 @@ impl Painter<'_> {
                 self.shade_row_px(&row, px as u32, frag, texel);
             }
         }
+    }
+
+    /// Textured MODULATE triangle span for `PixelPipe::fast` setups: the
+    /// attributes step incrementally along the row, texels come through the
+    /// row cache, and the filter / alpha test / blend are compile-time
+    /// choices (see [`Painter::fast_sprite_row`]).
+    #[inline(never)]
+    fn fast_tri_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastTri) {
+        let pipe = self.pipe;
+        let row = a.row;
+        let y = row.y;
+        let n = (a.xe - a.xs + 1) as u64;
+        self.scratch.pixels += n;
+        self.scratch.tex_samples[pipe.tex.psm as usize] += n;
+        #[cfg(feature = "profile")]
+        {
+            let k = (pipe.kind as usize) | ((pipe.tme as usize) << 2) | ((pipe.bilinear as usize) << 3)
+                | ((pipe.abe as usize) << 4) | ((pipe.tex.psm as usize & 0x3F) << 5)
+                | ((pipe.tfx as usize & 3) << 11) | ((pipe.ate as usize) << 13);
+            for _ in 0..n {
+                crate::prof::count_pixel(k);
+            }
+        }
+        let tcc = pipe.tcc;
+        let fst = pipe.fst;
+        let (tw, th) = (pipe.tex.tw as f32, pipe.tex.th as f32);
+        let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
+        let (blend_a, blend_b, blend_c, blend_d, blend_fix) =
+            (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
+        let canvas = self.canvas;
+        let fb24 = pipe.fb24;
+        let mut rgba = a.rgba;
+        let mut stqu = a.stqu;
+        let mut v = a.v;
+        for px in a.xs..=a.xe {
+            let (fu, fv) = if fst {
+                (stqu[3] / 16.0, v / 16.0)
+            } else {
+                let q = if stqu[2].abs() < 1e-9 { 1.0 } else { stqu[2] };
+                let inv_q = 1.0 / q;
+                (stqu[0] * inv_q * tw, stqu[1] * inv_q * th)
+            };
+            let texel = if BIL { self.sample_bilinear_cached(fu, fv) } else { self.cached_texel(0, floor_i32(fu), floor_i32(fv)) };
+            let (cr, cg, cb, ca) = (rgba[0] as u32, rgba[1] as u32, rgba[2] as u32, rgba[3] as u32);
+            for i in 0..4 {
+                rgba[i] += a.d_rgba[i];
+                stqu[i] += a.d_stqu[i];
+            }
+            v += a.d_v;
+            let ta = texel >> 24;
+            let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            if ATE {
+                let pass = match atst {
+                    0 => false,
+                    1 => true,
+                    2 => a8 < aref,
+                    3 => a8 <= aref,
+                    4 => a8 == aref,
+                    5 => a8 >= aref,
+                    6 => a8 > aref,
+                    _ => a8 != aref,
+                };
+                if !pass && (afail == 0 || afail == 2) {
+                    continue;
+                }
+            }
+            let mut out = Modulate::new(cr, cg, cb, ca, tcc).apply(texel);
+            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
+            let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
+            if ABE {
+                let src = spread21(out & 0xFF_FFFF);
+                let dstc = spread21(dst & 0xFF_FFFF);
+                let pick = |k: u8| -> u64 {
+                    match k {
+                        0 => src,
+                        1 => dstc,
+                        _ => 0,
+                    }
+                };
+                let alpha = match blend_c {
+                    0 => a8 as u64,
+                    1 => (dst >> 24) as u64,
+                    _ => blend_fix,
+                };
+                const BIAS: u64 = (1 << 16) | (1 << (16 + 21)) | (1 << (16 + 42));
+                let x = pick(blend_a) * alpha + pick(blend_d) * 128 + BIAS - pick(blend_b) * alpha;
+                let lane = |sh: u32| -> u32 {
+                    let v = (((x >> sh) & 0x1F_FFFF) >> 7) as i32 - 512;
+                    v.clamp(0, 255) as u32
+                };
+                out = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+            }
+            if fb24 {
+                // PSMCT24 frame: the alpha byte belongs to whatever shares
+                // the word.
+                out = (out & 0xFF_FFFF) | (dst & 0xFF00_0000);
+            }
+            canvas.wr32(fb_off, out);
+        }
+    }
+
+    /// Bilinear texel at texel-space `(fu, fv)` through the row cache
+    /// (the bilinear half of [`Painter::sample_cached`]).
+    #[inline(always)]
+    fn sample_bilinear_cached(&mut self, fu: f32, fv: f32) -> u32 {
+        let pipe = self.pipe;
+        let ti = &pipe.tex;
+        let x = fu - 0.5;
+        let y = fv - 0.5;
+        let (x0, y0) = (floor_i32(x), floor_i32(y));
+        let fx = ((x - x0 as f32) * 256.0) as u32;
+        let fy = ((y - y0 as f32) * 256.0) as u32;
+        if fx | fy == 0 {
+            return self.cached_texel(0, x0, y0);
+        }
+        // Common case: both rows cached and the 2x2 footprint inside them.
+        let (r0, r1) = (&self.scratch.tex_rows[0], &self.scratch.tex_rows[1]);
+        if r0.key == (ti.tex0, y0)
+            && r1.key == (ti.tex0, y0 + 1)
+            && x0 >= r0.u_lo
+            && x0 + 1 < r0.u_lo + r0.data.len() as i32
+            && x0 >= r1.u_lo
+            && x0 + 1 < r1.u_lo + r1.data.len() as i32
+        {
+            let (i0, i1) = ((x0 - r0.u_lo) as usize, (x0 - r1.u_lo) as usize);
+            return bilerp_rgba(r0.data[i0], r0.data[i0 + 1], r1.data[i1], r1.data[i1 + 1], fx, fy);
+        }
+        let t00 = self.cached_texel(0, x0, y0);
+        let t10 = self.cached_texel(0, x0 + 1, y0);
+        let t01 = self.cached_texel(1, x0, y0 + 1);
+        let t11 = self.cached_texel(1, x0 + 1, y0 + 1);
+        bilerp_rgba(t00, t10, t01, t11, fx, fy)
     }
 
     /// Make `tex_rows[slot]` hold texels `u_lo..=u_hi` of texture row `y`
@@ -752,31 +958,7 @@ impl Painter<'_> {
         if !pipe.bilinear {
             return self.cached_texel(0, floor_i32(fu), floor_i32(fv));
         }
-        let x = fu - 0.5;
-        let y = fv - 0.5;
-        let (x0, y0) = (floor_i32(x), floor_i32(y));
-        let fx = ((x - x0 as f32) * 256.0) as u32;
-        let fy = ((y - y0 as f32) * 256.0) as u32;
-        if fx | fy == 0 {
-            return self.cached_texel(0, x0, y0);
-        }
-        // Common case: both rows cached and the 2x2 footprint inside them.
-        let (r0, r1) = (&self.scratch.tex_rows[0], &self.scratch.tex_rows[1]);
-        if r0.key == (ti.tex0, y0)
-            && r1.key == (ti.tex0, y0 + 1)
-            && x0 >= r0.u_lo
-            && x0 + 1 < r0.u_lo + r0.data.len() as i32
-            && x0 >= r1.u_lo
-            && x0 + 1 < r1.u_lo + r1.data.len() as i32
-        {
-            let (i0, i1) = ((x0 - r0.u_lo) as usize, (x0 - r1.u_lo) as usize);
-            return bilerp_rgba(r0.data[i0], r0.data[i0 + 1], r1.data[i1], r1.data[i1 + 1], fx, fy);
-        }
-        let t00 = self.cached_texel(0, x0, y0);
-        let t10 = self.cached_texel(0, x0 + 1, y0);
-        let t01 = self.cached_texel(1, x0, y0 + 1);
-        let t11 = self.cached_texel(1, x0 + 1, y0 + 1);
-        bilerp_rgba(t00, t10, t01, t11, fx, fy)
+        self.sample_bilinear_cached(fu, fv)
     }
 
     #[inline(always)]
@@ -909,6 +1091,7 @@ impl Painter<'_> {
         let (blend_a, blend_b, blend_c, blend_d, blend_fix) =
             (pipe.blend_a, pipe.blend_b, pipe.blend_c, pipe.blend_d, pipe.blend_fix as u64);
         let canvas = self.canvas;
+        let fb24 = pipe.fb24;
         let (row0, row1) = (a.row0, a.row1);
         let last0 = row0.len().saturating_sub(if BIL { 2 } else { 1 });
         let mut u = a.ua - if BIL { 1i64 << 31 } else { 0 };
@@ -947,8 +1130,8 @@ impl Painter<'_> {
             }
             let mut out = mod_lanes.apply(texel);
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
+            let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
             if ABE {
-                let dst = canvas.rd32(fb_off);
                 let src = spread21(out & 0xFF_FFFF);
                 let dstc = spread21(dst & 0xFF_FFFF);
                 let pick = |k: u8| -> u64 {
@@ -970,6 +1153,11 @@ impl Painter<'_> {
                     v.clamp(0, 255) as u32
                 };
                 out = lane(0) | (lane(21) << 8) | (lane(42) << 16) | (out & 0xFF00_0000);
+            }
+            if fb24 {
+                // PSMCT24 frame: the alpha byte belongs to whatever shares
+                // the word.
+                out = (out & 0xFF_FFFF) | (dst & 0xFF00_0000);
             }
             canvas.wr32(fb_off, out);
         }
@@ -1221,6 +1409,20 @@ struct FastRow<'a> {
     du: i64,
 }
 
+/// Arguments of [`Painter::fast_tri_row`]: the span and the attributes at
+/// its first pixel plus their per-pixel steps.
+struct FastTri<'a> {
+    row: &'a Row,
+    xs: i32,
+    xe: i32,
+    rgba: [f32; 4],
+    stqu: [f32; 4],
+    v: f32,
+    d_rgba: [f32; 4],
+    d_stqu: [f32; 4],
+    d_v: f32,
+}
+
 /// MODULATE colour lanes: `(texel * colour) >> 7` per channel saturated
 /// to 255, alpha from the texel (TCC) or the vertex.
 #[derive(Clone, Copy)]
@@ -1311,8 +1513,9 @@ struct PixelPipe {
     blend_d: u8,
     blend_fix: u32,
     /// Textured MODULATE drawing that touches nothing but the colour
-    /// buffer: eligible for the specialised sprite loops
-    /// (`Painter::fast_sprite_row`).
+    /// buffer (no Z test/write, no frame mask): eligible for the
+    /// specialised row loops (`Painter::fast_sprite_row`,
+    /// `Painter::fast_tri_row`).
     fast: bool,
     /// Untextured, unblended sprite whose only per-pixel work is storing a
     /// constant colour (and maybe Z): `Painter::flat_sprite_row`.
