@@ -867,11 +867,42 @@ struct IopTimer {
 
 /// NTSC hblank rate on the IOP sysclock (36.864 MHz / 15734 Hz).
 const IOP_HBLANK_DIV: u64 = 2343;
+/// Longest gap between periodic ticks, whatever the computed events say.
+const MAX_TICK_GAP: u64 = 8192;
 
 impl IopTimer {
     /// IOP sysclock ticks are EE cycles / 8; mode bit 8 selects the external
     /// clock (pixel for counter 0, hblank for counters 1/3), bit 9 is /8 on
     /// counter 2, and wide timers add a sysclock prescaler in bits 13-14.
+    /// EE cycles per COUNT tick (mirrors [`IopTimer::count`]).
+    fn cycles_per_tick(&self, idx: usize) -> u64 {
+        let external = self.mode & (1 << 8) != 0;
+        8 * match idx {
+            0 if external => 3,
+            1 | 3 if external => IOP_HBLANK_DIV,
+            2 if self.mode & (1 << 9) != 0 => 8,
+            3.. => match (self.mode >> 13) & 3 {
+                0 => 1,
+                1 => 8,
+                2 => 16,
+                _ => 256,
+            },
+            _ => 1,
+        }
+    }
+
+    /// Earliest cycle at which this timer reaches its target or wraps.
+    fn next_event(&self, idx: usize, now: u64) -> u64 {
+        let size = if idx < 3 { 1u64 << 16 } else { 1u64 << 32 };
+        let count = u64::from(self.count(idx, now));
+        let to_target = (u64::from(self.target) + size - count) % size;
+        let to_target = if to_target == 0 { size } else { to_target };
+        let to_wrap = size - count;
+        let p = self.cycles_per_tick(idx);
+        let phase = now.saturating_sub(self.base_cycle) % p;
+        now + to_target.min(to_wrap) * p - phase
+    }
+
     fn count(&self, idx: usize, now: u64) -> u32 {
         let sys = now.saturating_sub(self.base_cycle) / 8;
         let external = self.mode & (1 << 8) != 0;
@@ -903,6 +934,10 @@ pub struct Bus {
     pub spad: Box<[u8]>,
     /// IOP RAM as seen from the EE at 0x1C00_0000 (2 MiB).
     pub iop_ram: Box<[u8]>,
+    /// Earliest cycle at which [`Bus::tick_timers`] has work (timer events,
+    /// deferred DMA completions, SPU2 samples); any write that can move an
+    /// event resets it to 0. See `Ps2System::machine_cycle`.
+    pub timers_due: u64,
     /// Shadow storage for EE MMIO registers we don't model yet: reads return
     /// the last written value so BIOS read-modify-write sequences behave.
     mmio: Box<[u8]>,
@@ -1003,6 +1038,7 @@ impl Bus {
             bios: bios.into_boxed_slice(),
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; 2 * 1024 * 1024].into_boxed_slice(),
+            timers_due: 0,
             mmio,
             gs: if gs_threaded { GsFront::new() } else { GsFront::inline() },
             gif: Gif::new(),
@@ -1062,6 +1098,7 @@ impl Bus {
     /// Queue an EE DMAC completion interrupt a little into the future.
     fn ee_dma_irq(&mut self, ch: u32) {
         self.dma_irq_queue.push((1 << ch, self.now + 1024));
+        self.timers_due = 0;
     }
 
     /// Record a TLB entry (from tlbwi) and flush the translation cache.
@@ -1422,6 +1459,7 @@ impl Bus {
         match addr & !0x3 {
             0x1000_0000..=0x1000_1FFF => {
                 self.timers.write(addr, v as u32, self.now);
+                self.timers_due = 0;
                 return;
             }
             // EE SIO TXFIFO: the kernel's debug output channel. Pure
@@ -1640,10 +1678,16 @@ impl Bus {
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
         let now = self.now;
+        // Next time anything here can happen (bounded, as a safety net).
+        let mut due = (now + MAX_TICK_GAP).min(self.timers.next_event(now)).min(self.spu2.next_due());
+        for &(_, at) in &self.dma_irq_queue {
+            due = due.min(at);
+        }
         for (t, timer) in self.iop_timers.iter_mut().enumerate() {
             if timer.mode == 0 {
                 continue; // never configured
             }
+            due = due.min(timer.next_event(t, now));
             let before = timer.count(t, timer.last_check);
             let after = timer.count(t, now);
             timer.last_check = now;
@@ -1677,6 +1721,7 @@ impl Bus {
             }
         }
         self.iop_i_stat |= fired;
+        self.timers_due = due.max(now + 1);
     }
 
     /// Vertical blank begin/end: EE INTC bits 2/3, IOP I_STAT bits 0/11,
@@ -1919,6 +1964,7 @@ impl Bus {
             }
         }
         self.spu2.dma(core, to_spu, &mut buf, self.now);
+        self.timers_due = 0;
         if !to_spu {
             for (i, b) in buf.into_iter().enumerate() {
                 self.iop_ram[(start + i) % len] = b;
@@ -2372,6 +2418,7 @@ impl Bus {
             }
             0x1F90_0000..=0x1F90_0FFF => {
                 self.spu2.write::<N>((addr & 0xFFF) as usize, v);
+                self.timers_due = 0;
                 if self.spu2.take_irq() {
                     self.iop_i_stat |= 1 << 9;
                 }
@@ -2468,6 +2515,7 @@ impl Bus {
 
     fn iop_write_mmio<const N: usize>(&mut self, addr: u32, v: u32) {
         if let Some(t) = Self::iop_timer_index(addr) {
+            self.timers_due = 0;
             let timer = &mut self.iop_timers[t];
             match addr & 0xF {
                 0x0 => {

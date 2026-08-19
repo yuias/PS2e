@@ -25,6 +25,16 @@ struct Timer {
 }
 
 impl Timer {
+    /// EE cycles per COUNT tick for the selected clock.
+    fn cycles_per_tick(&self) -> u64 {
+        (match self.mode & 3 {
+            0 => 1,
+            1 => 16,
+            2 => 256,
+            _ => HBLANK_DIV,
+        }) << BUSCLK_SHIFT
+    }
+
     fn count(&self, now: u64) -> u16 {
         let busclk = (now.saturating_sub(self.base_cycle)) >> BUSCLK_SHIFT;
         let ticks = match self.mode & 3 {
@@ -96,6 +106,27 @@ impl Timers {
     fn decode(addr: u32) -> (usize, u32) {
         let t = ((addr >> 11) & 3) as usize;
         (t, addr & 0x30)
+    }
+
+    /// Earliest cycle at which a timer can reach its compare value (the
+    /// only event [`Timers::check_irqs`] reacts to), or `u64::MAX`. A
+    /// check at or after that cycle sees the crossing; earlier checks have
+    /// nothing to find.
+    pub fn next_event(&self, now: u64) -> u64 {
+        let mut due = u64::MAX;
+        for timer in &self.timers {
+            if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
+                continue;
+            }
+            let p = timer.cycles_per_tick();
+            let ticks = u64::from(timer.comp.wrapping_sub(timer.count(now)));
+            // Equal right now: the crossing (if any) is found by this
+            // check; the next one is a full wrap away.
+            let ticks = if ticks == 0 { 0x1_0000 } else { ticks };
+            let phase = now.saturating_sub(timer.base_cycle) % p;
+            due = due.min(now + ticks * p - phase);
+        }
+        due
     }
 
     /// Edge-detect compare matches since the last call; returns an INTC bit

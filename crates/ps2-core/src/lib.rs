@@ -137,6 +137,7 @@ impl Ps2System {
         // approximation come later.
         if self.cycles.is_multiple_of(EE_PER_IOP) {
             let _g = prof::scope(prof::Slot::Iop);
+            self.bus.now = self.cycles;
             // Same idle-loop skip as the EE, for the IOP kernel's `j .`.
             if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
                 self.iop.idle = false;
@@ -144,7 +145,7 @@ impl Ps2System {
             }
             event = true;
         }
-        if self.cycles.is_multiple_of(TIMER_TICK_CYCLES) {
+        if self.cycles.is_multiple_of(TIMER_TICK_CYCLES) && self.cycles >= self.bus.timers_due {
             let _g = prof::scope(prof::Slot::Timers);
             self.bus.now = self.cycles;
             self.bus.tick_timers();
@@ -249,7 +250,9 @@ impl Ps2System {
     /// the jump.
     #[inline]
     fn idle_skip(&self, limit: u64) -> u64 {
-        let to_timer = (TIMER_TICK_CYCLES - self.cycles % TIMER_TICK_CYCLES) % TIMER_TICK_CYCLES;
+        // First tick-aligned cycle at or after the bus's next due time.
+        let due = self.bus.timers_due.max(self.cycles);
+        let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
         let vbl_start = EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
         let to_vblank = if self.frame_pos < vbl_start {
             vbl_start - self.frame_pos

@@ -120,6 +120,18 @@ impl Spu2 {
         }
     }
 
+    /// Earliest EE cycle at which [`Spu2::tick`] has something to do: the
+    /// next output sample or a transfer completing.
+    pub fn next_due(&self) -> u64 {
+        let mut due = self.last_sample + EE_CYCLES_PER_SAMPLE;
+        for core in &self.cores {
+            if let Some(d) = core.dma_due {
+                due = due.min(d);
+            }
+        }
+        due
+    }
+
     /// Take the samples mixed since the last call.
     pub fn take_output(&mut self) -> Vec<i16> {
         core::mem::take(&mut self.out)
