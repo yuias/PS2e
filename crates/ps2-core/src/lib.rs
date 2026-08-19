@@ -26,6 +26,9 @@ pub const EE_PER_IOP: u64 = 8;
 pub const EE_CYCLES_PER_FRAME: u64 = EE_CLOCK_HZ / 60;
 /// Vertical blank occupies roughly the last 5% of the frame.
 const VBLANK_CYCLES: u64 = EE_CYCLES_PER_FRAME / 20;
+/// Cadence of the periodic bus tick (timers, deferred DMA and SPU2
+/// completions, SPU2 mixing).
+const TIMER_TICK_CYCLES: u64 = 64;
 
 /// Top-level system: owns every component, mirrors the real console.
 pub struct Ps2System {
@@ -141,7 +144,7 @@ impl Ps2System {
             }
             event = true;
         }
-        if self.cycles.is_multiple_of(64) {
+        if self.cycles.is_multiple_of(TIMER_TICK_CYCLES) {
             let _g = prof::scope(prof::Slot::Timers);
             self.bus.now = self.cycles;
             self.bus.tick_timers();
@@ -194,6 +197,14 @@ impl Ps2System {
                 self.advance(n as u64);
                 continue;
             }
+            // Both cores idle: jump to the next timer tick or vblank edge,
+            // the only things that can wake either of them.
+            if self.ee.idle && self.iop.idle && !self.iop.interrupt_pending(&self.bus) {
+                let k = self.idle_skip(target - self.cycles - 1);
+                self.jump(k);
+                self.step();
+                continue;
+            }
             if !self.cycles.is_multiple_of(EE_PER_IOP) || target - self.cycles < EE_PER_IOP {
                 self.step();
                 continue;
@@ -230,12 +241,49 @@ impl Ps2System {
         }
     }
 
+    /// With the IOP idle (and no interrupt for it pending) nothing can
+    /// change its state until the next timer tick or vblank edge: every
+    /// other IOP interrupt source is an IOP or EE access, and neither core
+    /// runs during a skip. Returns how many cycles can be jumped before the
+    /// next `machine_cycle` must run (0 = it must run now); `limit` bounds
+    /// the jump.
+    #[inline]
+    fn idle_skip(&self, limit: u64) -> u64 {
+        let to_timer = (TIMER_TICK_CYCLES - self.cycles % TIMER_TICK_CYCLES) % TIMER_TICK_CYCLES;
+        let vbl_start = EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+        let to_vblank = if self.frame_pos < vbl_start {
+            vbl_start - self.frame_pos
+        } else {
+            EE_CYCLES_PER_FRAME - self.frame_pos
+        };
+        to_timer.min(to_vblank).min(limit)
+    }
+
+    /// Jump `k` cycles that carry no IOP slot, timer tick or vblank edge
+    /// (`k` never crosses a frame boundary; landing on it is the vblank-end
+    /// edge, which `machine_cycle` fires at `frame_pos == 0`).
+    #[inline]
+    fn jump(&mut self, k: u64) {
+        self.cycles += k;
+        self.frame_pos += k;
+        if self.frame_pos == EE_CYCLES_PER_FRAME {
+            self.frame_pos = 0;
+        }
+    }
+
     /// Run the rest of the machine for `n` cycles after the EE retired that
     /// many instructions: IOP slots and timers keep their cadence, vblank
     /// edges land on the exact cycle, and cycles with nothing due are
     /// skipped in bulk.
     fn advance(&mut self, mut n: u64) {
         while n > 0 {
+            if self.iop.idle && !self.iop.interrupt_pending(&self.bus) {
+                let k = self.idle_skip(n - 1);
+                self.jump(k);
+                self.machine_cycle();
+                n -= k + 1;
+                continue;
+            }
             if !self.cycles.is_multiple_of(EE_PER_IOP) || n < EE_PER_IOP {
                 self.machine_cycle();
                 n -= 1;
