@@ -28,12 +28,13 @@ impl Audio {
         let underruns = Arc::new(AtomicU64::new(0));
         let ur = underruns.clone();
 
-        // SPU2 produces 48000 Hz stereo; resample by simple duplication
-        // ratio if the device rate differs (good enough until a proper
-        // resampler is warranted).
+        // SPU2 produces 48000 Hz stereo; when the device rate differs,
+        // linearly interpolate between consecutive source frames (zero-order
+        // hold at a non-integer ratio is audibly rough).
         let step = 48_000.0 / sample_rate as f64;
         let mut pos = 0.0f64;
-        let mut last = (0i16, 0i16);
+        let mut prev = (0i16, 0i16);
+        let mut cur = (0i16, 0i16);
 
         let stream = device
             .build_output_stream(
@@ -45,18 +46,21 @@ impl Audio {
                         pos += step;
                         while pos >= 1.0 {
                             pos -= 1.0;
+                            prev = cur;
                             if q.len() >= 2 {
-                                last = (q.pop_front().unwrap(), q.pop_front().unwrap());
+                                cur = (q.pop_front().unwrap(), q.pop_front().unwrap());
                             } else {
                                 // Underrun: decay toward silence instead of
                                 // holding the level, so the eventual
                                 // resumption step is small (softer click)
                                 starved = true;
-                                last = (last.0 - last.0 / 16, last.1 - last.1 / 16);
+                                cur = (cur.0 - cur.0 / 16, cur.1 - cur.1 / 16);
                             }
                         }
-                        let l = last.0 as f32 / 32768.0;
-                        let r = last.1 as f32 / 32768.0;
+                        let t = pos as f32;
+                        let lerp = |a: i16, b: i16| (a as f32 + (b as f32 - a as f32) * t) / 32768.0;
+                        let l = lerp(prev.0, cur.0);
+                        let r = lerp(prev.1, cur.1);
                         for (i, s) in frame.iter_mut().enumerate() {
                             *s = if i % 2 == 0 { l } else { r };
                         }
