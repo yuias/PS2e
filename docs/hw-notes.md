@@ -460,3 +460,28 @@ each wait):
   both are skipped until an interrupt is pending without changing
   emulated timing (frames are bit-identical).
 
+
+## Disc boot: PS2 logo and the boot chime (SCPH-50000, SLPS-25918)
+
+- The OSD boots a disc once the drive identifies it: it polls the disc
+  type (CDVD reg 0x0F) from its animation loop and calls
+  ExecutePs2GameDisk when the type is known and its intro has played.
+  With instant identification that lands at ~5.0 s — mid-chime (the
+  chime has phrases out to ~8 s) — and the reboot's fresh libsd zeroes
+  the SPU 0.33 s later, chopping the reverb tail. With identification
+  at ~6.5 s from power-on the OSD holds the SCE screen and the chime
+  plays through (killed only below -25 dB), like hardware.
+- EELOAD reads the type register too and falls back to the OSD browser
+  ("No data") if it reads "detecting" (0x01) after the PS2LOGO reboot:
+  a reboot re-settle may gate the *status* register (SPIN) but must
+  keep the type answer.
+- PS2LOGO displays in SMODE2=1 (interlaced frame mode), DISPLAY2
+  DH=511 (640x512, NTSC shows the middle) over a PSMCT24 buffer.
+- The logo sound is five voices of one 0.55 s ADPCM sample (SSA
+  0x2808, END flag verified against the ROM copy at 0x347ca0 in
+  SCPH-50000), sustain-hold ADSR, pitches ~0.51-0.92. Each key-on
+  rewrites VMIXEL/VMIXER to 0xFFFFFF >> k, so only the last voice
+  feeds the core-0 reverb (ESA 0xFC810, EEA at its 0xF_FFFF reset
+  default — EEA's low 16 bits are fixed 0xFFFF on hardware — EVOL
+  0x1428). The audible ring is that reverb tail plus the second
+  reboot's re-settle time before the game's libsd init clears it.
