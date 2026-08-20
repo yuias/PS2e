@@ -93,7 +93,13 @@ Planned crates:
    OSD's blur-heavy boot screens now run at about real time (3G cycles
    in 10.0 s vs the 10.2 s a console takes; their slowness is what
    starved the audio buffer during the boot chime) and the game at
-   ~3.5x. Next: the IOP interpreter's in-situ cost, the wasm front-end.
+   ~3.5x. Next: an EE dual-issue cycle model — we retire 1
+   cycle/instruction while the R5900 pairs most integer ops, so fixed
+   CPU delay loops (PS2LOGO's boot pacing) run about twice as long and
+   its catch-up skips the PS-mark/PS2-logo fades (docs/hw-notes.md);
+   the JIT and the interpreter must share the cost model to keep the
+   bit-identical-frames protocol. After that: the GS's serial
+   small-triangle cost, the wasm front-end.
 
 ## Component map (ps2-core)
 
