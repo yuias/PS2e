@@ -28,10 +28,10 @@ scaler = "sharp"
 # Interlaced output: "weave" (both fields, combs on motion), "bob" (latest
 # field only, bobs by nature), "blend" (weave softened vertically),
 # "adaptive" (weave where still, bob where moving), "adaptivedebug"
-# (adaptive with the rebuilt pixels tinted), "yadif" (ffmpeg's filter:
-# edge-directed rebuild clamped by the neighbouring fields, one field of
-# display latency) or "bwdif" (yadif's clamp with a cubic vertical
-# rebuild; also one field late).
+# (adaptive with the rebuilt pixels tinted) or "bwdif" (ffmpeg's filter:
+# a cubic vertical rebuild clamped by the neighbouring fields, one field
+# of display latency). "yadif" also parses (bwdif's predecessor, not in
+# the menu).
 deinterlace = "bwdif"
 
 # Flip the field order (which rows the odd field lands on) if interlaced
@@ -69,13 +69,14 @@ pub enum DeinterlaceSetting {
 }
 
 impl DeinterlaceSetting {
-    pub const ALL: [DeinterlaceSetting; 7] = [
+    /// Modes offered in the UI. `Yadif` is left out (superseded by bwdif)
+    /// but still parses from the config file for hand-tuned setups.
+    pub const ALL: [DeinterlaceSetting; 6] = [
         DeinterlaceSetting::Weave,
         DeinterlaceSetting::Bob,
         DeinterlaceSetting::Blend,
         DeinterlaceSetting::Adaptive,
         DeinterlaceSetting::AdaptiveDebug,
-        DeinterlaceSetting::Yadif,
         DeinterlaceSetting::Bwdif,
     ];
 
