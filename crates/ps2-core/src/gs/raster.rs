@@ -12,6 +12,18 @@
 
 use super::*;
 
+/// Sprite-row bilinear weight classes, pixels each: nearest, copy (both
+/// weights 0), constant-wx row, constant 2-tap vertical, constant 4-tap,
+/// varying wx. Temporary tuning aid for the profile report.
+#[cfg(feature = "profile")]
+pub static BIL_CLASSES: [core::sync::atomic::AtomicU64; 6] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Texels decoded into the row cache, by texture PSM: how much decode
+/// traffic the fills cause on top of `tex_samples`.
+#[cfg(feature = "profile")]
+pub static FILL_TEXELS: [core::sync::atomic::AtomicU64; 64] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 64];
 
 /// Interpolated per-pixel attributes.
 #[derive(Clone, Copy)]
@@ -32,13 +44,15 @@ struct Frag {
 pub(super) struct Scratch {
     /// Decoded texture rows (see `Painter::fill_tex_row`).
     tex_rows: [TexRow; 2],
+    /// Prefiltered texel run for constant-weight bilinear sprite rows.
+    filtered: Vec<u32>,
     pixels: u64,
     tex_samples: [u64; 64],
 }
 
 impl Default for Scratch {
     fn default() -> Self {
-        Self { tex_rows: Default::default(), pixels: 0, tex_samples: [0; 64] }
+        Self { tex_rows: Default::default(), filtered: Vec::new(), pixels: 0, tex_samples: [0; 64] }
     }
 }
 
@@ -62,9 +76,9 @@ impl Rows {
 }
 
 /// Pixels a primitive must cover before it is split across threads.
-const PARALLEL_MIN_PIXELS: i64 = 4096;
+pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a split primitive is cut into.
-const PARALLEL_LANES: usize = 4;
+pub(super) const PARALLEL_LANES: usize = 6;
 
 /// Sprite geometry needed per scanline.
 #[derive(Clone, Copy)]
@@ -415,6 +429,7 @@ impl Gs {
                 let canvas = &self.canvas;
                 let clut = &self.clut;
                 let (rows, f) = (Rows { start, end, lane: 0, lanes: PARALLEL_LANES }, &f);
+                let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
                 rayon::scope(|s| {
                     for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
                         s.spawn(move |_| {
@@ -1001,6 +1016,7 @@ impl Painter<'_> {
     /// (wrapped/clamped like any sample); reuses the previous contents when
     /// they already cover the request.
     fn fill_tex_row(&mut self, slot: usize, y: i32, u_lo: i32, u_hi: i32) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsTexFill);
         let ti = &self.pipe.tex;
         let key = (ti.tex0, y);
         let covers = |row: &TexRow| {
@@ -1034,16 +1050,59 @@ impl Painter<'_> {
             }
             PSMCT32 | PSMCT24 | PSMT8H | PSMT4HL | PSMT4HH => {
                 let base = layout::row_base32(ti.tbp, ti.tbw, v, false);
-                for u in u_lo..=u_hi {
-                    let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
-                    let px = self.canvas.rd32((base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1));
-                    row.data.push(match ti.psm {
-                        PSMCT32 => px,
-                        PSMCT24 => (px & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
-                        PSMT8H => self.clut[(px >> 24) as usize],
-                        PSMT4HL => self.clut[((px >> 24) & 0xF) as usize + ti.clut_base],
-                        _ => self.clut[(px >> 28) as usize + ti.clut_base],
-                    });
+                if matches!(ti.psm, PSMCT32 | PSMCT24) && wrap_identity(u_lo, u_hi, ti) {
+                    // No wrapping in the span: an even x and its neighbour
+                    // share one aligned 8-byte column pair, so most of the
+                    // row moves as u64 loads with the mask/alpha applied
+                    // branchlessly (CT32: keep all, CT24: substitute TA0).
+                    let (m, or) = if ti.psm == PSMCT32 {
+                        (u32::MAX, 0)
+                    } else {
+                        (0xFF_FFFF, ((ti.texa & 0xFF) as u32) << 24)
+                    };
+                    let at = |u: u32| (base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1);
+                    let mut u = u_lo as u32;
+                    if u & 1 != 0 {
+                        row.data.push((self.canvas.rd32(at(u)) & m) | or);
+                        u += 1;
+                    }
+                    while (u + 1) as i32 <= u_hi {
+                        let pair = self.canvas.rd64(at(u));
+                        row.data.push((pair as u32 & m) | or);
+                        row.data.push(((pair >> 32) as u32 & m) | or);
+                        u += 2;
+                    }
+                    if u as i32 <= u_hi {
+                        row.data.push((self.canvas.rd32(at(u)) & m) | or);
+                    }
+                } else {
+                    for u in u_lo..=u_hi {
+                        let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
+                        let px = self.canvas.rd32((base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1));
+                        row.data.push(match ti.psm {
+                            PSMCT32 => px,
+                            PSMCT24 => (px & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
+                            PSMT8H => self.clut[(px >> 24) as usize],
+                            PSMT4HL => self.clut[((px >> 24) & 0xF) as usize + ti.clut_base],
+                            _ => self.clut[(px >> 28) as usize + ti.clut_base],
+                        });
+                    }
+                }
+            }
+            PSMCT16 | PSMCT16S => {
+                let s = ti.psm == PSMCT16S;
+                let base = layout::row_base16(ti.tbp, ti.tbw, v);
+                let at =
+                    |u: u32| (base + layout::col_off16(v, u, s, false)) & (VRAM_SIZE - 1);
+                if wrap_identity(u_lo, u_hi, ti) {
+                    for u in u_lo..=u_hi {
+                        row.data.push(expand16(self.canvas.rd16(at(u as u32)), ti.texa));
+                    }
+                } else {
+                    for u in u_lo..=u_hi {
+                        let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
+                        row.data.push(expand16(self.canvas.rd16(at(u)), ti.texa));
+                    }
                 }
             }
             _ => {
@@ -1052,6 +1111,9 @@ impl Painter<'_> {
                 }
             }
         }
+        #[cfg(feature = "profile")]
+        FILL_TEXELS[(ti.psm & 63) as usize]
+            .fetch_add(row.data.len() as u64, core::sync::atomic::Ordering::Relaxed);
         self.scratch.tex_rows[slot] = row;
     }
 
@@ -1203,17 +1265,131 @@ impl Painter<'_> {
     fn fast_sprite_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
         let _p = crate::prof::scope(crate::prof::Slot::GsFastSprite);
         let pipe = self.pipe;
-        let (row, frag) = (a.row, a.frag);
-        let y = row.y;
         let n = (a.pxb - a.pxa) as u64;
         self.scratch.pixels += n;
         self.scratch.tex_samples[pipe.tex.psm as usize] += n;
         #[cfg(feature = "profile")]
         {
+            let frag = a.frag;
             let neutral = frag.r == 128.0 && frag.g == 128.0 && frag.b == 128.0 && frag.a == 128.0;
             let k = pipe.profile_key(neutral);
             crate::prof::count_pixels(k, n);
+            let cls = if !BIL {
+                0
+            } else {
+                let wx0 = (((a.ua - (1i64 << 31)) >> 24) & 0xFF) as u32;
+                if a.du & 0xFFFF_FFFF != 0 {
+                    5
+                } else if wx0 == 0 && a.wy == 0 {
+                    1
+                } else if a.wy == 0 {
+                    2
+                } else if wx0 == 0 {
+                    3
+                } else {
+                    4
+                }
+            };
+            BIL_CLASSES[cls].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
         }
+        if BIL && a.du & 0xFFFF_FFFF == 0 {
+            // An integral texel step keeps the filter weights constant
+            // across the row (the OSD's half-texel blur copies): filter
+            // the texel run once, then the nearest loop reads it 1:1.
+            let wx = (((a.ua - (1i64 << 31)) >> 24) & 0xFF) as u32;
+            let mut filtered = core::mem::take(&mut self.scratch.filtered);
+            Self::prefilter_const(&mut filtered, a, wx);
+            let fa = FastRow { row0: &filtered, row1: &filtered, u_lo: 0, ua: 0, du: 1i64 << 32, wy: 0, ..*a };
+            self.sprite_row_px::<false, ABE, ATE>(&fa);
+            self.scratch.filtered = filtered;
+            return;
+        }
+        self.sprite_row_px::<BIL, ABE, ATE>(a);
+    }
+
+    /// Fill `dst` with the row's filtered texels for a constant-weight
+    /// bilinear sprite row: per pixel the taps move by the integral `du`
+    /// while `wx`/`wy` stay fixed. The in-bounds run with a step of one is
+    /// done two pixels per SSE2 vector with exactly [`bilerp_sse2`]'s
+    /// operation order, so the results stay bit-identical to the per-pixel
+    /// path.
+    fn prefilter_const(dst: &mut Vec<u32>, a: &FastRow, wx: u32) {
+        let count = (a.pxb - a.pxa).max(0) as usize;
+        dst.clear();
+        dst.reserve(count);
+        let last0 = a.row0.len().saturating_sub(2) as i64;
+        let step = a.du >> 32;
+        let i0 = ((a.ua - (1i64 << 31)) >> 32) - a.u_lo as i64;
+        let clamp = |k: usize| (i0 + step * k as i64).clamp(0, last0) as usize;
+        if wx | a.wy == 0 {
+            // Both weights zero: the filter is a plain texel fetch.
+            for k in 0..count {
+                dst.push(a.row0[clamp(k)]);
+            }
+            return;
+        }
+        if step != 1 {
+            for k in 0..count {
+                let i = clamp(k);
+                dst.push(bilerp_rgba(a.row0[i], a.row0[i + 1], a.row1[i], a.row1[i + 1], wx, a.wy));
+            }
+            return;
+        }
+        // Step one: clamping only trims the ends, the middle indexes are
+        // `i0 + k` and contiguous.
+        let k_lo = (-i0).clamp(0, count as i64) as usize;
+        let k_hi = (last0 - i0 + 1).clamp(k_lo as i64, count as i64) as usize;
+        for k in 0..k_lo {
+            let i = clamp(k);
+            dst.push(bilerp_rgba(a.row0[i], a.row0[i + 1], a.row1[i], a.row1[i + 1], wx, a.wy));
+        }
+        let mut k = k_lo;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::*;
+            let (wxl, wxr) = (256 - wx, wx);
+            let (wyl, wyr) = (256 - a.wy, a.wy);
+            // SAFETY: SSE2 baseline; all loads stay in bounds (pixel k+1
+            // reads texels up to i0+k+2 <= last0+1).
+            unsafe {
+                let zero = _mm_setzero_si128();
+                let (wxl, wxr) = (_mm_set1_epi16(wxl as i16), _mm_set1_epi16(wxr as i16));
+                let (wyl, wyr) = (_mm_set1_epi16(wyl as i16), _mm_set1_epi16(wyr as i16));
+                let lerp = |l: __m128i, r: __m128i, wl: __m128i, wr: __m128i| {
+                    _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(l, wl), _mm_mullo_epi16(r, wr)), 8)
+                };
+                while k + 1 < k_hi {
+                    let i = (i0 + k as i64) as usize;
+                    let two = |r: &[u32], at: usize| {
+                        _mm_unpacklo_epi8(_mm_loadl_epi64(r.as_ptr().add(at) as *const __m128i), zero)
+                    };
+                    let top = lerp(two(a.row0, i), two(a.row0, i + 1), wxl, wxr);
+                    let bot = lerp(two(a.row1, i), two(a.row1, i + 1), wxl, wxr);
+                    let out = _mm_packus_epi16(lerp(top, bot, wyl, wyr), zero);
+                    let mut pair = [0u32; 2];
+                    _mm_storel_epi64(pair.as_mut_ptr() as *mut __m128i, out);
+                    dst.extend_from_slice(&pair);
+                    k += 2;
+                }
+            }
+        }
+        for k in k..k_hi {
+            let i = (i0 + k as i64) as usize;
+            dst.push(bilerp_rgba(a.row0[i], a.row0[i + 1], a.row1[i], a.row1[i + 1], wx, a.wy));
+        }
+        for k in k_hi..count {
+            let i = clamp(k);
+            dst.push(bilerp_rgba(a.row0[i], a.row0[i + 1], a.row1[i], a.row1[i + 1], wx, a.wy));
+        }
+    }
+
+    /// The pixel half of [`Painter::fast_sprite_row`], after the row's
+    /// texel addressing has been decided.
+    #[inline(never)]
+    fn sprite_row_px<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
+        let pipe = self.pipe;
+        let (row, frag) = (a.row, a.frag);
+        let y = row.y;
         let (cr, cg, cb, ca) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
         let tcc = pipe.tcc;
         let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
@@ -1579,6 +1755,7 @@ impl Row {
 }
 
 /// Arguments of [`Painter::fast_sprite_row`].
+#[derive(Clone, Copy)]
 struct FastRow<'a> {
     row: &'a Row,
     pxa: i32,
@@ -1765,6 +1942,9 @@ struct Modulate {
     /// yields the vertex alpha.
     tex_mask: u32,
     tex_or: u32,
+    /// All factors are 128: the multiply is the identity, skip it. Very
+    /// common (2D draws leave the vertex colour neutral).
+    neutral: bool,
 }
 
 impl Modulate {
@@ -1779,12 +1959,18 @@ impl Modulate {
             c: [cr, cg, cb, ca],
             tex_mask,
             tex_or,
+            neutral: cr == 128 && cg == 128 && cb == 128 && ca == 128,
         }
     }
 
     #[inline(always)]
     fn apply(self, texel: u32) -> u32 {
         let t = (texel & self.tex_mask) | self.tex_or;
+        if self.neutral {
+            // t * 128 >> 7 == t for every lane, including the substituted
+            // 0x80 alpha when TCC is off.
+            return t;
+        }
         #[cfg(target_arch = "x86_64")]
         {
             use core::arch::x86_64::*;
@@ -2076,6 +2262,17 @@ fn floor_i32(x: f32) -> i32 {
 #[inline]
 fn px_clip(v: i32) -> i32 {
     v.clamp(0, 2048)
+}
+
+/// Whether [`wrap`] is the identity over the whole span `u_lo..=u_hi`,
+/// letting a row fill skip the per-texel wrap.
+#[inline]
+fn wrap_identity(u_lo: i32, u_hi: i32, ti: &TexInfo) -> bool {
+    match ti.wms {
+        0 | 1 => u_lo >= 0 && u_hi < ti.tw as i32,
+        2 => ti.minu <= ti.maxu && u_lo >= ti.minu && u_hi <= ti.maxu,
+        _ => false,
+    }
 }
 
 #[inline(always)]

@@ -7,7 +7,7 @@
 //! two formats. Revisit with real swizzle tables when that bites
 //! (docs/ARCHITECTURE.md).
 
-mod raster;
+pub(crate) mod raster;
 
 use tracing::{debug, trace, warn};
 
@@ -203,7 +203,7 @@ impl Gs {
             warned_regs: [0; 4],
             scratch: raster::Scratch::default(),
             pool: if cfg!(feature = "threads") {
-                (0..4).map(|_| raster::Scratch::default()).collect()
+                (0..raster::PARALLEL_LANES).map(|_| raster::Scratch::default()).collect()
             } else {
                 Vec::new()
             },

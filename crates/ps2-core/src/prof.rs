@@ -44,14 +44,18 @@ pub enum Slot {
     GsFastSprite,
     GsFastTri,
     GsGeneric,
+    /// Texture row decode into the row cache (`fill_tex_row`).
+    GsTexFill,
+    /// Waiting for the worker pool to finish a split primitive.
+    GsJoin,
 }
 
 #[cfg(feature = "profile")]
-const N: usize = 16;
+const N: usize = 18;
 #[cfg(feature = "profile")]
 const NAMES: [&str; N] = [
     "other", "EE", "IOP", "timers", "VIF1", "GIF", "SIF", "VU1", "GS draw", "GS xfer", "SPU2",
-    "GS idle", "GS flat", "GS sprite", "GS tri", "GS generic",
+    "GS idle", "GS flat", "GS sprite", "GS tri", "GS generic", "GS texfill", "GS join",
 ];
 
 #[cfg(feature = "profile")]
@@ -295,6 +299,25 @@ pub fn report() -> Option<String> {
                 *n as f64 * 100.0 / px_total as f64
             ));
         }
+        let bc: Vec<u64> =
+            crate::gs::raster::BIL_CLASSES.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let bt = bc.iter().sum::<u64>().max(1) as f64;
+        out.push_str(&format!(
+            "sprite-row filter classes (% of sprite pixels): nearest {:.1} copy {:.1} const-wx {:.1} vert-2tap {:.1} const-4tap {:.1} varying {:.1}
+",
+            bc[0] as f64 * 100.0 / bt, bc[1] as f64 * 100.0 / bt, bc[2] as f64 * 100.0 / bt,
+            bc[3] as f64 * 100.0 / bt, bc[4] as f64 * 100.0 / bt, bc[5] as f64 * 100.0 / bt,
+        ));
+        let fills: Vec<String> = crate::gs::raster::FILL_TEXELS
+            .iter()
+            .enumerate()
+            .filter_map(|(k, a)| {
+                let n = a.load(Ordering::Relaxed);
+                (n > 0).then(|| format!("{k:#04x}:{n}"))
+            })
+            .collect();
+        out.push_str(&format!("row-cache texels decoded per PSM: {}
+", fills.join(" ")));
         out.push_str("EE hot words (physical RAM address):
 ");
         for (k, n) in pcs.iter().take(40) {
