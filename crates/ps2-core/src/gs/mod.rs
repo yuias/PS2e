@@ -387,10 +387,10 @@ impl Gs {
                 self.vq_len = 0;
             }
             1 | 2 => {
-                // Line / line strip: not needed for the boot screen yet.
+                // Line / line strip.
                 if self.vq_len == 2 {
                     if draw {
-                        trace!(target: "ps2_core::gs", "line prim (not rasterized)");
+                        self.draw_line();
                     }
                     if kind == 1 {
                         self.vq_len = 0;
@@ -844,7 +844,8 @@ impl Gs {
                 // temporal neighbours of those rows are known. Bands of rows
                 // go to the worker pool when there is one.
                 let missing = field;
-                let bands = if cfg!(feature = "threads") && !self.pool.is_empty() { 4 } else { 1 };
+                let bands =
+                    if cfg!(feature = "threads") && !self.pool.is_empty() { raster::PARALLEL_LANES } else { 1 };
                 let rows_per_band = (h as usize).div_ceil(bands);
                 let run_band = |band: usize, out_band: &mut [u8]| {
                     let y0 = band * rows_per_band;
@@ -1180,6 +1181,28 @@ impl Gs {
     /// Read one displayed line (`sy` in buffer lines) as RGBA8 into `out`.
     fn scan_line(&self, v: &DisplayView, sy: u32, out: &mut [u8]) {
         let w = out.len() as u32 / 4;
+        if matches!(v.psm, PSMCT32 | PSMCT24) && v.dbx == 0 {
+            // Common scanout: even x and its neighbour share an aligned
+            // 8-byte column pair, so the row moves as u64 loads.
+            let y = v.dby + sy;
+            let base = layout::row_base32(v.fbp, v.fbw, y, false);
+            let mut x = 0u32;
+            while x + 1 < w {
+                let o = (base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
+                let pair = self.canvas.rd64(o);
+                let (p0, p1) = (pair as u32, (pair >> 32) as u32);
+                let d = (x * 4) as usize;
+                out[d..d + 4].copy_from_slice(&(p0 | 0xFF00_0000).to_le_bytes());
+                out[d + 4..d + 8].copy_from_slice(&(p1 | 0xFF00_0000).to_le_bytes());
+                x += 2;
+            }
+            if x < w {
+                let o = (base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
+                let px = self.canvas.rd32(o) | 0xFF00_0000;
+                out[(x * 4) as usize..][..4].copy_from_slice(&px.to_le_bytes());
+            }
+            return;
+        }
         for x in 0..w {
             let (r, g, b) = match v.psm {
                 PSMCT32 | PSMCT24 => {

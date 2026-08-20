@@ -159,6 +159,63 @@ impl Gs {
         self.merge_scratch();
     }
 
+    /// Rasterize a line with a pixel-step DDA over the major axis. As on
+    /// hardware the end point's pixel is not drawn, so the joints of a
+    /// strip land exactly once — the PS2 logo's additive wireframe counts
+    /// on that. Attributes interpolate (or stick to the second vertex's
+    /// colour when shading is flat), and pixels go through the generic
+    /// per-pixel pipeline.
+    pub(super) fn draw_line(&mut self) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
+        self.log_target(self.prim, "line", 2);
+        let (a, b) = (self.vq[0], self.vq[1]);
+        let pipe = self.pixel_pipe();
+        tracing::trace!(target: "ps2_core::gs::line",
+            v0 = format_args!("({},{},z={:#x})", a.x as f32 / 16.0, a.y as f32 / 16.0, a.z),
+            v1 = format_args!("({},{})", b.x as f32 / 16.0, b.y as f32 / 16.0),
+            rgba = format_args!("{},{},{},{}", b.r, b.g, b.b, b.a),
+            prim = format_args!("{:#x}", self.prim),
+            fbp = (self.ctx[((self.prim >> 9) & 1) as usize].frame & 0x1FF) * 32,
+            "line");
+        let gouraud = self.prim & 8 != 0;
+        let (fx0, fy0) = (a.x as f32 / 16.0, a.y as f32 / 16.0);
+        let (fx1, fy1) = (b.x as f32 / 16.0, b.y as f32 / 16.0);
+        let (dx, dy) = (fx1 - fx0, fy1 - fy0);
+        let steps = dx.abs().max(dy.abs()).round() as i32;
+        if steps <= 0 {
+            return;
+        }
+        let inv = 1.0 / steps as f32;
+        let lerp = |p: f32, q: f32, t: f32| p + (q - p) * t;
+        let mut painter =
+            Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
+        for i in 0..steps {
+            let t = i as f32 * inv;
+            let px = (fx0 + dx * t).round() as i32;
+            let py = (fy0 + dy * t).round() as i32;
+            if px < pipe.scx0 || px > pipe.scx1 || py < pipe.scy0 || py > pipe.scy1 {
+                continue;
+            }
+            let frag = Frag {
+                r: if gouraud { lerp(a.r as f32, b.r as f32, t) } else { b.r as f32 },
+                g: if gouraud { lerp(a.g as f32, b.g as f32, t) } else { b.g as f32 },
+                b: if gouraud { lerp(a.b as f32, b.b as f32, t) } else { b.b as f32 },
+                a: if gouraud { lerp(a.a as f32, b.a as f32, t) } else { b.a as f32 },
+                z: lerp(a.z as f32, b.z as f32, t) as u32,
+                s: lerp(a.s, b.s, t),
+                t: lerp(a.t, b.t, t),
+                q: lerp(a.q, b.q, t),
+                u: lerp(a.u as f32, b.u as f32, t) / 16.0,
+                v: lerp(a.v as f32, b.v as f32, t) / 16.0,
+            };
+            let texel = if pipe.tme { painter.sample(&frag) } else { 0 };
+            let row = Row::new(&pipe, py as u32);
+            painter.shade_row_px(&row, px as u32, frag, texel);
+        }
+        self.prims_drawn += 1;
+        self.merge_scratch();
+    }
+
     /// Bring-up aid: describe each distinct render-target setup once.
     fn log_target(&mut self, attrs: u64, kind: &str, n: usize) {
         let ctx = self.ctx[((attrs >> 9) & 1) as usize];
