@@ -226,7 +226,6 @@ fn main() -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-
     let debugger = match (args.debug_ee, args.debug_iop) {
         (None, None) => None,
         (ee, iop) => match ps2_debug::DebugServer::bind(ee, iop) {
@@ -344,6 +343,13 @@ fn run_headless(
 ) -> ExitCode {
     let cycles = args.cycles.expect("headless mode requires --cycles");
     tracing::info!(bios = ?args.bios, cycles, "booting");
+    // Debug aid: PS2E_SHOT_WOVEN=1 makes the periodic screenshots go
+    // through the same vblank-composited path the window shows.
+    let shot_woven = std::env::var_os("PS2E_SHOT_WOVEN").is_some();
+    if shot_woven {
+        sys.bus.gs.set_publish_frames(true);
+        sys.bus.gs.deinterlace = ps2_core::gs::Deinterlace::Bwdif;
+    }
 
     // Run in slices so TTY output streams out as it appears.
     const SLICE: u64 = 1_000_000;
@@ -385,7 +391,11 @@ fn run_headless(
             && sys.cycles / every != (sys.cycles - n) / every
         {
             let numbered = numbered_path(path, sys.cycles / every);
-            let (w, h, rgba) = sys.framebuffer();
+            let (w, h, rgba) = if shot_woven {
+                sys.bus.gs.latest_frame().unwrap_or((0, 0, Vec::new()))
+            } else {
+                sys.framebuffer()
+            };
             if let Err(e) = write_bmp(&numbered, w, h, &rgba) {
                 eprintln!("error: screenshot failed: {e}");
                 return ExitCode::FAILURE;

@@ -222,6 +222,10 @@ impl Gs {
     /// Display-side privileged registers (PMODE, SMODE, DISPFB, DISPLAY,
     /// BGCOLOR); CSR/IMR live in [`GsFront`].
     pub fn priv_write(&mut self, addr: u32, v: u64) {
+        if matches!(addr & 0x1FF0, 0x0000 | 0x0020 | 0x0070..=0x00A0) {
+            debug!(target: "ps2_core::gs::disp",
+                addr = format_args!("{:#06x}", addr & 0x1FF0), value = format_args!("{v:#018x}"), "display reg");
+        }
         match addr & 0x1FF0 {
             0x0000 => self.pmode = v,
             0x0010 => self.smode1 = v,
