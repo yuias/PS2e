@@ -2293,16 +2293,18 @@ impl Bus {
                 }
                 if cid == 0x8000_0003 {
                     debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
-                    // From the second reboot on (PS2LOGO -> game), the
+                    // From the third reboot on (PS2LOGO -> game), the
                     // rebooted cdvdman re-checks the drive and it settles a
                     // while later; that hold is what lets the logo sound's
                     // reverb tail ring before the game's libsd clears the
-                    // SPU. The first reboot (OSD -> PS2LOGO) must stay
-                    // fast: PS2LOGO polls ReadKey on a coarse delay loop
-                    // and fast-forwards its intro (the PS mark and PS2
-                    // logo fades) past every ~0.8 s it loses there.
+                    // SPU. The two earlier reboots (OSD boot, and PS2LOGO's
+                    // own right before its mechacon sequence) must stay
+                    // fast: a drive hold after PS2LOGO's reboot blocks its
+                    // ReadKey and logo read, and its coarse ~0.46 s polling
+                    // rounds turn any such wait into whole extra rounds of
+                    // black screen in the vsync-scheduled intro.
                     self.iop_resets += 1;
-                    if self.iop_resets >= 2 {
+                    if self.iop_resets >= 3 {
                         self.cdvd.ready_at = self.now + CDVD_RESETTLE;
                     }
                     self.sif.fifo0.clear();
