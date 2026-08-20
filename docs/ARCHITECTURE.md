@@ -87,12 +87,13 @@ Planned crates:
    one command per run, and specialised rasterizer row loops (flat
    fills, textured MODULATE sprites with fixed-point u, incremental
    triangle spans, SSE2 modulate/blend/16-bit bilinear) for the setups
-   the game and the OSD actually draw. Same-box A/B (loaded machine):
-   the OSD's blur-heavy boot screens went from ~40% to ~85% of real
-   time (their slowness is what starves the audio buffer during the
-   boot chime) and the game from ~1.8x to ~3.1x; expect more on an idle
-   box. Next: the OSD boot phase speed, the IOP interpreter's in-situ
-   cost, the wasm front-end.
+   the game and the OSD actually draw, and texture row-cache fills that
+   skip the per-texel wrap and move column pairs as u64 loads (the
+   fills were the OSD's single largest GS cost). On an idle box the
+   OSD's blur-heavy boot screens now run at about real time (3G cycles
+   in 10.0 s vs the 10.2 s a console takes; their slowness is what
+   starved the audio buffer during the boot chime) and the game at
+   ~3.5x. Next: the IOP interpreter's in-situ cost, the wasm front-end.
 
 ## Component map (ps2-core)
 
