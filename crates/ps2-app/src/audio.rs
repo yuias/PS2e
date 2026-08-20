@@ -47,10 +47,18 @@ impl Audio {
                     // Dynamic rate control: while the queue holds roughly the
                     // target, consume at the nominal rate; as it drains (the
                     // machine is running slower than real time) consume more
-                    // slowly, down to 0.7x, so a slow stretch plays lower
-                    // rather than in pieces.
+                    // slowly — gently down to 0.7x, then steeper toward 0.45x
+                    // as the queue nears empty — so even a badly slow stretch
+                    // plays lower rather than in pieces.
                     let fill = (q.len() / 2) as f64 / target.max(1) as f64;
-                    let step = base_step * if fill < 0.75 { (1.0 - (0.75 - fill) * 0.6).max(0.7) } else { 1.0 };
+                    let scale = if fill >= 0.75 {
+                        1.0
+                    } else if fill >= 0.25 {
+                        1.0 - (0.75 - fill) * 0.6
+                    } else {
+                        (0.7 - (0.25 - fill)).max(0.45)
+                    };
+                    let step = base_step * scale;
                     for frame in data.chunks_mut(channels) {
                         pos += step;
                         while pos >= 1.0 {
