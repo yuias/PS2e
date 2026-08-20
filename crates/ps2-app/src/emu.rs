@@ -123,6 +123,8 @@ pub fn deinterlace_mode(index: u8) -> ps2_core::gs::Deinterlace {
 /// Everything the worker owns besides the system itself.
 pub struct WorkerConfig {
     pub bios: Vec<u8>,
+    /// Mechacon NVRAM image next to the BIOS; re-attached on reset.
+    pub nvram_path: Option<PathBuf>,
     /// None disables persistence (headless-style, no card mounted).
     pub memcard_path: Option<PathBuf>,
     pub debugger: Option<ps2_debug::DebugServer>,
@@ -273,11 +275,15 @@ impl Worker {
                     // Ambient assets survive a reset: disc and memory card
                     // (mid-write contents included).
                     let disc = self.sys.bus.cdvd.disc.take();
+                    let nvram_path = self.cfg.nvram_path.clone();
                     let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
                     let jit = self.sys.jit_enabled();
                     self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
                     let _ = self.sys.set_jit(jit);
                     self.sys.set_publish_frames(true);
+                    if let Some(p) = nvram_path {
+                        self.sys.load_nvram(p);
+                    }
                     self.sys.bus.cdvd.disc = disc;
                     self.sys.bus.sio2.memcard = memcard;
                 }

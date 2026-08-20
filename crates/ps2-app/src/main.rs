@@ -226,6 +226,10 @@ fn main() -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
+    // Mechacon NVRAM sits next to the BIOS image (PCSX2 layout): the OSD's
+    // configuration persists there, and a fresh file boots like a new
+    // console (first-time setup with the PS/PS2 logo screens).
+    sys.load_nvram(std::path::Path::new(&bios_path).with_extension("nvm"));
     let debugger = match (args.debug_ee, args.debug_iop) {
         (None, None) => None,
         (ee, iop) => match ps2_debug::DebugServer::bind(ee, iop) {
@@ -286,7 +290,8 @@ fn main() -> ExitCode {
     }
 
     if windowed {
-        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path)
+        let nvram_path = std::path::Path::new(&bios_path).with_extension("nvm");
+        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path, nvram_path)
     } else {
         run_headless(sys, &args, debugger, memcard_path)
     }
@@ -300,6 +305,7 @@ fn run_windowed(
     cfg_path: Option<PathBuf>,
     debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
+    nvram_path: PathBuf,
 ) -> ExitCode {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -315,6 +321,7 @@ fn run_windowed(
         Box::new(move |cc| {
             let worker_cfg = emu::WorkerConfig {
                 bios,
+                nvram_path: Some(nvram_path),
                 memcard_path,
                 debugger,
                 wait_debugger,

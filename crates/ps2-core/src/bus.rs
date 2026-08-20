@@ -75,12 +75,18 @@ pub struct Cdvd {
     s_params: Vec<u8>,
     s_results: Vec<u8>,
     s_result_pos: usize,
-    /// Config session state (S 0x40 open .. 0x43 close): blocks left to
-    /// serve and the cursor into the synthesized OSD config.
-    config_blocks_left: u8,
-    config_pos: usize,
-    /// True when the open selected the OSD's area (wire triple [0, 1, n]).
-    config_is_osd: bool,
+    /// Config session state (S 0x40 open .. 0x43 close), addressing one of
+    /// the three NVRAM config areas: write mode, area, block budget, cursor.
+    config_write: bool,
+    config_area: u8,
+    config_blocks: u8,
+    config_index: u8,
+    /// Mechacon NVRAM (1 KiB EEPROM). Holds the OSD's configuration —
+    /// including the "initialized" flag that decides whether the boot runs
+    /// the first-time setup (PS logo, PS2 logo, language wizard) — plus
+    /// region parameters and the i.Link id. Persisted to `nvram_path`.
+    nvram: Vec<u8>,
+    nvram_path: Option<std::path::PathBuf>,
     /// Disc image (2048-byte sectors), read on demand.
     pub disc: Option<std::fs::File>,
     /// Sector data staged for DMA channel 3, and the drain cursor.
@@ -333,33 +339,88 @@ impl Cdvd {
 
 /// A config block on the wire is 15 data bytes plus their sum mod 256;
 /// CDVDMAN verifies the sum and rejects the block before the OSD sees it.
-fn config_block(data: [u8; 15]) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    b[..15].copy_from_slice(&data);
-    b[15] = data.iter().fold(0u8, |s, &x| s.wrapping_add(x));
-    b
-}
+/// NVRAM size (mechacon EEPROM, 8 Kbit).
+const NVRAM_SIZE: usize = 1024;
 
-/// The OSD's config: open(1, 0, 2), i.e. two 15-byte blocks. Block 0 is
-/// passed through uninterpreted; block 1 carries the bit fields. The top
-/// three bits of block 1 byte +0 must be non-zero for the 5-bit language
-/// index in byte +1 to be honoured at all, and that index subscripts an
-/// 8-entry table with NO bounds check — out of range means the OSD holds a
-/// null string table and silently draws nothing.
-fn osd_config_blocks() -> [[u8; 16]; 2] {
-    let block0 = [0u8; 15];
-    let mut block1 = [0u8; 15];
-    block1[0] = 0x20; // generation marker: language index in +1 is live
-    block1[1] = 1; // language: English (0-7 only)
-    // Timezone +540 minutes (JST): 11 bits, low 8 in +3, high 3 in +2.
-    // Byte +2 bit 7 is the "configured" flag: the decoder returns its
-    // inverse, and the OSD runs first-boot setup while that is non-zero.
-    block1[3] = 0x1C;
-    block1[2] = 0x82;
-    [config_block(block0), config_block(block1)]
+/// NVRAM layout for v1.70+ BIOSes (both our reference images are v2.x);
+/// offsets and per-area block caps as on the real EEPROM. Area 1 holds the
+/// OSD's config: block 1 is the language/timezone block whose byte +2 bit 7
+/// is the "initialized" flag — while it is clear the boot runs the
+/// first-time setup (PS logo and PS2 logo screens, then the language
+/// wizard) instead of going straight to the browser/disc.
+const NVRAM_CONFIG_AREAS: [(usize, u8); 3] = [(0x270, 4), (0x2B0, 2), (0x200, 7)];
+const NVRAM_REGPARAMS: usize = 0x180;
+const NVRAM_ILINK_ID: usize = 0x1E0;
+const NVRAM_LANGUAGE: usize = 0x2B0 + 0x10;
+
+/// A factory-fresh Japanese NVRAM: region parameters, an i.Link id, and the
+/// default language block WITHOUT the initialized flag, so the first boot
+/// runs the OSD setup like a new console. Completing the wizard persists
+/// the real configuration.
+fn nvram_defaults() -> Vec<u8> {
+    let mut nv = vec![0u8; NVRAM_SIZE];
+    // "JJjpnJJ": PStwo region parameters for Japan.
+    nv[NVRAM_REGPARAMS..NVRAM_REGPARAMS + 7].copy_from_slice(b"JJjpnJJ");
+    // Dummy i.Link id + its checksum, as expected by libcdvd.
+    nv[NVRAM_ILINK_ID..NVRAM_ILINK_ID + 8]
+        .copy_from_slice(&[0x00, 0xAC, 0xFF, 0xFF, 0xFF, 0xFF, 0xB9, 0x86]);
+    nv[NVRAM_ILINK_ID + 8..NVRAM_ILINK_ID + 10].copy_from_slice(&[0x00, 0x18]);
+    // Default language block (Japanese, JST); byte +2 bit 7 stays clear.
+    nv[NVRAM_LANGUAGE..NVRAM_LANGUAGE + 16].copy_from_slice(&[
+        0x20, 0x20, 0, 0, 0, 0x70, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30,
+    ]);
+    nv
 }
 
 impl Cdvd {
+    /// Load NVRAM from `path` (created with factory defaults when missing
+    /// or invalid) and persist subsequent writes back to it.
+    pub(crate) fn load_nvram(&mut self, path: std::path::PathBuf) {
+        let loaded = std::fs::read(&path).ok().filter(|d| d.len() == NVRAM_SIZE);
+        let fresh = loaded.is_none();
+        self.nvram = loaded.unwrap_or_else(nvram_defaults);
+        // Like the real libcdvd expects: region parameters and a language
+        // block must exist; refill a wiped image with the defaults (the
+        // initialized flag stays clear, so the first-boot setup still runs).
+        if self.nvram[NVRAM_LANGUAGE..NVRAM_LANGUAGE + 16].iter().all(|&b| b == 0)
+            || self.nvram[NVRAM_REGPARAMS..NVRAM_REGPARAMS + 12].iter().all(|&b| b == 0)
+        {
+            let d = nvram_defaults();
+            self.nvram[NVRAM_REGPARAMS..NVRAM_REGPARAMS + 12]
+                .copy_from_slice(&d[NVRAM_REGPARAMS..NVRAM_REGPARAMS + 12]);
+            self.nvram[NVRAM_ILINK_ID..NVRAM_ILINK_ID + 10]
+                .copy_from_slice(&d[NVRAM_ILINK_ID..NVRAM_ILINK_ID + 10]);
+            self.nvram[NVRAM_LANGUAGE..NVRAM_LANGUAGE + 16]
+                .copy_from_slice(&d[NVRAM_LANGUAGE..NVRAM_LANGUAGE + 16]);
+        }
+        self.nvram_path = Some(path);
+        if fresh {
+            self.save_nvram();
+        }
+    }
+
+    fn save_nvram(&self) {
+        if let Some(p) = &self.nvram_path
+            && let Err(e) = std::fs::write(p, &self.nvram)
+        {
+            warn!(target: "ps2_core::iop::cdvd", path = %p.display(), error = %e, "cannot persist NVRAM");
+        }
+    }
+
+    /// NVRAM range of the current config-session block, if the session's
+    /// area, budget and per-area block cap all allow it.
+    fn config_nvram_range(&self) -> Option<std::ops::Range<usize>> {
+        if self.config_index >= self.config_blocks {
+            return None;
+        }
+        let (base, cap) = *NVRAM_CONFIG_AREAS.get(self.config_area as usize)?;
+        if self.config_index >= cap {
+            return None;
+        }
+        let start = base + self.config_index as usize * 16;
+        (start + 16 <= self.nvram.len()).then(|| start..start + 16)
+    }
+
     /// Execute an S command; fills the result FIFO.
     fn s_execute(&mut self) {
         let cmd = self.s_cmd;
@@ -389,49 +450,78 @@ impl Cdvd {
                 self.s_results
                     .extend_from_slice(&MODEL[off..(off + 8).min(16)]);
             }
-            // OpenConfig: params are [b, a, count]; the count is the
-            // session's only state. The OSD opens (1, 0, 2) for its config.
+            // OpenConfig: params are [read/write, area, block count]. The
+            // OSD opens (0, 1, 2) to read its config from NVRAM area 1.
             0x40 => {
-                self.config_blocks_left = self.s_params.get(2).copied().unwrap_or(0);
-                self.config_pos = 0;
-                self.config_is_osd =
-                    self.s_params.first() == Some(&0) && self.s_params.get(1) == Some(&1);
+                self.config_write = self.s_params.first().copied().unwrap_or(0) == 1;
+                self.config_area = self.s_params.get(1).copied().unwrap_or(0);
+                self.config_blocks = self.s_params.get(2).copied().unwrap_or(0);
+                self.config_index = 0;
                 self.s_results.push(0);
             }
-            // ReadConfig: one 16-byte block (15 data + sum) per call. The
-            // OSD's area gets the synthesized "configured" blocks; any other
-            // area reads as zeroes (an all-zero block checksums correctly).
+            // ReadConfig: one 16-byte block per call, straight from the
+            // NVRAM area (the checksum byte lives in NVRAM as written).
+            // Out-of-range areas or indices read as zeroes.
             0x41 => {
-                let osd = osd_config_blocks();
-                let block = if self.config_is_osd {
-                    osd.get(self.config_pos).copied().unwrap_or([0; 16])
-                } else {
-                    [0; 16]
-                };
-                if self.config_blocks_left > 0 {
-                    self.config_blocks_left -= 1;
-                    self.config_pos += 1;
-                }
+                let block = self
+                    .config_nvram_range()
+                    .map(|r| {
+                        let mut b = [0u8; 16];
+                        b.copy_from_slice(&self.nvram[r]);
+                        b
+                    })
+                    .unwrap_or([0; 16]);
+                self.config_index += 1;
                 self.s_results.extend_from_slice(&block);
             }
-            // WriteConfig: accept and discard the 16-byte block.
+            // WriteConfig: store the 16-byte block into NVRAM and persist
+            // (this is how the first-boot wizard saves its settings).
             0x42 => {
-                if self.config_blocks_left > 0 {
-                    self.config_blocks_left -= 1;
-                    self.config_pos += 1;
+                if self.config_write
+                    && let Some(r) = self.config_nvram_range()
+                    && self.s_params.len() >= 16
+                {
+                    self.nvram[r].copy_from_slice(&self.s_params[..16]);
+                    self.save_nvram();
                 }
+                self.config_index += 1;
                 self.s_results.push(0);
             }
             // CloseConfig: ends the session.
             0x43 => {
-                self.config_blocks_left = 0;
-                self.config_pos = 0;
+                self.config_write = false;
+                self.config_area = 0;
+                self.config_blocks = 0;
+                self.config_index = 0;
                 self.s_results.push(0);
             }
-            // ReadNVM: big-endian [status, data_hi, data_lo]; empty NVRAM.
-            0x0A => self.s_results.extend_from_slice(&[0, 0, 0]),
-            // WriteNVM: accepted.
-            0x0B => self.s_results.push(0),
+            // ReadNVM: params [addr_hi, addr_lo] in 16-bit words; result
+            // [status, data_hi, data_lo].
+            0x0A => {
+                let addr = ((self.s_params.first().copied().unwrap_or(0) as usize) << 8
+                    | self.s_params.get(1).copied().unwrap_or(0) as usize)
+                    * 2;
+                if addr + 1 < NVRAM_SIZE {
+                    self.s_results
+                        .extend_from_slice(&[0, self.nvram[addr + 1], self.nvram[addr]]);
+                } else {
+                    self.s_results.push(0xFF);
+                }
+            }
+            // WriteNVM: params [addr_hi, addr_lo, data_hi, data_lo].
+            0x0B => {
+                let addr = ((self.s_params.first().copied().unwrap_or(0) as usize) << 8
+                    | self.s_params.get(1).copied().unwrap_or(0) as usize)
+                    * 2;
+                if addr + 1 < NVRAM_SIZE && self.s_params.len() >= 4 {
+                    self.nvram[addr + 1] = self.s_params[2];
+                    self.nvram[addr] = self.s_params[3];
+                    self.save_nvram();
+                    self.s_results.push(0);
+                } else {
+                    self.s_results.push(0xFF);
+                }
+            }
             // BootCertify: accepted.
             0x1A => self.s_results.push(1),
             // MagicGate mechacon commands, used by SECRMAN for memory-card
@@ -1149,7 +1239,7 @@ impl Bus {
             cdvd_dma_deferred: false,
             cdvd_done_at: None,
             iop_resets: 0,
-            cdvd: Cdvd::default(),
+            cdvd: Cdvd { nvram: nvram_defaults(), ..Cdvd::default() },
             sio2: Sio2::default(),
             now: 0,
             tty_buffer: String::new(),

@@ -523,11 +523,22 @@ each wait):
     interrupts needed); the paced mechacon waits re-check completion
     only once per delay round, so any device latency that misses the
     first check costs a whole ~0.46 s round of black.
-  - Working hypothesis for the fades: they belong to OSDSYS's
-    disc-boot exit animation (zoom into the cloud -> PS mark -> PS2
-    logo) played *before* EELOAD/PS2LOGO — our boot fades the SCE
-    screen straight to black instead. Unverified; next step is the
-    OSD side, not PS2LOGO.
+  - RESOLVED: the "missing" PS-mark and PS2-logo fades are the OSD's
+    FIRST-BOOT sequence, not part of a configured console's disc boot
+    at all. With a factory-fresh NVRAM the boot runs towers -> colourful
+    PS logo fade -> blue PS2 logo fade -> the setup wizard (language,
+    timezone, daylight saving); completing the wizard sets the
+    "initialized" flag (NVRAM 0x2C2 bit 7, config area 1 block 1 byte
+    +2) and every later boot goes straight to the browser/disc.
+    PCSX2 shows the fades because its per-BIOS .nvm starts fresh; our
+    old synthesized S 0x40-0x43 answers hard-wired the flag on.
+- The mechacon NVRAM (1 KiB) is now backed by `<bios>.nvm` (PCSX2's
+  layout, shared with it): config areas at 0x270/0x2B0/0x200 with
+  4/2/7-block caps (v1.70+ BIOSes), region parameters at 0x180, i.Link
+  id at 0x1E0, OSD language block at 0x2C0. S 0x40-0x43 read/write the
+  areas (block checksums live in NVRAM as written); S 0x0A/0x0B are
+  word ReadNVM/WriteNVM (big-endian result/params). The wizard's
+  writes persist, so first-boot happens exactly once per NVRAM.
 - The mechacon version query (S 0x03 sub 0x00) must answer with a
   status byte first ([0, major, minor, patch]); answering PCSX2's raw
   4-byte little-endian version stalls the SCPH-50000 boot handshake

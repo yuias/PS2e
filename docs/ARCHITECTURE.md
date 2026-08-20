@@ -98,10 +98,12 @@ Planned crates:
    interpreter and the JIT so frames stay bit-identical between them);
    PS2LOGO's fixed delay loops run at the hardware's 4 cycles per
    iteration and every CPU-bound boot phase takes ~20-35% fewer
-   cycles. The still-missing PS-mark/PS2-logo boot fades are not a
-   PS2LOGO timing artifact (docs/hw-notes.md); the next lead is the
-   OSDSYS disc-boot exit animation. After that: the GS's serial
-   small-triangle cost, the wasm front-end.
+   cycles. The "missing" PS-mark/PS2-logo boot fades turned out to be
+   the OSD's first-boot sequence, gated on the NVRAM "initialized"
+   flag; the mechacon NVRAM is now backed by `<bios>.nvm` (PCSX2's
+   layout), so a fresh file boots like a new console into the setup
+   wizard and the saved settings persist (docs/hw-notes.md). Next: the
+   GS's serial small-triangle cost, the wasm front-end.
 
 ## Component map (ps2-core)
 

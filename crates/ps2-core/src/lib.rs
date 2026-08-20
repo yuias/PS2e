@@ -318,6 +318,15 @@ impl Ps2System {
         }
     }
 
+    /// Attach the mechacon NVRAM image at `path` (created with factory
+    /// defaults when missing). The OSD's configuration — language, clock
+    /// settings, and the first-boot "initialized" flag that decides whether
+    /// the boot runs the setup wizard with the PS/PS2 logo screens — lives
+    /// there and persists across runs.
+    pub fn load_nvram(&mut self, path: std::path::PathBuf) {
+        self.bus.cdvd.load_nvram(path);
+    }
+
     /// Drain kernel TTY output captured since the last call.
     pub fn take_tty(&mut self) -> String {
         core::mem::take(&mut self.bus.tty_buffer)
