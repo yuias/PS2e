@@ -138,7 +138,8 @@ pub struct Gs {
     /// [`Deinterlace::Adaptive`]), one byte per pixel of `woven`.
     motion: Vec<u8>,
     /// Per field parity, the field before the one now in `woven` (rows of
-    /// that parity only), for [`Deinterlace::Yadif`]'s temporal taps.
+    /// that parity only), for [`Deinterlace::Yadif`]'s and
+    /// [`Deinterlace::Bwdif`]'s temporal taps.
     history: [Vec<u8>; 2],
     woven_dims: (u32, u32),
     /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
@@ -803,7 +804,7 @@ impl Gs {
             let y = sy * 2 + field as u32;
             self.scan_line(&view, sy, &mut line);
             let row = &mut woven[y as usize * stride..][..stride];
-            if mode == Deinterlace::Yadif {
+            if matches!(mode, Deinterlace::Yadif | Deinterlace::Bwdif) {
                 // Keep the field this one replaces: it is the temporal
                 // neighbour of the same parity.
                 history[field as usize][y as usize * stride..][..stride].copy_from_slice(row);
@@ -833,7 +834,7 @@ impl Gs {
         let mut out = woven.clone();
         match mode {
             Deinterlace::Weave => {}
-            Deinterlace::Yadif => {
+            Deinterlace::Yadif | Deinterlace::Bwdif => {
                 // Deinterlace the *previous* field (one vblank late): its
                 // missing rows are the parity that just arrived, so both
                 // temporal neighbours of those rows are known. Bands of rows
@@ -846,7 +847,11 @@ impl Gs {
                     for (i, row) in out_band.chunks_mut(stride).enumerate() {
                         let y = (y0 + i) as u32;
                         if (y & 1 != 0) == missing {
-                            Self::yadif_row(&woven, &history, row, w, h, y, missing);
+                            if mode == Deinterlace::Yadif {
+                                Self::yadif_row(&woven, &history, row, w, h, y, missing);
+                            } else {
+                                Self::bwdif_row(&woven, &history, row, w, h, y, missing);
+                            }
                         }
                     }
                 };
@@ -985,6 +990,91 @@ impl Gs {
                 diff = diff.max(min_).max(-max_);
                 let v = spatial_pred.clamp(d - diff, d + diff);
                 row[x * 4 + ch] = v.clamp(0, 255) as u8;
+            }
+            row[x * 4 + 3] = 255;
+        }
+    }
+
+    /// bwdif (ffmpeg's "Bob Weaver deinterlacing filter") for one missing
+    /// row: the same temporal clamp as [`Gs::yadif_row`], but the rebuilt
+    /// value is a vertical cubic (w3fdif taps) over the shown field instead
+    /// of an edge-directed search, with a high-frequency variant mixing in
+    /// the temporal neighbours' detail where the field alone would alias.
+    /// The outermost rows fall back to plain averaging, as in ffmpeg.
+    /// Without a look-ahead field the "next" term of the motion estimate
+    /// is dropped (one field of display latency, like yadif here).
+    fn bwdif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool) {
+        // 13-bit fixed-point coefficients from ffmpeg's bwdifdsp.c.
+        const LF: [i32; 2] = [4309, 213];
+        const HF: [i32; 3] = [5570, 3801, 1016];
+        const SP: [i32; 2] = [5077, 981];
+        let stride = (w * 4) as usize;
+        let hmax = h - 1;
+        // Rows beyond the edges mirror, which keeps their field parity.
+        fn rowof(buf: &[u8], yy: i64, hmax: u32, stride: usize) -> &[u8] {
+            let yy = if yy < 0 { -yy } else if yy > hmax as i64 { 2 * hmax as i64 - yy } else { yy };
+            let yy = yy.clamp(0, hmax as i64) as usize;
+            &buf[yy * stride..][..stride]
+        }
+        // ffmpeg runs the simpler edge filter on the outermost rows, and on
+        // the very first/last pair skips even its spatial clamp.
+        let edge = y < 4 || y + 5 > h;
+        let spat = y >= 2 && y + 3 <= h;
+        let y = y as i64;
+        // Rows of the shown field around the missing one, the missing
+        // parity's fields before (`p*`) and after (`n*`) at y and y±2/±4,
+        // and the shown field's previous instance around y.
+        let (cm1, cp1) = (rowof(woven, y - 1, hmax, stride), rowof(woven, y + 1, hmax, stride));
+        let (cm3, cp3) = (rowof(woven, y - 3, hmax, stride), rowof(woven, y + 3, hmax, stride));
+        let prev2 = &history[missing as usize];
+        let (p0, pm2, pp2) =
+            (rowof(prev2, y, hmax, stride), rowof(prev2, y - 2, hmax, stride), rowof(prev2, y + 2, hmax, stride));
+        let (pm4, pp4) = (rowof(prev2, y - 4, hmax, stride), rowof(prev2, y + 4, hmax, stride));
+        let (n0, nm2, np2) =
+            (rowof(woven, y, hmax, stride), rowof(woven, y - 2, hmax, stride), rowof(woven, y + 2, hmax, stride));
+        let (nm4, np4) = (rowof(woven, y - 4, hmax, stride), rowof(woven, y + 4, hmax, stride));
+        let prev = &history[!missing as usize];
+        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, stride), rowof(prev, y + 1, hmax, stride));
+        for x in 0..w as usize {
+            for ch in 0..3 {
+                let i = x * 4 + ch;
+                let at = |r: &[u8]| i32::from(r[i]);
+                let (c, e) = (at(cm1), at(cp1));
+                let (p, n) = (at(p0), at(n0));
+                let d = (p + n) >> 1;
+                let temporal_diff0 = (p - n).abs();
+                let temporal_diff1 = ((at(pvm1) - c).abs() + (at(pvp1) - e).abs()) >> 1;
+                let mut diff = (temporal_diff0 >> 1).max(temporal_diff1);
+                let v = if diff == 0 {
+                    d
+                } else {
+                    if !edge || spat {
+                        // Widen the clamp by what the rows two above/below
+                        // suggest (yadif's spatial check).
+                        let b = ((at(pm2) + at(nm2)) >> 1) - c;
+                        let f = ((at(pp2) + at(np2)) >> 1) - e;
+                        let max_ = (d - e).max(d - c).max(b.min(f));
+                        let min_ = (d - e).min(d - c).min(b.max(f));
+                        diff = diff.max(min_).max(-max_);
+                    }
+                    let interpol = if edge {
+                        (c + e) >> 1
+                    } else if (c - e).abs() > temporal_diff0 {
+                        // High vertical frequency: cubic over the shown
+                        // field plus the temporal average's fine detail.
+                        (((HF[0] * (p + n)
+                            - HF[1] * (at(pm2) + at(nm2) + at(pp2) + at(np2))
+                            + HF[2] * (at(pm4) + at(nm4) + at(pp4) + at(np4)))
+                            >> 2)
+                            + LF[0] * (c + e)
+                            - LF[1] * (at(cm3) + at(cp3)))
+                            >> 13
+                    } else {
+                        (SP[0] * (c + e) - SP[1] * (at(cm3) + at(cp3))) >> 13
+                    };
+                    interpol.clamp(d - diff, d + diff)
+                };
+                row[i] = v.clamp(0, 255) as u8;
             }
             row[x * 4 + 3] = 255;
         }
@@ -1139,6 +1229,10 @@ pub enum Deinterlace {
     /// ffmpeg's yadif: edge-directed rebuild clamped by the previous and
     /// next field of the same parity; shows each field one vblank late.
     Yadif,
+    /// ffmpeg's bwdif: yadif's temporal clamp with a vertical cubic
+    /// rebuild (w3fdif taps) instead of the edge-directed search; also one
+    /// field late.
+    Bwdif,
 }
 
 /// Per-channel change below which a pixel counts as still, and above
@@ -1220,8 +1314,8 @@ mod tests {
             }
         }
         assert_eq!((last_even, last_odd), (0x80, 0x40), "settles back to the weave");
-        // Yadif: a still vertical ramp (each field holding its lines of it)
-        // comes out as the exact weave, one field late.
+        // Yadif and bwdif: a still vertical ramp (each field holding its
+        // lines of it) comes out as the exact weave, one field late.
         let ramp = |gs: &mut Gs, field: bool| {
             for y in 0..4 {
                 for x in 0..64 {
@@ -1229,23 +1323,25 @@ mod tests {
                 }
             }
         };
-        for i in 0..6 {
-            let field1 = i % 2 == 0;
-            ramp(&mut gs, field1);
-            let (_, _, f) = gs.framebuffer_woven(field1, Deinterlace::Yadif);
-            // The first frames still see the change from the earlier
-            // fills in their temporal taps.
-            if i >= 4 {
-                let rows: Vec<u8> = (0..8).map(|y| px(&f, 64, 5, y)).collect();
-                let want: Vec<u8> = (0..8).map(|y| (0x40 + y * 8) as u8).collect();
-                assert_eq!(rows, want, "yadif on a still ramp");
+        for mode in [Deinterlace::Yadif, Deinterlace::Bwdif] {
+            for i in 0..6 {
+                let field1 = i % 2 == 0;
+                ramp(&mut gs, field1);
+                let (_, _, f) = gs.framebuffer_woven(field1, mode);
+                // The first frames still see the change from the earlier
+                // fills in their temporal taps.
+                if i >= 4 {
+                    let rows: Vec<u8> = (0..8).map(|y| px(&f, 64, 5, y)).collect();
+                    let want: Vec<u8> = (0..8).map(|y| (0x40 + y * 8) as u8).collect();
+                    assert_eq!(rows, want, "{mode:?} on a still ramp");
+                }
             }
         }
     }
 
-    /// Yadif must stay cheap enough for the GS thread at 60 vblanks/s.
+    /// Yadif/bwdif must stay cheap enough for the GS thread at 60 vblanks/s.
     #[test]
-    fn yadif_full_frame_cost() {
+    fn deinterlace_full_frame_cost() {
         let mut gs = Gs::new();
         gs.priv_write(0x0000, 1);
         gs.priv_write(0x0020, 3);
@@ -1256,13 +1352,15 @@ mod tests {
                 gs.write_psmct32(0, 10, x, y, (x * 7 + y * 13) & 0xFF);
             }
         }
-        let t = std::time::Instant::now();
-        for i in 0..20 {
-            gs.framebuffer_woven(i % 2 == 0, Deinterlace::Yadif);
+        for mode in [Deinterlace::Yadif, Deinterlace::Bwdif] {
+            let t = std::time::Instant::now();
+            for i in 0..20 {
+                gs.framebuffer_woven(i % 2 == 0, mode);
+            }
+            let per = t.elapsed() / 20;
+            eprintln!("{mode:?} 640x448: {per:?} per vblank");
+            assert!(per.as_millis() < 16, "{mode:?}: {per:?}");
         }
-        let per = t.elapsed() / 20;
-        eprintln!("yadif 640x448: {per:?} per vblank");
-        assert!(per.as_millis() < 16, "{per:?}");
     }
 
     /// Full-screen textured sprite copying one 640x224 buffer into another

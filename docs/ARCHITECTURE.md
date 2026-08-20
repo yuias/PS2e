@@ -75,8 +75,8 @@ Planned crates:
    keyboard pad input, menu/status bar, TTY and register panels, F11
    fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest),
    selectable deinterlacing of field-buffer output (weave / bob / blend /
-   motion-adaptive / yadif, composited at vblank on the GS thread; FIELD=1
-   is the top field, with a swap option)
+   motion-adaptive / yadif / bwdif, composited at vblank on the GS thread;
+   FIELD=1 is the top field, with a swap option)
    and audio rate control that slows playback instead of starving when
    the machine lags (done). Speed: EE x86-64
    recompiler with block linking, GS on a worker thread with the pixel
@@ -91,9 +91,8 @@ Planned crates:
    the OSD's blur-heavy boot screens went from ~40% to ~85% of real
    time (their slowness is what starves the audio buffer during the
    boot chime) and the game from ~1.8x to ~3.1x; expect more on an idle
-   box. Next: yadif → bwdif (then the interlace topic is closed), the OSD
-   boot phase speed, the IOP interpreter's in-situ cost, the wasm
-   front-end.
+   box. Next: the OSD boot phase speed, the IOP interpreter's in-situ
+   cost, the wasm front-end.
 
 ## Component map (ps2-core)
 
