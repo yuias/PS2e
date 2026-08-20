@@ -97,15 +97,39 @@ pub struct Cdvd {
     /// by bits 4-6. The PS2 logo area (lsn 0-11) is stored encrypted and
     /// PS2LOGO refuses to boot the game unless the read decrypts it.
     dec_set: u8,
+    /// An N command is in flight: the completion interrupt is deferred by
+    /// the drive-latency model (the bus delivers it via `finish_n`).
+    n_busy: bool,
+    /// Head position after the last read, for the seek-time model.
+    last_lsn: u32,
+    /// EE cycle at which the drive has spun up and identified the disc:
+    /// until then the status reports SPIN and the disc type "detecting".
+    /// Set at power-on and again on each IOP reboot, so cdvdman's re-init
+    /// (sceCdDiskReady) holds the boot like the hardware drive check does
+    /// — that hold is what lets the boot chime's reverb tail ring out
+    /// before the fresh libsd zeroes the SPU.
+    ready_at: u64,
 }
+
+/// Initial spin-up/identification time after power-on, and again after an
+/// IOP reboot ([`Cdvd::ready_at`]).
+const CDVD_SPINUP: u64 = 6500 * CDVD_MS;
+const CDVD_RESETTLE: u64 = 1200 * CDVD_MS;
 
 /// ISO sector payload size; DVD reads wrap it in a 2064-byte raw sector.
 const ISO_SECTOR: u64 = 2048;
 
+/// EE cycles per millisecond, for the drive-latency model.
+const CDVD_MS: u64 = 294_912;
+
 impl Cdvd {
     /// Execute an N command. CdRead (0x06) and DvdRead (0x08) stage the
-    /// requested sectors into `read_buf` for DMA channel 3.
-    fn n_execute(&mut self) {
+    /// requested sectors into `read_buf` for DMA channel 3. Returns the
+    /// drive latency (EE cycles) until the completion interrupt: real
+    /// drives seek and stream slowly, and boot-time audio/visuals (the
+    /// chime riding out while the OSD loads the game, the PS2 logo dwell)
+    /// depend on those delays.
+    fn n_execute(&mut self) -> u64 {
         let cmd = self.n_cmd;
         let lsn = u32::from_le_bytes([
             self.n_params.first().copied().unwrap_or(0),
@@ -125,8 +149,21 @@ impl Cdvd {
                     cmd = format_args!("{cmd:#04x}"), lsn, count, "disc read");
                 self.read_buf.clear();
                 self.read_pos = 0;
+                // Latency: a distance-graded seek and ~4x-DVD streaming
+                // (0.4 ms/sector); the spin-up is in `CDVD_READY_AT`.
+                let dist = u64::from(lsn.abs_diff(self.last_lsn));
+                let seek = match dist {
+                    0 => CDVD_MS / 4,
+                    1..16 => CDVD_MS,
+                    16..4096 => 10 * CDVD_MS,
+                    4096..65536 => 30 * CDVD_MS,
+                    _ => 80 * CDVD_MS,
+                };
+                let xfer = u64::from(count.min(4096)) * (2 * CDVD_MS / 5);
+                self.last_lsn = lsn.wrapping_add(count);
+                let latency = seek + xfer;
                 let Some(disc) = self.disc.as_mut() else {
-                    return;
+                    return latency;
                 };
                 use std::io::{Read, Seek, SeekFrom};
                 for i in 0..count.min(4096) {
@@ -168,6 +205,7 @@ impl Cdvd {
                         }
                     }
                 }
+                latency
             }
             // sceCdReadKey: derive the disc key from the boot executable's
             // serial the way the mechacon does; the OSD recomputes it and
@@ -208,12 +246,15 @@ impl Cdvd {
                     serial = format_args!("{:?}", serial.map(|s| String::from_utf8_lossy(&s).into_owned())),
                     key = format_args!("{:02x?}", self.key),
                     "read disc key");
+                // The mechacon takes a while over key exchanges.
+                20 * CDVD_MS
             }
             _ => {
                 debug!(target: "ps2_core::iop::cdvd",
                     cmd = format_args!("{cmd:#04x}"),
                     params = format_args!("{:02x?}", self.n_params),
-                    "N command (instant)");
+                    "N command (quick)");
+                CDVD_MS / 2
             }
         }
     }
@@ -403,27 +444,46 @@ impl Cdvd {
         }
     }
 
-    pub fn read(&mut self, addr: u32) -> u32 {
+    pub fn read(&mut self, addr: u32, now: u64) -> u32 {
+        let spinning_up = self.disc.is_some() && now < self.ready_at.max(CDVD_SPINUP);
         let v = match addr & 0x3F {
             0x04 => self.n_cmd as u32,
-            // N status: ready, no data.
-            0x05 => 0x40,
+            // N status: busy while an N command's latency runs, else
+            // ready with no data.
+            0x05 => {
+                if self.n_busy {
+                    0x80
+                } else {
+                    0x40
+                }
+            }
             0x06 => 0, // error
             0x08 => self.istat as u32,
-            // Drive status: paused-on-disc when idle, stopped without a
-            // disc. cdvdman's sceCdDiskReady waits for exactly 0x0A
-            // (PAUSE); reporting SPIN forever stalls EELOAD's game boot.
+            // Drive status: spinning up after power-on, reading while an
+            // N command is in flight, paused-on-disc when idle, stopped
+            // without a disc. cdvdman's sceCdDiskReady waits for exactly
+            // 0x0A (PAUSE); reporting SPIN forever stalls EELOAD's game
+            // boot.
             0x0A => {
-                if self.disc.is_some() {
+                if spinning_up {
+                    0x02
+                } else if self.n_busy && self.disc.is_some() {
+                    0x06
+                } else if self.disc.is_some() {
                     0x0A
                 } else {
                     0
                 }
             }
             0x0B => 0,
-            // Disc type: PS2 DVD (0x14) when an image is loaded.
+            // Disc type: detecting during the initial spin-up only (a
+            // reboot resettle keeps the known type — EELOAD reads it to
+            // pick its boot path and would fall back to the browser on
+            // "detecting"), then PS2 DVD (0x14) when an image is loaded.
             0x0F => {
-                if self.disc.is_some() {
+                if self.disc.is_some() && now < CDVD_SPINUP {
+                    0x01
+                } else if self.disc.is_some() {
                     0x14
                 } else {
                     0
@@ -464,17 +524,18 @@ impl Cdvd {
         v
     }
 
-    /// Returns true when the write completed an N command (raises the CDVD
-    /// interrupt line).
-    pub fn write(&mut self, addr: u32, v: u32) -> bool {
+    /// Returns the drive latency when the write issued an N command; the
+    /// bus delivers the completion ([`Cdvd::finish_n`]) after that many
+    /// EE cycles.
+    pub fn write(&mut self, addr: u32, v: u32) -> Option<u64> {
         trace!(target: "ps2_core::iop::cdvd", addr = format_args!("{addr:#04x}"), value = format_args!("{v:#x}"), "write");
         match addr & 0x3F {
             0x04 => {
                 self.n_cmd = v as u8;
-                self.n_execute();
+                let latency = self.n_execute();
                 self.n_params.clear();
-                self.istat |= 3; // command complete + data ready
-                return true;
+                self.n_busy = true;
+                return Some(latency);
             }
             0x05 => self.n_params.push(v as u8),
             0x08 => self.istat &= !(v as u8),
@@ -490,7 +551,14 @@ impl Cdvd {
             }
             _ => {}
         }
-        false
+        None
+    }
+
+    /// The in-flight N command's drive latency elapsed: raise the internal
+    /// completion flags (the bus raises the IOP interrupt line).
+    pub fn finish_n(&mut self) {
+        self.n_busy = false;
+        self.istat |= 3; // command complete + data ready
     }
 }
 
@@ -988,6 +1056,8 @@ pub struct Bus {
     sio2out_deferred: bool,
     /// DMA ch3 armed before the CDVD read staged its sectors.
     cdvd_dma_deferred: bool,
+    /// EE cycle when the in-flight CDVD N command completes.
+    cdvd_done_at: Option<u64>,
     pub cdvd: Cdvd,
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
@@ -1072,6 +1142,7 @@ impl Bus {
             iop_dma_cdvd: IopDmaChannel::default(),
             sio2out_deferred: false,
             cdvd_dma_deferred: false,
+            cdvd_done_at: None,
             cdvd: Cdvd::default(),
             sio2: Sio2::default(),
             now: 0,
@@ -1330,7 +1401,7 @@ impl Bus {
             0x1FC0_0000..=0x1FFF_FFFF => read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize),
             // CDVD (MECHACON) registers, also visible from the EE: the OSD
             // peeks N-status directly.
-            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr) as u64,
+            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr, self.now) as u64,
             // ROM1 (DVD player ROM): absent, reads like erased flash.
             0x1E00_0000..=0x1E3F_FFFF => u64::MAX >> (64 - 8 * N as u32),
             // SBUS CRT-controller command interface used by ROMGSCRT:
@@ -1649,6 +1720,19 @@ impl Bus {
 
     /// Edge-detect timer interrupts on both sides. Called periodically.
     pub fn tick_timers(&mut self) {
+        // Deliver a due CDVD N-command completion: internal flags, the IOP
+        // interrupt line, and any DMA that was armed while the drive worked.
+        if let Some(at) = self.cdvd_done_at
+            && at <= self.now
+        {
+            self.cdvd_done_at = None;
+            self.cdvd.finish_n();
+            self.iop_i_stat |= 1 << 2;
+            if self.cdvd_dma_deferred && self.cdvd.read_remaining() > 0 {
+                self.cdvd_dma_deferred = false;
+                self.do_cdvd_dma();
+            }
+        }
         // Deliver due deferred DMA completion interrupts.
         let mut i = 0;
         while i < self.dma_irq_queue.len() {
@@ -1680,6 +1764,9 @@ impl Bus {
         let now = self.now;
         // Next time anything here can happen (bounded, as a safety net).
         let mut due = (now + MAX_TICK_GAP).min(self.timers.next_event(now)).min(self.spu2.next_due());
+        if let Some(at) = self.cdvd_done_at {
+            due = due.min(at);
+        }
         for &(_, at) in &self.dma_irq_queue {
             due = due.min(at);
         }
@@ -2200,6 +2287,9 @@ impl Bus {
                 }
                 if cid == 0x8000_0003 {
                     debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
+                    // The rebooted cdvdman re-checks the drive; it settles
+                    // a while later, like the hardware drive does.
+                    self.cdvd.ready_at = self.now + CDVD_RESETTLE;
                     self.sif.fifo0.clear();
                     self.sif.fifo1.clear();
                     self.iop_dma_sif0 = IopDmaChannel::default();
@@ -2367,7 +2457,7 @@ impl Bus {
             }
             0x1F80_1000..=0x1F80_FFFF => self.iop_read_mmio::<N>(addr),
             0x1D00_0000..=0x1D00_00FF => self.sif.iop_read(addr),
-            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr),
+            0x1F40_2000..=0x1F40_203F => self.cdvd.read(addr, self.now),
             // ROM1 (DVD player ROM): not present; reads like erased flash so
             // presence/version checks fail instead of "succeeding" with zeros.
             0x1E00_0000..=0x1E3F_FFFF => u32::MAX,
@@ -2407,13 +2497,11 @@ impl Bus {
                 }
             }
             0x1F40_2000..=0x1F40_203F => {
-                if self.cdvd.write(addr, v) {
-                    // N command completion interrupts the IOP (CDVD line).
-                    self.iop_i_stat |= 1 << 2;
-                    if self.cdvd_dma_deferred && self.cdvd.read_remaining() > 0 {
-                        self.cdvd_dma_deferred = false;
-                        self.do_cdvd_dma();
-                    }
+                if let Some(latency) = self.cdvd.write(addr, v) {
+                    // The N command completes (and interrupts the IOP)
+                    // after the drive latency, from tick_timers.
+                    self.cdvd_done_at = Some(self.now + latency);
+                    self.timers_due = 0;
                 }
             }
             0x1F90_0000..=0x1F90_0FFF => {
@@ -2557,7 +2645,10 @@ impl Bus {
             0x1F80_10B8 => {
                 self.iop_dma_cdvd.chcr = v & !IOP_CHCR_BUSY;
                 if v & IOP_CHCR_BUSY != 0 {
-                    if self.cdvd.read_remaining() == 0 {
+                    // Sectors staged by a still-busy drive are not visible
+                    // yet: the copy waits for the completion like hardware
+                    // waits on DRQ.
+                    if self.cdvd.n_busy || self.cdvd.read_remaining() == 0 {
                         self.cdvd_dma_deferred = true;
                     } else {
                         self.do_cdvd_dma();
