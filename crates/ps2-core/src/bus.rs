@@ -246,15 +246,17 @@ impl Cdvd {
                     serial = format_args!("{:?}", serial.map(|s| String::from_utf8_lossy(&s).into_owned())),
                     key = format_args!("{:02x?}", self.key),
                     "read disc key");
-                // The mechacon takes a while over key exchanges.
-                20 * CDVD_MS
+                // A quick mechacon exchange: PS2LOGO polls its completion
+                // on a coarse ~0.8 s delay loop, so any latency beyond the
+                // first check costs a whole extra round of black screen.
+                CDVD_MS / 8
             }
             _ => {
                 debug!(target: "ps2_core::iop::cdvd",
                     cmd = format_args!("{cmd:#04x}"),
                     params = format_args!("{:02x?}", self.n_params),
                     "N command (quick)");
-                CDVD_MS / 2
+                CDVD_MS / 8
             }
         }
     }
@@ -369,6 +371,9 @@ impl Cdvd {
         self.s_results.clear();
         self.s_result_pos = 0;
         match cmd {
+            // Mechacon version query (sub-command in param 0): status +
+            // version bytes.
+            0x03 => self.s_results.extend_from_slice(&[0, 3, 6, 2]),
             // sceCdReadClock: stat + BCD sec/min/hour/pad/day/month/year.
             0x08 => self
                 .s_results
@@ -435,8 +440,6 @@ impl Cdvd {
             // console-side challenges as [status, 16 bytes].
             0x84 | 0x85 => self.s_results.extend_from_slice(&[0; 17]),
             0x80..=0x8F => self.s_results.push(0),
-            // Mecacon version: stat + version bytes.
-            0x03 => self.s_results.extend_from_slice(&[0, 3, 0, 6]),
             _ => {
                 trace!(target: "ps2_core::iop::cdvd", cmd = format_args!("{cmd:#04x}"), "unhandled S command (returning 0)");
                 self.s_results.push(0);
@@ -1058,6 +1061,8 @@ pub struct Bus {
     cdvd_dma_deferred: bool,
     /// EE cycle when the in-flight CDVD N command completes.
     cdvd_done_at: Option<u64>,
+    /// sceSifIopReset commands seen, for the drive re-settle policy.
+    iop_resets: u32,
     pub cdvd: Cdvd,
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
@@ -1143,6 +1148,7 @@ impl Bus {
             sio2out_deferred: false,
             cdvd_dma_deferred: false,
             cdvd_done_at: None,
+            iop_resets: 0,
             cdvd: Cdvd::default(),
             sio2: Sio2::default(),
             now: 0,
@@ -2287,9 +2293,18 @@ impl Bus {
                 }
                 if cid == 0x8000_0003 {
                     debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
-                    // The rebooted cdvdman re-checks the drive; it settles
-                    // a while later, like the hardware drive does.
-                    self.cdvd.ready_at = self.now + CDVD_RESETTLE;
+                    // From the second reboot on (PS2LOGO -> game), the
+                    // rebooted cdvdman re-checks the drive and it settles a
+                    // while later; that hold is what lets the logo sound's
+                    // reverb tail ring before the game's libsd clears the
+                    // SPU. The first reboot (OSD -> PS2LOGO) must stay
+                    // fast: PS2LOGO polls ReadKey on a coarse delay loop
+                    // and fast-forwards its intro (the PS mark and PS2
+                    // logo fades) past every ~0.8 s it loses there.
+                    self.iop_resets += 1;
+                    if self.iop_resets >= 2 {
+                        self.cdvd.ready_at = self.now + CDVD_RESETTLE;
+                    }
                     self.sif.fifo0.clear();
                     self.sif.fifo1.clear();
                     self.iop_dma_sif0 = IopDmaChannel::default();
