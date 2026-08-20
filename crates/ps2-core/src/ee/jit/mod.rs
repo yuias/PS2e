@@ -2,7 +2,9 @@
 //!
 //! Straight-line runs of instructions ("blocks") are translated once and
 //! cached by virtual PC. A block is an `extern "C"` function taking the
-//! CPU and bus pointers and returning how many instructions it retired;
+//! CPU and bus pointers and returning how many cycles it retired (the
+//! aligned second half of a dual-issued couple costs zero — see
+//! [`super::issue`], the model shared with the interpreter);
 //! [`Jit::run`] executes one block and returns the EE cycles spent so the
 //! system can advance the IOP, timers and vblank by the same amount. The
 //! interpreter stays the reference: instructions the translator does not
@@ -34,7 +36,9 @@ type Entry = unsafe extern "C" fn(*mut Cpu, *mut Bus, u32) -> u32;
 
 /// Code arena size; when full, every block is dropped and it starts over.
 const ARENA_BYTES: usize = 64 << 20;
-/// Longest block, in instructions.
+/// Longest block, in instructions; may run one further so the fall-through
+/// lands 8-byte aligned (a block seam must never straddle a dual-issue
+/// couple, or the two worlds would charge it differently).
 const MAX_BLOCK: usize = 64;
 /// Direct-mapped lookup entries (indexed by pc >> 2).
 const LOOKUP_ENTRIES: usize = 1 << 16;
@@ -228,9 +232,17 @@ impl Jit {
         let mut interp_exits: Vec<(dynasmrt::DynamicLabel, u32)> = Vec::with_capacity(MAX_BLOCK);
         let mut addr = pc;
         let mut count = 0u32;
+        let mut cycles = 0u32;
+        // Previous instruction when it falls through to `addr` within this
+        // block (dual-issue pairing; None across control flow).
+        let mut prev: Option<u32> = None;
         loop {
             let instr = bus.fetch32(addr);
             let next = bus.fetch32(addr.wrapping_add(4));
+            // The aligned second half of a hazard-free couple retires with
+            // its head. Decided on the instruction words alone, exactly as
+            // the interpreter does, so both worlds charge the same cycles.
+            let free = addr & 7 == 4 && prev.is_some_and(|p| super::issue::dual_issue(p, instr));
             // A control-flow instruction in the delay slot is undefined
             // behaviour on MIPS; leave such branches to the interpreter.
             let mut emitted = if is_control_flow(instr) && is_control_flow(next) {
@@ -240,33 +252,43 @@ impl Jit {
             };
             if let emit::Emitted::Branch(kind) = emitted {
                 count += 1;
+                // The branch itself may be the second half of a couple; its
+                // delay slot always costs its own cycle.
+                if !free {
+                    cycles += 1;
+                }
                 let ds_addr = addr.wrapping_add(4);
                 if let emit::BranchKind::Cond { likely: true, .. } = kind {
-                    emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), count, &mut exits);
+                    emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), cycles, &mut exits);
                 }
                 if let emit::Emitted::Interp = emit::emit(&mut ops, ds_addr, next) {
-                    emit_interp(&mut ops, ds_addr, next, count + 1, &mut interp_exits);
+                    emit_interp(&mut ops, ds_addr, next, cycles + 1, &mut interp_exits);
                 }
                 count += 1;
+                cycles += 1;
                 let idle = is_idle_loop(bus, addr, instr, next);
-                emit::emit_branch_end(&mut ops, kind, ds_addr.wrapping_add(4), count, idle, &mut exits);
+                emit::emit_branch_end(&mut ops, kind, ds_addr.wrapping_add(4), cycles, idle, &mut exits);
                 break;
             }
+            count += 1;
+            if !free {
+                cycles += 1;
+            }
             if let emit::Emitted::Interp = emitted {
-                emit_interp(&mut ops, addr, instr, count + 1, &mut interp_exits);
+                emit_interp(&mut ops, addr, instr, cycles, &mut interp_exits);
                 emitted = emit::Emitted::Plain;
             }
             let _ = emitted;
-            count += 1;
             let control = is_control_flow(instr);
+            prev = if control { None } else { Some(instr) };
             addr = addr.wrapping_add(4);
             if control {
                 // pc/next_pc were left by the interpreted instruction.
-                exits.to_stored(&mut ops, count);
+                exits.to_stored(&mut ops, cycles);
                 break;
             }
-            if count as usize >= MAX_BLOCK || addr & 0xFFF == 0 {
-                exits.to(&mut ops, addr, count);
+            if (count as usize >= MAX_BLOCK && addr & 7 == 0) || addr & 0xFFF == 0 {
+                exits.to(&mut ops, addr, cycles);
                 break;
             }
         }

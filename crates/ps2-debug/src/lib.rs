@@ -116,6 +116,10 @@ impl DebugServer {
     /// running, execute up to `budget_cycles` of emulation with breakpoint
     /// and watchpoint checks.
     pub fn pump(&mut self, sys: &mut Ps2System, budget_cycles: u64) {
+        // Breakpoints compare pc before every step; dual-issue would hide
+        // the second half of a pair, so EE debugging runs single-issue
+        // (cycle timing under a debugger differs from a free run).
+        sys.ee.single_issue = self.ee.as_ref().is_some_and(|s| s.client.is_some());
         if let Some(stub) = &mut self.ee {
             stub.accept_new_client();
             stub.service_client(sys);

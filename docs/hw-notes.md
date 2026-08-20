@@ -500,10 +500,34 @@ each wait):
   paces each step with a fixed ~2^25-iteration CPU delay loop, then
   *catches up* its vsync-driven animation clock by fast-forwarding.
   On a real R5900 the loop dual-issues (~0.4 s per round); our JIT
-  counts 1 cycle/instruction (~0.8 s), the stall doubles to ~2.7 s,
-  and the catch-up skips the PS-mark and PS2-logo scenes entirely.
-  Device-side latencies are irrelevant to this window (measured: it is
-  invariant); the fix is a dual-issue cycle model for the EE.
+  counted 1 cycle/instruction (~0.8 s), doubling the stall to ~2.7 s.
+  The EE dual-issue model (`ee/issue.rs`) brings the loop to the
+  hardware's 4 cycles/iteration and the restart-to-SMODE2 window to
+  ~2.0 emu-seconds.
+- The missing PS-mark/PS2-logo fades are NOT PS2LOGO's (established by
+  probes: the window length is irrelevant — shrinking it to 1.2 s by
+  patching the delay-loop counts, moving the whole boot 3.5 s earlier
+  via CDVD spin-up, and zeroing candidate vsync counters at show start
+  all leave the presentation unchanged). What PS2LOGO actually does,
+  from its disassembly (gp = 0x138070):
+  - 0x102164: after `0x102078()` (mode from ROMVER byte 4: 'A'-> 1,
+    'E' -> 2, 'J'/'H' -> 0) and the logo checksum (sum of the 0x1800
+    decrypted words xor 0x62db1e66, at gp-0x7f30; both verified 0 for
+    our delivered data — decryption xor 0xF5 + ror 5 is bit-exact),
+    mode != 1 with checksum != 0 skips the logo sound + disc-logo
+    display + 120-vsync dwell; we take the full path.
+  - Its only image assets are imagedata/osd_logo_B(.raw/_PAL.raw):
+    the mist-text show. There are no PS-mark or PS2-wireframe assets
+    in this PS2LOGO at all.
+  - WaitVsync is a *poll* of INTC_STAT bit 2 at 0x11cb08 (no
+    interrupts needed); the paced mechacon waits re-check completion
+    only once per delay round, so any device latency that misses the
+    first check costs a whole ~0.46 s round of black.
+  - Working hypothesis for the fades: they belong to OSDSYS's
+    disc-boot exit animation (zoom into the cloud -> PS mark -> PS2
+    logo) played *before* EELOAD/PS2LOGO — our boot fades the SCE
+    screen straight to black instead. Unverified; next step is the
+    OSD side, not PS2LOGO.
 - The mechacon version query (S 0x03 sub 0x00) must answer with a
   status byte first ([0, major, minor, patch]); answering PCSX2's raw
   4-byte little-endian version stalls the SCPH-50000 boot handshake

@@ -40,7 +40,7 @@ Planned crates:
 | Bus design | Concrete fields + address `match` dispatch, no traits | Simplicity and speed; avoids generics. Same as PS1e. |
 | EE↔IOP timing | Alternating slices at the 8:1 clock ratio (EE 294.912 MHz : IOP 36.864 MHz) | Simple and deterministic; refine granularity when SIF timing demands it. |
 | Address translation | KSEG0/1 fold, real EE TLB for mapped segments with a 1024-entry translation cache and a one-page instruction-fetch cache | Games map their own pages; the caches keep the common case at a compare and a load. |
-| Cycle counting | 1 cycle per EE instruction for now | Good enough for bring-up; add memory wait states and dual-issue approximation later (PS1e-style penalty accounting). |
+| Cycle counting | 1 cycle per EE issue group: an 8-byte-aligned, hazard-free ALU(+load/store) couple dual-issues (`ee/issue.rs`), everything else is 1 cycle/instruction | The R5900 pairs most integer ops; without this, fixed CPU delay loops (PS2LOGO's boot pacing) ran ~2x long. The model is position-based (aligned couples only, reset across control flow) so JIT block seams cannot split a pair, and one pure function serves both the interpreter and the JIT — the bit-identical-frames protocol depends on both counting alike. Memory wait states still unmodeled. |
 | Profiling | `--features profile`: rdtsc scope accounting per subsystem plus EE/IOP instruction and PC histograms; `examples/gs_bench.rs`, `examples/ee_bench.rs` | Sampling profilers need elevation on the development box; the scopes answer "which subsystem" and the histograms "which loop" cheaply. |
 | Logging | `tracing` with per-component targets (`ps2_core::ee::cpu`, `ps2_core::tty`, …) | Fine-grained runtime filtering; static max-level features strip verbose logs from release builds. |
 | Unimplemented ops/MMIO | Log at `error` and panic (ops) / log and shadow (MMIO) | During bring-up, silently continuing past an unknown instruction corrupts state; a loud stop with context is the iteration loop. |
@@ -93,12 +93,14 @@ Planned crates:
    OSD's blur-heavy boot screens now run at about real time (3G cycles
    in 10.0 s vs the 10.2 s a console takes; their slowness is what
    starved the audio buffer during the boot chime) and the game at
-   ~3.5x. Next: an EE dual-issue cycle model — we retire 1
-   cycle/instruction while the R5900 pairs most integer ops, so fixed
-   CPU delay loops (PS2LOGO's boot pacing) run about twice as long and
-   its catch-up skips the PS-mark/PS2-logo fades (docs/hw-notes.md);
-   the JIT and the interpreter must share the cost model to keep the
-   bit-identical-frames protocol. After that: the GS's serial
+   ~3.5x. The EE now dual-issues aligned, hazard-free instruction
+   couples (`ee/issue.rs`, one pure cost model shared by the
+   interpreter and the JIT so frames stay bit-identical between them);
+   PS2LOGO's fixed delay loops run at the hardware's 4 cycles per
+   iteration and every CPU-bound boot phase takes ~20-35% fewer
+   cycles. The still-missing PS-mark/PS2-logo boot fades are not a
+   PS2LOGO timing artifact (docs/hw-notes.md); the next lead is the
+   OSDSYS disc-boot exit animation. After that: the GS's serial
    small-triangle cost, the wasm front-end.
 
 ## Component map (ps2-core)

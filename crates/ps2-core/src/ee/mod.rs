@@ -7,6 +7,7 @@
 
 pub mod cop0;
 pub mod fpu;
+pub mod issue;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub mod jit;
 
@@ -45,6 +46,10 @@ pub struct Cpu {
     /// interrupt can change state, so [`crate::Ps2System`] skips EE steps
     /// until one is pending.
     pub idle: bool,
+    /// Disable the dual-issue pairing so one [`Cpu::step`] is exactly one
+    /// instruction (the gdb stub needs pc observable at every instruction
+    /// for breakpoints; timing under a debugger differs accordingly).
+    pub single_issue: bool,
 }
 
 impl Default for Cpu {
@@ -69,6 +74,7 @@ impl Cpu {
             current_pc: 0xBFC0_0000,
             in_delay: false,
             idle: false,
+            single_issue: false,
         }
     }
 
@@ -226,6 +232,23 @@ impl Cpu {
         self.next_pc = self.pc.wrapping_add(4);
         let t2 = if sample { crate::prof::now() } else { 0 };
         self.execute(instr, bus);
+        // Dual-issue: an aligned, hazard-free couple retires in one cycle
+        // (see [`issue`]); the partner runs inside this same step so one
+        // step stays one cycle and the system's accounting is untouched.
+        // Accepted heads never divert, so the fall-through is guaranteed.
+        if !self.in_delay && self.current_pc & 7 == 0 && !self.single_issue
+            && issue::may_lead(instr)
+        {
+            let second = bus.fetch32(self.current_pc | 4);
+            if issue::dual_issue(instr, second) {
+                debug_assert!(!self.next_is_delay && self.pc == (self.current_pc | 4));
+                self.current_pc = self.pc;
+                crate::prof::count_ee(self.pc, second);
+                self.pc = self.next_pc;
+                self.next_pc = self.pc.wrapping_add(4);
+                self.execute(second, bus);
+            }
+        }
         if sample {
             let t3 = crate::prof::now();
             crate::prof::step_parts([t1 - t0, t2 - t1, t3 - t2, t3 - t0]);

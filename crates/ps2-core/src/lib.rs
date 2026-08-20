@@ -133,8 +133,8 @@ impl Ps2System {
     #[inline]
     fn machine_cycle(&mut self) {
         let mut event = false;
-        // 1 cycle per instruction for now; wait states and dual-issue
-        // approximation come later.
+        // The EE retires one issue group per cycle (dual-issued pairs count
+        // one; see `ee::issue`); wait states are not modeled.
         if self.cycles.is_multiple_of(EE_PER_IOP) {
             let _g = prof::scope(prof::Slot::Iop);
             self.bus.now = self.cycles;
