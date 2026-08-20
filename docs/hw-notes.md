@@ -485,3 +485,26 @@ each wait):
   default — EEA's low 16 bits are fixed 0xFFFF on hardware — EVOL
   0x1428). The audible ring is that reverb tail plus the second
   reboot's re-settle time before the game's libsd init clears it.
+
+## PS2LOGO's intro and the EE dual-issue gap
+
+- The full disc-boot presentation after the towers/SCE screen: zoom
+  into the blue cloud, the colourful PS mark fades in/out, the blue
+  "PS2" logo fades in/out, then the mist gathers into the disc's
+  "PlayStation(R)2" text (640x512 phase). The mist, light streaks and
+  wisps are additive *line* primitives; the glow runs through a
+  downscale/upscale ping-pong (bp 10240) and an accumulation buffer
+  (bp 6720) that survives the reboot.
+- Before its show, PS2LOGO runs its mechacon sequence (version query,
+  ReadKey, DEC-SET, logo read + checksum of the 0x1800-word logo) and
+  paces each step with a fixed ~2^25-iteration CPU delay loop, then
+  *catches up* its vsync-driven animation clock by fast-forwarding.
+  On a real R5900 the loop dual-issues (~0.4 s per round); our JIT
+  counts 1 cycle/instruction (~0.8 s), the stall doubles to ~2.7 s,
+  and the catch-up skips the PS-mark and PS2-logo scenes entirely.
+  Device-side latencies are irrelevant to this window (measured: it is
+  invariant); the fix is a dual-issue cycle model for the EE.
+- The mechacon version query (S 0x03 sub 0x00) must answer with a
+  status byte first ([0, major, minor, patch]); answering PCSX2's raw
+  4-byte little-endian version stalls the SCPH-50000 boot handshake
+  before the OSD even starts.
