@@ -229,7 +229,7 @@ impl GsFront {
                 let _ = reply.send(gs.framebuffer());
             }
             Cmd::Vram(reply) => {
-                let _ = reply.send(gs.canvas.to_vec());
+                let _ = reply.send(gs.vram_snapshot());
             }
             Cmd::Stats(reply) => {
                 let _ = reply.send(Stats::of(gs));
@@ -383,7 +383,7 @@ impl GsFront {
 
     /// Current display as RGBA8, as of everything written so far.
     pub fn framebuffer(&mut self) -> Frame {
-        if let Some(gs) = &self.inline {
+        if let Some(gs) = &mut self.inline {
             return gs.framebuffer();
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -394,8 +394,8 @@ impl GsFront {
 
     /// Copy of VRAM, as of everything written so far.
     pub fn vram(&mut self) -> Box<[u8]> {
-        if let Some(gs) = &self.inline {
-            return gs.canvas.to_vec();
+        if let Some(gs) = &mut self.inline {
+            return gs.vram_snapshot();
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.push(Cmd::Vram(tx));

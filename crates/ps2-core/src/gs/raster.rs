@@ -1,14 +1,21 @@
 //! Pixel pipeline: triangle/sprite rasterization, texture sampling,
 //! alpha blending and the frame-buffer write path.
 //!
-//! [`Gs`] decodes a primitive into geometry plus a [`PixelPipe`] and hands
-//! scanlines to a [`Painter`], which owns nothing but references: the
-//! shared [`Canvas`] and CLUT, the pipe, and a per-thread [`Scratch`]. Large
-//! primitives are split across worker threads in two-row bands (rows
-//! `2k, 2k+1` share the 32-bit column layout's cache lines), each band with
-//! its own scratch, so no two threads write the same pixel; the split is
-//! skipped when the texture may alias the render target, since a primitive
-//! that samples what it draws would otherwise depend on thread timing.
+//! [`Gs`] decodes a primitive into geometry plus a [`PixelPipe`] and queues
+//! it in a [`Batch`]; a flush hands scanlines to [`Painter`]s, which own
+//! nothing but references: the shared [`Canvas`] and CLUT, the pipe, and a
+//! per-thread [`Scratch`]. A flush runs the whole queue on the worker pool
+//! in two-row bands (rows `2k, 2k+1` share the 32-bit column layout's cache
+//! lines): every lane walks all queued primitives in order but only touches
+//! its own rows, so no two threads write the same pixel and each pixel sees
+//! its primitives in program order — results are bit-identical to a serial
+//! pass. Batching amortizes the pool dispatch over many primitives, which
+//! is what makes the small-triangle rushes (the OSD boot towers) parallel.
+//! The batch is flushed before anything else reads or writes VRAM (IMAGE
+//! transfers, local copies, CLUT decodes, scanout) and a primitive whose
+//! texture may alias what the queue wrote flushes first; one that samples
+//! its *own* target runs inline, since it would otherwise depend on thread
+//! timing.
 
 use super::*;
 
@@ -75,10 +82,62 @@ impl Rows {
     }
 }
 
-/// Pixels a primitive must cover before it is split across threads.
+/// Pixels a batch must cover before its flush is split across threads.
 pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
-/// Bands (tasks) a split primitive is cut into.
+/// Bands (tasks) a flush is cut into.
 pub(super) const PARALLEL_LANES: usize = 6;
+/// Pixel estimate that triggers a batch flush on its own.
+const BATCH_MAX_PIXELS: i64 = 1 << 16;
+
+/// Queued primitive geometry (decoded, self-contained).
+enum Prim {
+    Tri(TriGeom),
+    Sprite(SpriteGeom),
+    Line(LineGeom),
+}
+
+struct Queued {
+    pipe: PixelPipe,
+    prim: Prim,
+    start: i32,
+    end: i32,
+}
+
+/// Primitives decoded and queued for one parallel rasterization pass.
+#[derive(Default)]
+pub(super) struct Batch {
+    queued: Vec<Queued>,
+    /// Bounding-box pixel estimate of the queue.
+    px: i64,
+    /// Merged block ranges the queue writes (frame and Z), for the
+    /// read-after-write flush test.
+    writes: Vec<(u32, u32)>,
+}
+
+impl Batch {
+    fn note_write(&mut self, r: std::ops::Range<u32>) {
+        for w in self.writes.iter_mut() {
+            if r.start <= w.1 && w.0 <= r.end {
+                w.0 = w.0.min(r.start);
+                w.1 = w.1.max(r.end);
+                return;
+            }
+        }
+        self.writes.push((r.start, r.end));
+    }
+
+    fn reads(&self, r: &std::ops::Range<u32>) -> bool {
+        self.writes.iter().any(|w| r.start < w.1 && w.0 < r.end)
+    }
+}
+
+/// Line geometry: the DDA re-derives everything else per step.
+struct LineGeom {
+    a: Vertex,
+    b: Vertex,
+    gouraud: bool,
+    steps: i32,
+}
 
 /// Sprite geometry needed per scanline.
 #[derive(Clone, Copy)]
@@ -150,6 +209,8 @@ impl Gs {
         };
         let (px, py) = (v.x >> 4, v.y >> 4);
         if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
+            // Points are rare: draw in place, keeping order with the queue.
+            self.flush_batch();
             let mut p = Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
             let texel = if pipe.tme { p.sample(&frag) } else { 0 };
             let row = Row::new(&pipe, py as u32);
@@ -177,43 +238,19 @@ impl Gs {
             prim = format_args!("{:#x}", self.prim),
             fbp = (self.ctx[((self.prim >> 9) & 1) as usize].frame & 0x1FF) * 32,
             "line");
-        let gouraud = self.prim & 8 != 0;
-        let (fx0, fy0) = (a.x as f32 / 16.0, a.y as f32 / 16.0);
-        let (fx1, fy1) = (b.x as f32 / 16.0, b.y as f32 / 16.0);
-        let (dx, dy) = (fx1 - fx0, fy1 - fy0);
-        let steps = dx.abs().max(dy.abs()).round() as i32;
+        let (fy0, fy1) = (a.y as f32 / 16.0, b.y as f32 / 16.0);
+        let steps = ((b.x - a.x) as f32 / 16.0)
+            .abs()
+            .max((fy1 - fy0).abs())
+            .round() as i32;
         if steps <= 0 {
             return;
         }
-        let inv = 1.0 / steps as f32;
-        let lerp = |p: f32, q: f32, t: f32| p + (q - p) * t;
-        let mut painter =
-            Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
-        for i in 0..steps {
-            let t = i as f32 * inv;
-            let px = (fx0 + dx * t).round() as i32;
-            let py = (fy0 + dy * t).round() as i32;
-            if px < pipe.scx0 || px > pipe.scx1 || py < pipe.scy0 || py > pipe.scy1 {
-                continue;
-            }
-            let frag = Frag {
-                r: if gouraud { lerp(a.r as f32, b.r as f32, t) } else { b.r as f32 },
-                g: if gouraud { lerp(a.g as f32, b.g as f32, t) } else { b.g as f32 },
-                b: if gouraud { lerp(a.b as f32, b.b as f32, t) } else { b.b as f32 },
-                a: if gouraud { lerp(a.a as f32, b.a as f32, t) } else { b.a as f32 },
-                z: lerp(a.z as f32, b.z as f32, t) as u32,
-                s: lerp(a.s, b.s, t),
-                t: lerp(a.t, b.t, t),
-                q: lerp(a.q, b.q, t),
-                u: lerp(a.u as f32, b.u as f32, t) / 16.0,
-                v: lerp(a.v as f32, b.v as f32, t) / 16.0,
-            };
-            let texel = if pipe.tme { painter.sample(&frag) } else { 0 };
-            let row = Row::new(&pipe, py as u32);
-            painter.shade_row_px(&row, px as u32, frag, texel);
-        }
         self.prims_drawn += 1;
-        self.merge_scratch();
+        let start = (fy0.min(fy1).floor() as i32).max(pipe.scy0);
+        let end = (fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1);
+        let geom = LineGeom { a, b, gouraud: self.prim & 8 != 0, steps };
+        self.enqueue(pipe, Prim::Line(geom), start, end.max(start), steps as i64, None);
     }
 
     /// Bring-up aid: describe each distinct render-target setup once.
@@ -280,14 +317,12 @@ impl Gs {
         }
     }
 
-    /// Whether the texture may alias the frame or Z buffer within the rows
-    /// drawn (conservative block-range test): such primitives read what
-    /// they write and must stay on one thread. `tex_v` is the texel row
-    /// range the primitive samples (`None` = unknown, assume the whole
-    /// declared height).
-    fn texture_aliases_target(pipe: &PixelPipe, rows: i32, tex_v: Option<(f32, f32)>) -> bool {
+    /// Block range the texture may be sampled from (conservative): `tex_v`
+    /// is the texel row range the primitive samples (`None` = unknown,
+    /// assume the whole declared height). `None` result = untextured.
+    fn tex_blocks(pipe: &PixelPipe, tex_v: Option<(f32, f32)>) -> Option<std::ops::Range<u32>> {
         if !pipe.tme {
-            return false;
+            return None;
         }
         let ti = &pipe.tex;
         // Texel rows the primitive can touch: the sampled range (plus one
@@ -299,13 +334,17 @@ impl Gs {
         // 32-bit pages are 32 rows tall; the other formats' pages are taller,
         // so this over-estimates their span (safe side).
         let tbw = ti.tbw.max(1);
-        let tex = ti.tbp + (v_lo / 32) * tbw * 32..ti.tbp + (v_hi / 32 + 1) * tbw * 32;
-        let target_pages = ((rows as u32).div_ceil(32)) * pipe.fbw.max(1);
-        let fb = pipe.fbp..pipe.fbp + target_pages * 32;
-        let zb = pipe.zbp..pipe.zbp + target_pages * 32;
-        let overlaps = |a: &std::ops::Range<u32>, b: &std::ops::Range<u32>| a.start < b.end && b.start < a.end;
-        // Only buffers actually written can feed back.
-        (pipe.fbmsk != u32::MAX && overlaps(&tex, &fb)) || (pipe.zte && !pipe.zmsk && overlaps(&tex, &zb))
+        Some(ti.tbp + (v_lo / 32) * tbw * 32..ti.tbp + (v_hi / 32 + 1) * tbw * 32)
+    }
+
+    /// Block ranges a primitive covering rows `0..rows` writes: frame and Z
+    /// buffer, `None` where fully masked. Only written buffers can feed
+    /// back into a texture.
+    fn written_blocks(pipe: &PixelPipe, rows: i32) -> (Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>) {
+        let target_pages = ((rows.max(0) as u32).div_ceil(32)) * pipe.fbw.max(1);
+        let fb = (pipe.fbmsk != u32::MAX).then(|| pipe.fbp..pipe.fbp + target_pages * 32);
+        let zb = (pipe.zte && !pipe.zmsk).then(|| pipe.zbp..pipe.zbp + target_pages * 32);
+        (fb, zb)
     }
 
     pub(super) fn draw_sprite(&mut self) {
@@ -371,7 +410,8 @@ impl Gs {
             let (a, b) = (t0 * geom.inv_q * th, t1 * geom.inv_q * th);
             (a.min(b), a.max(b))
         };
-        self.run_rows(&pipe, rya, ryb, geom.pxb - geom.pxa, Some(tex_v), |p, rows| p.sprite_rows(&geom, rows));
+        let px = (ryb - rya).max(0) as i64 * (geom.pxb - geom.pxa).max(0) as i64;
+        self.enqueue(pipe, Prim::Sprite(geom), rya, ryb, px, Some(tex_v));
     }
 
     pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
@@ -461,52 +501,104 @@ impl Gs {
             let (ta, tb, tc) = (tv(&a), tv(&b), tv(&c));
             (ta.min(tb).min(tc), ta.max(tb).max(tc))
         };
-        self.run_rows(&pipe, miny, maxy + 1, maxx - minx + 1, Some(tex_v), |p, rows| p.tri_rows(&geom, rows));
+        let px = (maxy - miny + 1) as i64 * (maxx - minx + 1) as i64;
+        self.enqueue(pipe, Prim::Tri(geom), miny, maxy + 1, px, Some(tex_v));
     }
 
-    /// Rasterize rows `start..end`: on the worker pool in bands when the
-    /// primitive is large and cannot sample its own target, else inline.
-    fn run_rows(
-        &mut self,
-        pipe: &PixelPipe,
-        start: i32,
-        end: i32,
-        width: i32,
-        tex_v: Option<(f32, f32)>,
-        f: impl Fn(&mut Painter, Rows) + Sync,
-    ) {
-        let pixels = (end - start).max(0) as i64 * width.max(0) as i64;
-        let big = pixels >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES;
-        let alias = big && Self::texture_aliases_target(pipe, end, tex_v);
-        let split = big && !alias;
-        if split {
-            #[cfg(feature = "threads")]
-            {
-                self.prims_split += 1;
-                let canvas = &self.canvas;
-                let clut = &self.clut;
-                let (rows, f) = (Rows { start, end, lane: 0, lanes: PARALLEL_LANES }, &f);
-                let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
-                rayon::scope(|s| {
-                    for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
-                        s.spawn(move |_| {
-                            let mut p = Painter { canvas, clut, pipe, scratch };
-                            f(&mut p, Rows { lane, ..rows });
-                        });
-                    }
-                });
-                for s in self.pool.iter_mut() {
-                    self.pixels_shaded += std::mem::take(&mut s.pixels);
-                    for (h, n) in self.tex_psm_hist.iter_mut().zip(s.tex_samples.iter_mut()) {
-                        *h += std::mem::take(n);
-                    }
-                }
+    /// Queue a decoded primitive, flushing first when it would read what
+    /// the queue wrote (or, for a primitive sampling its own target, run it
+    /// inline — its result depends on draw order within itself).
+    fn enqueue(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) {
+        let tex = Self::tex_blocks(&pipe, tex_v);
+        let (fb, zb) = Self::written_blocks(&pipe, end);
+        if let Some(t) = &tex {
+            if self.batch.reads(t) {
+                self.flush_batch();
+            }
+            let overlaps = |w: &Option<std::ops::Range<u32>>| {
+                w.as_ref().is_some_and(|w| t.start < w.end && w.start < t.end)
+            };
+            if overlaps(&fb) || overlaps(&zb) {
+                self.flush_batch();
+                let mut p =
+                    Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
+                Self::run_prim(&mut p, &prim, Rows::all(start, end));
+                self.merge_scratch();
                 return;
             }
         }
-        let mut p = Painter { canvas: &self.canvas, clut: &self.clut, pipe, scratch: &mut self.scratch };
-        f(&mut p, Rows::all(start, end));
+        for r in [fb, zb].into_iter().flatten() {
+            self.batch.note_write(r);
+        }
+        self.batch.px += px;
+        self.batch.queued.push(Queued { pipe, prim, start, end });
+        if self.batch.px >= BATCH_MAX_PIXELS {
+            self.flush_batch();
+        }
+    }
+
+    fn run_prim(p: &mut Painter, prim: &Prim, rows: Rows) {
+        match prim {
+            Prim::Tri(g) => p.tri_rows(g, rows),
+            Prim::Sprite(g) => p.sprite_rows(g, rows),
+            Prim::Line(g) => p.line_rows(g, rows),
+        }
+    }
+
+    /// Rasterize the queued primitives: across the worker pool in two-row
+    /// bands when there is enough work, else serially. Each lane replays
+    /// the whole queue in order restricted to its own rows, so the result
+    /// is identical either way.
+    pub(super) fn flush_batch(&mut self) {
+        if self.batch.queued.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.batch.queued);
+        let px = std::mem::take(&mut self.batch.px);
+        self.batch.writes.clear();
+        #[cfg(feature = "threads")]
+        if px >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES {
+            self.prims_split += queued.len() as u64;
+            let canvas = &self.canvas;
+            let clut = &self.clut;
+            let q = &queued;
+            let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
+            rayon::scope(|s| {
+                for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
+                    s.spawn(move |_| {
+                        for item in q {
+                            let mut p = Painter { canvas, clut, pipe: &item.pipe, scratch };
+                            let rows = Rows { start: item.start, end: item.end, lane, lanes: PARALLEL_LANES };
+                            Self::run_prim(&mut p, &item.prim, rows);
+                        }
+                    });
+                }
+            });
+            for s in self.pool.iter_mut() {
+                self.pixels_shaded += std::mem::take(&mut s.pixels);
+                for (h, n) in self.tex_psm_hist.iter_mut().zip(s.tex_samples.iter_mut()) {
+                    *h += std::mem::take(n);
+                }
+            }
+            self.batch.queued = {
+                let mut v = queued;
+                v.clear();
+                v
+            };
+            return;
+        }
+        let _ = px;
+        for item in &queued {
+            let mut p =
+                Painter { canvas: &self.canvas, clut: &self.clut, pipe: &item.pipe, scratch: &mut self.scratch };
+            Self::run_prim(&mut p, &item.prim, Rows::all(item.start, item.end));
+        }
         self.merge_scratch();
+        self.batch.queued = {
+            let mut v = queued;
+            v.clear();
+            v
+        };
     }
 
     /// Decode the drawing environment for the current context once per
@@ -581,6 +673,9 @@ impl Gs {
         if key == self.clut_key && !self.clut_dirty {
             return;
         }
+        // Queued primitives reference this CLUT and may have written the
+        // VRAM it decodes from.
+        self.flush_batch();
         let entries = if ti.clut_bits == 8 { 256 } else { 16 };
         for e in ti.clut_base..ti.clut_base + entries {
             self.clut[e] = self.clut_lookup(ti.tex0, e as u32);
@@ -735,6 +830,49 @@ impl Painter<'_> {
                 let texel = if pipe.tme { self.sample(&frag) } else { 0 };
                 self.shade_row_px(&row, px as u32, frag, texel);
             }
+        }
+    }
+
+    /// Pixel-step DDA over the major axis; as on hardware the end point's
+    /// pixel is not drawn, so the joints of a strip land exactly once — the
+    /// PS2 logo's additive wireframe counts on that. Attributes interpolate
+    /// (or stick to the second vertex's colour when shading is flat) and
+    /// pixels go through the generic per-pixel pipeline. Every lane walks
+    /// the full DDA and plots only its own rows, keeping values identical
+    /// to a serial pass.
+    fn line_rows(&mut self, g: &LineGeom, rows: Rows) {
+        let pipe = self.pipe;
+        let (a, b) = (g.a, g.b);
+        let (fx0, fy0) = (a.x as f32 / 16.0, a.y as f32 / 16.0);
+        let (fx1, fy1) = (b.x as f32 / 16.0, b.y as f32 / 16.0);
+        let (dx, dy) = (fx1 - fx0, fy1 - fy0);
+        let inv = 1.0 / g.steps as f32;
+        let lerp = |p: f32, q: f32, t: f32| p + (q - p) * t;
+        for i in 0..g.steps {
+            let t = i as f32 * inv;
+            let px = (fx0 + dx * t).round() as i32;
+            let py = (fy0 + dy * t).round() as i32;
+            if px < pipe.scx0 || px > pipe.scx1 || py < pipe.scy0 || py > pipe.scy1 {
+                continue;
+            }
+            if rows.lanes > 1 && ((py >> 1) as usize) % rows.lanes != rows.lane {
+                continue;
+            }
+            let frag = Frag {
+                r: if g.gouraud { lerp(a.r as f32, b.r as f32, t) } else { b.r as f32 },
+                g: if g.gouraud { lerp(a.g as f32, b.g as f32, t) } else { b.g as f32 },
+                b: if g.gouraud { lerp(a.b as f32, b.b as f32, t) } else { b.b as f32 },
+                a: if g.gouraud { lerp(a.a as f32, b.a as f32, t) } else { b.a as f32 },
+                z: lerp(a.z as f32, b.z as f32, t) as u32,
+                s: lerp(a.s, b.s, t),
+                t: lerp(a.t, b.t, t),
+                q: lerp(a.q, b.q, t),
+                u: lerp(a.u as f32, b.u as f32, t) / 16.0,
+                v: lerp(a.v as f32, b.v as f32, t) / 16.0,
+            };
+            let texel = if pipe.tme { self.sample(&frag) } else { 0 };
+            let row = Row::new(pipe, py as u32);
+            self.shade_row_px(&row, px as u32, frag, texel);
         }
     }
 

@@ -132,6 +132,8 @@ pub struct Gs {
     /// (see raster.rs; empty pool = never split).
     scratch: raster::Scratch,
     pool: Vec<raster::Scratch>,
+    /// Decoded primitives queued for one parallel pass (see raster.rs).
+    batch: raster::Batch,
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
     /// Per-pixel motion flags of the last composited frame (see
@@ -207,6 +209,7 @@ impl Gs {
             } else {
                 Vec::new()
             },
+            batch: raster::Batch::default(),
             woven: Vec::new(),
             motion: Vec::new(),
             history: [Vec::new(), Vec::new()],
@@ -481,6 +484,8 @@ impl Gs {
             return;
         }
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        // Queued primitives may sample the region this transfer overwrites.
+        self.flush_batch();
         self.clut_dirty = true;
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
@@ -544,6 +549,7 @@ impl Gs {
             return;
         }
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        self.flush_batch();
         self.clut_dirty = true;
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
@@ -669,6 +675,7 @@ impl Gs {
     /// LOCAL->LOCAL copy, used by the kernel to move fonts around.
     fn local_copy(&mut self) {
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
+        self.flush_batch();
         self.clut_dirty = true;
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
@@ -717,6 +724,12 @@ impl Gs {
     }
 
     // --- VRAM accessors (see `Canvas`) -----------------------------------
+
+    /// A copy of local memory with all queued drawing applied (for dumps).
+    pub fn vram_snapshot(&mut self) -> Box<[u8]> {
+        self.flush_batch();
+        self.canvas.to_vec()
+    }
 
     #[inline]
     pub fn write_psmct32(&mut self, bp: u32, bw: u32, x: u32, y: u32, v: u32) {
@@ -767,7 +780,8 @@ impl Gs {
 
     /// Compose the currently displayed frame as RGBA8. Returns (w, h, data).
     /// Interlaced field buffers (SMODE2 INT+FFMD) are line-doubled.
-    pub fn framebuffer(&self) -> (u32, u32, Vec<u8>) {
+    pub fn framebuffer(&mut self) -> (u32, u32, Vec<u8>) {
+        self.flush_batch();
         let (w, h, view) = self.display_view();
         let mut out = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
@@ -782,6 +796,7 @@ impl Gs {
     /// keep the previous field. Bobbing each field alone would show the
     /// game's half-line field offset as a 30 Hz shake.
     pub fn framebuffer_woven(&mut self, field: bool, mode: Deinterlace) -> (u32, u32, Vec<u8>) {
+        self.flush_batch();
         let (w, h, view) = self.display_view();
         if !view.field_buffer {
             return self.framebuffer();
