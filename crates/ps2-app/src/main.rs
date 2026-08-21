@@ -48,6 +48,8 @@ struct Args {
     gs_inline: bool,
     /// Interpret the EE instead of recompiling it.
     no_jit: bool,
+    /// Render internally at 2x and scan out the overlay.
+    internal_2x: bool,
     /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
@@ -96,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
         wait_debugger: false,
         gs_inline: false,
         no_jit: false,
+        internal_2x: false,
         presses: Vec::new(),
         memcard: None,
         disc: None,
@@ -136,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
             "--wait-debugger" => args.wait_debugger = true,
             "--gs-inline" => args.gs_inline = true,
             "--no-jit" => args.no_jit = true,
+            "--internal-2x" => args.internal_2x = true,
             "--press" => args
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
@@ -161,6 +165,7 @@ fn parse_args() -> Result<Args, String> {
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
                      --gs-inline      render on the emulation thread (no GS worker)\n\
                      --no-jit         interpret the EE instead of recompiling it\n\
+                     --internal-2x    render internally at 2x (sharper 3D)\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
@@ -356,6 +361,9 @@ fn run_headless(
     if shot_woven {
         sys.bus.gs.set_publish_frames(true);
         sys.bus.gs.deinterlace = ps2_core::gs::Deinterlace::Bwdif;
+    }
+    if args.internal_2x {
+        sys.bus.gs.set_internal_2x(true);
     }
 
     // Run in slices so TTY output streams out as it appears.

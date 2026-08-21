@@ -7,8 +7,11 @@
 //! format. Block tables follow the GS User's Manual (as in PCSX2's
 //! GSLocalMemory); the intra-block column layouts are the closed forms of
 //! its column tables. Buffers are addressed by block pointer `bp`, width
-//! `bw` in 64-pixel units and pixel `(x, y)`; results wrap in 4 MiB.
+//! `bw` in 64-pixel units and pixel `(x, y)`; the canvas that resolves
+//! an address wraps it to its own size (4 MiB local memory, larger for
+//! the internal-2x overlay).
 
+#[cfg(test)]
 use super::VRAM_SIZE;
 
 /// 32-bit page: 64x32 pixels, 8x4 blocks of 8x8. Also used by PSMT8H/4HL/4HH.
@@ -46,8 +49,6 @@ const BLOCK4: [[u32; 4]; 8] = BLOCK16;
 /// The Z formats use the colour tables with block bits 3 and 4 flipped.
 const Z_FLIP: u32 = 24;
 
-const BYTE_MASK: usize = VRAM_SIZE - 1;
-
 /// Byte address of a 32-bit pixel (PSMCT32/24, PSMT8H/4HL/4HH; `z` for PSMZ32/24).
 #[inline(always)]
 pub(super) fn addr32(bp: u32, bw: u32, x: u32, y: u32, z: bool) -> usize {
@@ -56,7 +57,7 @@ pub(super) fn addr32(bp: u32, bw: u32, x: u32, y: u32, z: bool) -> usize {
         .wrapping_add(((y >> 5) * bw + (x >> 6)) * 32)
         .wrapping_add(BLOCK32[((y >> 3) & 3) as usize][((x >> 3) & 7) as usize] ^ if z { Z_FLIP } else { 0 });
     let col = ((y & 7) >> 1) * 16 + ((x & 7) >> 1) * 4 + (y & 1) * 2 + (x & 1);
-    ((block as usize) * 256 + col as usize * 4) & BYTE_MASK
+    (block as usize) * 256 + col as usize * 4
 }
 
 /// Byte address of a 16-bit pixel (`s` for PSMCT16S/PSMZ16S, `z` for the Z formats).
@@ -68,7 +69,7 @@ pub(super) fn addr16(bp: u32, bw: u32, x: u32, y: u32, s: bool, z: bool) -> usiz
         .wrapping_add(((y >> 6) * bw + (x >> 6)) * 32)
         .wrapping_add(table[((y >> 3) & 7) as usize][((x >> 4) & 3) as usize] ^ if z { Z_FLIP } else { 0 });
     let col = ((y & 7) >> 1) * 32 + (y & 1) * 4 + ((x & 7) >> 1) * 8 + (x & 1) * 2 + ((x & 15) >> 3);
-    ((block as usize) * 256 + col as usize * 2) & BYTE_MASK
+    (block as usize) * 256 + col as usize * 2
 }
 
 /// Byte address of an 8-bit texel (PSMT8).
@@ -84,7 +85,7 @@ pub(super) fn addr8(bp: u32, bw: u32, x: u32, y: u32) -> usize {
     let swap = ((ry >> 1) ^ (c & 1)) & 1;
     let xs = (x & 15) ^ (swap << 2);
     let col = c * 64 + (ry & 1) * 8 + (ry >> 1) + ((xs >> 1) & 3) * 16 + (xs & 1) * 4 + (xs >> 3) * 2;
-    ((block as usize) * 256 + col as usize) & BYTE_MASK
+    (block as usize) * 256 + col as usize
 }
 
 /// Nibble address of a 4-bit texel (PSMT4): byte `>> 1`, low nibble when even.
@@ -101,7 +102,7 @@ pub(super) fn addr4(bp: u32, bw: u32, x: u32, y: u32) -> usize {
     let xs = (x & 31) ^ (swap << 2);
     let col =
         c * 128 + (ry & 1) * 16 + (ry >> 1) + ((xs >> 1) & 3) * 32 + (xs & 1) * 8 + ((xs >> 3) & 3) * 2;
-    ((block as usize) * 512 + col as usize) & (BYTE_MASK * 2 + 1)
+    (block as usize) * 512 + col as usize
 }
 
 /// Row-based 32-bit addressing for the rasterizer: a scanline's byte
@@ -234,7 +235,7 @@ mod tests {
         let mut seen = HashSet::new();
         for y in 0..ph {
             for x in 0..pw {
-                let a = f(x, y);
+                let a = f(x, y) & (VRAM_SIZE - 1);
                 assert!(a < bytes_per_page, "({x},{y}) -> {a}");
                 assert!(seen.insert(a), "({x},{y}) collides at {a}");
             }
@@ -321,7 +322,7 @@ mod tests {
             for y in [0u32, 1, 7, 8, 31, 32, 100, 447] {
                 for x in [0u32, 1, 7, 8, 63, 64, 65, 320, 639] {
                     for z in [false, true] {
-                        let want = addr32(bp, bw, x, y, z);
+                        let want = addr32(bp, bw, x, y, z) & (VRAM_SIZE - 1);
                         let got = (row_base32(bp, bw, y, z) + col_off32(y, x, z)) & (VRAM_SIZE - 1);
                         assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y} z {z}");
                     }
@@ -337,7 +338,7 @@ mod tests {
                 for x in [0u32, 1, 7, 8, 15, 16, 63, 64, 127, 511] {
                     for s in [false, true] {
                         for z in [false, true] {
-                            let want = addr16(bp, bw, x, y, s, z);
+                            let want = addr16(bp, bw, x, y, s, z) & (VRAM_SIZE - 1);
                             let got = (row_base16(bp, bw, y) + col_off16(y, x, s, z)) & (VRAM_SIZE - 1);
                             assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y} s {s} z {z}");
                         }
@@ -352,7 +353,7 @@ mod tests {
         for &(bp, bw) in &[(0u32, 10u32), (4480, 8), (4480, 10), (7840, 6)] {
             for y in [0u32, 1, 2, 3, 5, 15, 16, 63, 64, 200] {
                 for x in [0u32, 1, 4, 7, 8, 15, 16, 127, 128, 511] {
-                    let want = addr8(bp, bw, x, y);
+                    let want = addr8(bp, bw, x, y) & (VRAM_SIZE - 1);
                     let got = (row_base8(bp, bw, y) + col_off8(y, x)) & (VRAM_SIZE - 1);
                     assert_eq!(got, want, "bp {bp} bw {bw} x {x} y {y}");
                 }

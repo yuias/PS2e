@@ -85,7 +85,7 @@ impl Rows {
 /// Pixels a batch must cover before its flush is split across threads.
 pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a flush is cut into.
-pub(super) const PARALLEL_LANES: usize = 6;
+pub(super) const PARALLEL_LANES: usize = 14;
 /// Pixel estimate that triggers a batch flush on its own.
 const BATCH_MAX_PIXELS: i64 = 1 << 16;
 
@@ -101,6 +101,8 @@ struct Queued {
     prim: Prim,
     start: i32,
     end: i32,
+    /// Internal-2x twin: drawn into the overlay canvas in 2x coordinates.
+    hi: bool,
 }
 
 /// Primitives decoded and queued for one parallel rasterization pass.
@@ -211,10 +213,17 @@ impl Gs {
         if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
             // Points are rare: draw in place, keeping order with the queue.
             self.flush_batch();
-            let mut p = Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
+            let mut p = Painter {
+                canvas: &self.canvas,
+                tex: &self.canvas,
+                clut: &self.clut,
+                pipe: &pipe,
+                scratch: &mut self.scratch,
+            };
             let texel = if pipe.tme { p.sample(&frag) } else { 0 };
             let row = Row::new(&pipe, py as u32);
             p.shade_row_px(&row, px as u32, frag, texel);
+            self.mirror_rect(&pipe, px, px, py, py + 1);
         }
         self.prims_drawn += 1;
         self.merge_scratch();
@@ -238,19 +247,36 @@ impl Gs {
             prim = format_args!("{:#x}", self.prim),
             fbp = (self.ctx[((self.prim >> 9) & 1) as usize].frame & 0x1FF) * 32,
             "line");
+        let gouraud = self.prim & 8 != 0;
+        let Some((geom, start, end, px)) = Self::line_prim(&pipe, a, b, gouraud) else {
+            return;
+        };
+        self.prims_drawn += 1;
+        let queued = self.enqueue(pipe.clone(), Prim::Line(geom), start, end, px, None);
+        if let Some(p2) = self.scaled_pipe(&pipe) {
+            if !queued {
+                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, start, end);
+            } else if let Some((g2, s2, e2, px2)) =
+                Self::line_prim(&p2, Self::scale_vertex(a), Self::scale_vertex(b), gouraud)
+            {
+                self.enqueue_hi(p2, Prim::Line(g2), s2, e2, px2);
+            }
+        }
+    }
+
+    /// Line geometry and its row/pixel extent for [`Gs::enqueue`].
+    fn line_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, gouraud: bool) -> Option<(LineGeom, i32, i32, i64)> {
         let (fy0, fy1) = (a.y as f32 / 16.0, b.y as f32 / 16.0);
         let steps = ((b.x - a.x) as f32 / 16.0)
             .abs()
             .max((fy1 - fy0).abs())
             .round() as i32;
         if steps <= 0 {
-            return;
+            return None;
         }
-        self.prims_drawn += 1;
         let start = (fy0.min(fy1).floor() as i32).max(pipe.scy0);
-        let end = (fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1);
-        let geom = LineGeom { a, b, gouraud: self.prim & 8 != 0, steps };
-        self.enqueue(pipe, Prim::Line(geom), start, end.max(start), steps as i64, None);
+        let end = ((fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1)).max(start);
+        Some((LineGeom { a, b, gouraud, steps }, start, end, steps as i64))
     }
 
     /// Bring-up aid: describe each distinct render-target setup once.
@@ -368,6 +394,29 @@ impl Gs {
         if px1 - px0 <= 24 && py1 - py0 <= 24 {
             self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
         }
+        let pipe = self.pixel_pipe();
+        let (geom, rya, ryb, px, tex_v) = Self::sprite_prim(&pipe, v0, v1);
+        let queued = self.enqueue(pipe.clone(), Prim::Sprite(geom), rya, ryb, px, Some(tex_v));
+        if let Some(p2) = self.scaled_pipe(&pipe) {
+            if !queued {
+                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, rya, ryb);
+            } else {
+                let (g2, s2, e2, px2, _) =
+                    Self::sprite_prim(&p2, Self::scale_vertex(v0), Self::scale_vertex(v1));
+                self.enqueue_hi(p2, Prim::Sprite(g2), s2, e2, px2);
+            }
+        }
+    }
+
+    /// Sprite geometry and its row/pixel extent for [`Gs::enqueue`].
+    fn sprite_prim(pipe: &PixelPipe, v0: Vertex, v1: Vertex) -> (SpriteGeom, i32, i32, i64, (f32, f32)) {
+        let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
+        let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
+        // Pixel centers in 12.4: draw [x0, x1) rounding up from the left.
+        let px0 = (x0 + 15) >> 4;
+        let px1 = (x1 + 15) >> 4;
+        let py0 = (y0 + 15) >> 4;
+        let py1 = (y1 + 15) >> 4;
         // Texture coords run left-to-right / top-to-bottom regardless of
         // vertex order; color is flat from the second vertex.
         let (u0, u1, s0, s1) = if v0.x <= v1.x {
@@ -380,7 +429,6 @@ impl Gs {
         } else {
             (v1.v, v0.v, v1.t, v0.t)
         };
-        let pipe = self.pixel_pipe();
         let geom = SpriteGeom {
             x0,
             y0,
@@ -411,7 +459,7 @@ impl Gs {
             (a.min(b), a.max(b))
         };
         let px = (ryb - rya).max(0) as i64 * (geom.pxb - geom.pxa).max(0) as i64;
-        self.enqueue(pipe, Prim::Sprite(geom), rya, ryb, px, Some(tex_v));
+        (geom, rya, ryb, px, tex_v)
     }
 
     pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
@@ -428,25 +476,44 @@ impl Gs {
         if area == 0 {
             return;
         }
-        let (a, b, c, area) = if area < 0 {
-            (v0, v2, v1, -area)
+        let (a, b, c) = if area < 0 {
+            (v0, v2, v1)
         } else {
-            (v0, v1, v2, area)
+            (v0, v1, v2)
         };
         let minx = (a.x.min(b.x).min(c.x) >> 4).max(0);
-        let maxx = ((a.x.max(b.x).max(c.x) + 15) >> 4).min(2047);
+        let maxx = ((a.x.max(b.x).max(c.x) + 15) >> 4).min(4095);
         let miny = (a.y.min(b.y).min(c.y) >> 4).max(0);
-        let maxy = ((a.y.max(b.y).max(c.y) + 15) >> 4).min(2047);
+        let maxy = ((a.y.max(b.y).max(c.y) + 15) >> 4).min(4095);
         if maxx - minx <= 24 && maxy - miny <= 24 {
             self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
         }
         let pipe = self.pixel_pipe();
-        let minx = minx.max(pipe.scx0);
-        let maxx = maxx.min(pipe.scx1);
-        let miny = miny.max(pipe.scy0);
-        let maxy = maxy.min(pipe.scy1);
-        if minx > maxx || miny > maxy {
+        let Some((geom, s, e, px, tex_v)) = Self::tri_prim(&pipe, a, b, c) else {
             return;
+        };
+        let queued = self.enqueue(pipe.clone(), Prim::Tri(geom), s, e, px, Some(tex_v));
+        if let Some(p2) = self.scaled_pipe(&pipe) {
+            if !queued {
+                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, s, e);
+            } else if let Some((g2, s2, e2, px2, _)) =
+                Self::tri_prim(&p2, Self::scale_vertex(a), Self::scale_vertex(b), Self::scale_vertex(c))
+            {
+                self.enqueue_hi(p2, Prim::Tri(g2), s2, e2, px2);
+            }
+        }
+    }
+
+    /// Triangle geometry and its row/pixel extent for [`Gs::enqueue`];
+    /// `a, b, c` are already wound positive. `None` = clipped out.
+    fn tri_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, c: Vertex) -> Option<(TriGeom, i32, i32, i64, (f32, f32))> {
+        let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
+        let minx = (a.x.min(b.x).min(c.x) >> 4).max(0).max(pipe.scx0);
+        let maxx = (((a.x.max(b.x).max(c.x)) + 15) >> 4).min(4095).min(pipe.scx1);
+        let miny = (a.y.min(b.y).min(c.y) >> 4).max(0).max(pipe.scy0);
+        let maxy = (((a.y.max(b.y).max(c.y)) + 15) >> 4).min(4095).min(pipe.scy1);
+        if minx > maxx || miny > maxy {
+            return None;
         }
         // Edge functions are affine in (sx, sy): evaluate at the top-left
         // sample once and step by whole pixels (16 units) — exact in i64.
@@ -502,13 +569,15 @@ impl Gs {
             (ta.min(tb).min(tc), ta.max(tb).max(tc))
         };
         let px = (maxy - miny + 1) as i64 * (maxx - minx + 1) as i64;
-        self.enqueue(pipe, Prim::Tri(geom), miny, maxy + 1, px, Some(tex_v));
+        Some((geom, miny, maxy + 1, px, tex_v))
     }
 
     /// Queue a decoded primitive, flushing first when it would read what
-    /// the queue wrote (or, for a primitive sampling its own target, run it
-    /// inline — its result depends on draw order within itself).
-    fn enqueue(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) {
+    /// the queue wrote. A primitive sampling its own target runs inline —
+    /// its result depends on draw order within itself — and `false` is
+    /// returned so the caller mirrors the 1x result into the overlay
+    /// instead of queueing a 2x twin.
+    fn enqueue(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) -> bool {
         let tex = Self::tex_blocks(&pipe, tex_v);
         let (fb, zb) = Self::written_blocks(&pipe, end);
         if let Some(t) = &tex {
@@ -520,20 +589,84 @@ impl Gs {
             };
             if overlaps(&fb) || overlaps(&zb) {
                 self.flush_batch();
-                let mut p =
-                    Painter { canvas: &self.canvas, clut: &self.clut, pipe: &pipe, scratch: &mut self.scratch };
+                let mut p = Painter {
+                    canvas: &self.canvas,
+                    tex: &self.canvas,
+                    clut: &self.clut,
+                    pipe: &pipe,
+                    scratch: &mut self.scratch,
+                };
                 Self::run_prim(&mut p, &prim, Rows::all(start, end));
                 self.merge_scratch();
-                return;
+                return false;
             }
         }
         for r in [fb, zb].into_iter().flatten() {
             self.batch.note_write(r);
         }
         self.batch.px += px;
-        self.batch.queued.push(Queued { pipe, prim, start, end });
+        self.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
         if self.batch.px >= BATCH_MAX_PIXELS {
             self.flush_batch();
+        }
+        true
+    }
+
+    /// Queue the internal-2x twin of a primitive just queued at 1x. It
+    /// shares the queue (order among twins matches the 1x order) but skips
+    /// the dependency checks — those were decided by its 1x sibling.
+    fn enqueue_hi(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64) {
+        self.batch.px += px;
+        self.batch.queued.push(Queued { pipe, prim, start, end, hi: true });
+        if self.batch.px >= BATCH_MAX_PIXELS {
+            self.flush_batch();
+        }
+    }
+
+    /// Internal-2x: the drawing environment re-addressed in the overlay's
+    /// doubled coordinate space (`None` when the overlay is off). Texture
+    /// fields stay in 1x space — sampling reads local memory.
+    fn scaled_pipe(&self, pipe: &PixelPipe) -> Option<PixelPipe> {
+        self.overlay.as_ref()?;
+        let mut p = pipe.clone();
+        p.scx0 *= 2;
+        p.scy0 *= 2;
+        p.scx1 = p.scx1 * 2 + 1;
+        p.scy1 = p.scy1 * 2 + 1;
+        p.fbp *= 4;
+        p.zbp *= 4;
+        p.fbw *= 2;
+        Some(p)
+    }
+
+    /// A vertex in the overlay's doubled 12.4 coordinate space.
+    fn scale_vertex(v: Vertex) -> Vertex {
+        Vertex { x: v.x << 1, y: v.y << 1, ..v }
+    }
+
+    /// Copy pixels `x0..=x1` of rows `y0..y1` of the pipe's frame (and
+    /// written Z) from local memory into the overlay as 2x2 duplicates —
+    /// for primitives whose 2x twin cannot be rasterized because they
+    /// sample their own target.
+    fn mirror_rect(&mut self, pipe: &PixelPipe, x0: i32, x1: i32, y0: i32, y1: i32) {
+        let Some(ov) = &self.overlay else { return };
+        let write_z = pipe.zte && !pipe.zmsk;
+        for y in y0.max(0)..y1 {
+            for x in x0.max(0)..=x1 {
+                let (x, y) = (x as u32, y as u32);
+                if pipe.fbmsk != u32::MAX {
+                    let v = self.canvas.read_psmct32(pipe.fbp, pipe.fbw, x, y);
+                    for d in 0..4u32 {
+                        ov.write_psmct32(pipe.fbp * 4, pipe.fbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), v);
+                    }
+                }
+                if write_z {
+                    let z = self.canvas.read_psmz32(pipe.zbp, pipe.fbw, x, y);
+                    for d in 0..4u32 {
+                        ov.write_psmz32(pipe.zbp * 4, pipe.fbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), z);
+                    }
+                }
+            }
         }
     }
 
@@ -560,6 +693,7 @@ impl Gs {
         if px >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES {
             self.prims_split += queued.len() as u64;
             let canvas = &self.canvas;
+            let overlay = self.overlay.as_ref();
             let clut = &self.clut;
             let q = &queued;
             let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
@@ -567,7 +701,8 @@ impl Gs {
                 for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
                     s.spawn(move |_| {
                         for item in q {
-                            let mut p = Painter { canvas, clut, pipe: &item.pipe, scratch };
+                            let fb = if item.hi { overlay.unwrap_or(canvas) } else { canvas };
+                            let mut p = Painter { canvas: fb, tex: canvas, clut, pipe: &item.pipe, scratch };
                             let rows = Rows { start: item.start, end: item.end, lane, lanes: PARALLEL_LANES };
                             Self::run_prim(&mut p, &item.prim, rows);
                         }
@@ -589,8 +724,14 @@ impl Gs {
         }
         let _ = px;
         for item in &queued {
-            let mut p =
-                Painter { canvas: &self.canvas, clut: &self.clut, pipe: &item.pipe, scratch: &mut self.scratch };
+            let fb = if item.hi { self.overlay.as_ref().unwrap_or(&self.canvas) } else { &self.canvas };
+            let mut p = Painter {
+                canvas: fb,
+                tex: &self.canvas,
+                clut: &self.clut,
+                pipe: &item.pipe,
+                scratch: &mut self.scratch,
+            };
             Self::run_prim(&mut p, &item.prim, Rows::all(item.start, item.end));
         }
         self.merge_scratch();
@@ -709,7 +850,10 @@ impl Gs {
 
 /// Scanline rasterizer over shared VRAM with per-thread scratch.
 struct Painter<'a> {
+    /// Frame/Z target: local memory, or the internal-2x overlay.
     canvas: &'a Canvas,
+    /// Texture source: always the real local memory.
+    tex: &'a Canvas,
     clut: &'a [u32; 512],
     pipe: &'a PixelPipe,
     scratch: &'a mut Scratch,
@@ -1160,7 +1304,7 @@ impl Painter<'_> {
                 continue;
             }
             let mut out = Modulate::new(cr, cg, cb, ca, tcc).apply(texel);
-            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
+            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & canvas.mask();
             let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
             if ABE {
                 out = blend.apply(out, dst, a8);
@@ -1232,6 +1376,7 @@ impl Painter<'_> {
         row.data.clear();
         row.data.reserve((u_hi - u_lo + 1) as usize);
         let v = wrap(y, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
+        let (tex, tm) = (self.tex, self.tex.mask());
         // The row's texture line is fixed: address it as base + column
         // table for the formats the fast paths matter for.
         match ti.psm {
@@ -1239,7 +1384,7 @@ impl Painter<'_> {
                 let base = layout::row_base8(ti.tbp, ti.tbw, v);
                 for u in u_lo..=u_hi {
                     let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
-                    let idx = self.canvas.rd8((base + layout::col_off8(v, u)) & (VRAM_SIZE - 1));
+                    let idx = tex.rd8((base + layout::col_off8(v, u)) & tm);
                     row.data.push(self.clut[idx as usize]);
                 }
             }
@@ -1255,25 +1400,25 @@ impl Painter<'_> {
                     } else {
                         (0xFF_FFFF, ((ti.texa & 0xFF) as u32) << 24)
                     };
-                    let at = |u: u32| (base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1);
+                    let at = |u: u32| (base + layout::col_off32(v, u, false)) & tm;
                     let mut u = u_lo as u32;
                     if u & 1 != 0 {
-                        row.data.push((self.canvas.rd32(at(u)) & m) | or);
+                        row.data.push((tex.rd32(at(u)) & m) | or);
                         u += 1;
                     }
                     while (u + 1) as i32 <= u_hi {
-                        let pair = self.canvas.rd64(at(u));
+                        let pair = tex.rd64(at(u));
                         row.data.push((pair as u32 & m) | or);
                         row.data.push(((pair >> 32) as u32 & m) | or);
                         u += 2;
                     }
                     if u as i32 <= u_hi {
-                        row.data.push((self.canvas.rd32(at(u)) & m) | or);
+                        row.data.push((tex.rd32(at(u)) & m) | or);
                     }
                 } else {
                     for u in u_lo..=u_hi {
                         let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
-                        let px = self.canvas.rd32((base + layout::col_off32(v, u, false)) & (VRAM_SIZE - 1));
+                        let px = tex.rd32((base + layout::col_off32(v, u, false)) & tm);
                         row.data.push(match ti.psm {
                             PSMCT32 => px,
                             PSMCT24 => (px & 0xFF_FFFF) | (((ti.texa & 0xFF) as u32) << 24),
@@ -1288,15 +1433,15 @@ impl Painter<'_> {
                 let s = ti.psm == PSMCT16S;
                 let base = layout::row_base16(ti.tbp, ti.tbw, v);
                 let at =
-                    |u: u32| (base + layout::col_off16(v, u, s, false)) & (VRAM_SIZE - 1);
+                    |u: u32| (base + layout::col_off16(v, u, s, false)) & tm;
                 if wrap_identity(u_lo, u_hi, ti) {
                     for u in u_lo..=u_hi {
-                        row.data.push(expand16(self.canvas.rd16(at(u as u32)), ti.texa));
+                        row.data.push(expand16(tex.rd16(at(u as u32)), ti.texa));
                     }
                 } else {
                     for u in u_lo..=u_hi {
                         let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
-                        row.data.push(expand16(self.canvas.rd16(at(u)), ti.texa));
+                        row.data.push(expand16(tex.rd16(at(u)), ti.texa));
                     }
                 }
             }
@@ -1381,8 +1526,9 @@ impl Painter<'_> {
         let z = frag.z & pipe.zmask;
         let z_merge = pipe.zmask != u32::MAX;
         let canvas = self.canvas;
-        let fb_at = |x: i32| (row.fb_base + layout::col_off32(y, x as u32, false)) & (VRAM_SIZE - 1);
-        let z_at = |x: i32| (row.z_base + layout::col_off32(y, x as u32, true)) & (VRAM_SIZE - 1);
+        let m = canvas.mask();
+        let fb_at = |x: i32| (row.fb_base + layout::col_off32(y, x as u32, false)) & m;
+        let z_at = |x: i32| (row.z_base + layout::col_off32(y, x as u32, true)) & m;
         let put_z = |x: i32| {
             let o = z_at(x);
             if z_merge {
@@ -1425,7 +1571,7 @@ impl Painter<'_> {
             // Even x: its pair partner sits in the next word (unless the
             // pair straddles the end of VRAM).
             let o = fb_at(px);
-            if o + 8 <= VRAM_SIZE {
+            if o + 8 <= canvas.size() {
                 canvas.wr64(o, pair);
             } else {
                 canvas.wr32(o, out);
@@ -1433,7 +1579,7 @@ impl Painter<'_> {
             }
             if write_z {
                 let zo = z_at(px);
-                if z_merge || zo + 8 > VRAM_SIZE {
+                if z_merge || zo + 8 > canvas.size() {
                     put_z(px);
                     put_z(px + 1);
                 } else {
@@ -1633,7 +1779,7 @@ impl Painter<'_> {
                 continue;
             }
             let mut out = mod_lanes.apply(texel);
-            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & (VRAM_SIZE - 1);
+            let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & canvas.mask();
             let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
             if ABE {
                 out = blend.apply(out, dst, a8);
@@ -1726,8 +1872,8 @@ impl Painter<'_> {
 
         // Depth test (linear z buffer, PSMZ32-style storage).
         let zmask = pipe.zmask;
-        let z_off = (row.z_base + layout::col_off32(y, x, true)) & (VRAM_SIZE - 1);
-        let fb_off = (row.fb_base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
+        let z_off = (row.z_base + layout::col_off32(y, x, true)) & self.canvas.mask();
+        let fb_off = (row.fb_base + layout::col_off32(y, x, false)) & self.canvas.mask();
         // ZTST ALWAYS with the Z write masked touches nothing: skip the Z
         // read (every in-game sprite of Amagami draws that way).
         if pipe.zte && !(pipe.ztst == 1 && pipe.zmsk) {
@@ -1827,13 +1973,13 @@ impl Painter<'_> {
         if fx | fy == 0 {
             return self.texel(x0, y0);
         }
-        let cv = self.canvas;
+        let cv = self.tex;
         let u0 = wrap(x0, ti.wms, ti.tw, ti.minu, ti.maxu) as u32;
         let u1 = wrap(x0 + 1, ti.wms, ti.tw, ti.minu, ti.maxu) as u32;
         let v0 = wrap(y0, ti.wmt, ti.th, ti.minv, ti.maxv) as u32;
         let v1 = wrap(y0 + 1, ti.wmt, ti.th, ti.minv, ti.maxv) as u32;
         let (tbp, tbw) = (ti.tbp, ti.tbw);
-        let m = VRAM_SIZE - 1;
+        let m = cv.mask();
         let [t00, t10, t01, t11] = match ti.psm {
             PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
                 let (s, z) = (ti.psm & 8 != 0, ti.psm & 0x30 != 0);
@@ -1882,7 +2028,7 @@ impl Painter<'_> {
     #[inline(always)]
     fn texel(&self, u: i32, v: i32) -> u32 {
         let ti = &self.pipe.tex;
-        let cv = self.canvas;
+        let cv = self.tex;
         let u = wrap(u, ti.wms, ti.tw as i32, ti.minu, ti.maxu) as u32;
         let v = wrap(v, ti.wmt, ti.th as i32, ti.minv, ti.maxv) as u32;
         let (tbp, tbw) = (ti.tbp, ti.tbw);
@@ -2110,7 +2256,7 @@ impl ZTest {
     /// pixel passes and writes are enabled. Same as the generic path.
     #[inline(always)]
     fn pass(self, canvas: &Canvas, row: &Row, x: u32, z: u32) -> bool {
-        let z_off = (row.z_base + layout::col_off32(row.y, x, true)) & (VRAM_SIZE - 1);
+        let z_off = (row.z_base + layout::col_off32(row.y, x, true)) & canvas.mask();
         let zcur = canvas.rd32(z_off);
         let pass = match self.ztst {
             0 => false,
@@ -2187,6 +2333,7 @@ impl Modulate {
 }
 
 /// Drawing environment decoded once per primitive (see `pixel_pipe`).
+#[derive(Clone)]
 struct PixelPipe {
     /// Primitive kind being drawn (PRIM bits 0-2), for the pixel histogram.
     #[cfg_attr(not(feature = "profile"), allow(dead_code))]
@@ -2236,6 +2383,7 @@ struct PixelPipe {
 }
 
 /// TEX0/CLAMP fields decoded once per primitive.
+#[derive(Clone)]
 struct TexInfo {
     tex0: u64,
     tbp: u32,
@@ -2456,7 +2604,7 @@ fn floor_i32(x: f32) -> i32 {
 
 #[inline]
 fn px_clip(v: i32) -> i32 {
-    v.clamp(0, 2048)
+    v.clamp(0, 4096)
 }
 
 /// Whether [`wrap`] is the identity over the whole span `u_lo..=u_hi`,

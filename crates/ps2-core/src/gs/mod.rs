@@ -134,6 +134,13 @@ pub struct Gs {
     pool: Vec<raster::Scratch>,
     /// Decoded primitives queued for one parallel pass (see raster.rs).
     batch: raster::Batch,
+    /// Internal-2x overlay: a 4x-size shadow of local memory in the same
+    /// page/block layout at doubled coordinates (`bp*4, bw*2, x*2, y*2`).
+    /// Primitives are rasterized into it at true 2x, transfers land as 2x2
+    /// duplicates, and scanout reads it instead of local memory. Local
+    /// memory stays the source of truth for everything the emulated
+    /// software can observe.
+    overlay: Option<Canvas>,
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
     /// Per-pixel motion flags of the last composited frame (see
@@ -210,6 +217,7 @@ impl Gs {
                 Vec::new()
             },
             batch: raster::Batch::default(),
+            overlay: None,
             woven: Vec::new(),
             motion: Vec::new(),
             history: [Vec::new(), Vec::new()],
@@ -497,6 +505,7 @@ impl Gs {
             return;
         }
         let (mut x, mut y) = (self.trx_x, self.trx_y);
+        let y_first = y;
         let canvas = &self.canvas;
         match dpsm {
             PSMT8 => {
@@ -541,6 +550,14 @@ impl Gs {
         }
         self.trx_x = x;
         self.trx_y = y;
+        // Mirror the rows this run touched into the overlay (full width:
+        // duplicating from local memory is always safe).
+        if self.overlay.is_some() {
+            let y_last = if x > 0 { y } else { y.wrapping_sub(1) }.min(rrh - 1);
+            if y_last != u32::MAX && y_last >= y_first {
+                self.mirror_upload_rect(dbp, dbw, dpsm, dsax, dsay + y_first, rrw, y_last - y_first + 1);
+            }
+        }
     }
 
     /// HWREG: one 64-bit chunk of a HOST->LOCAL image transfer.
@@ -561,8 +578,10 @@ impl Gs {
         if rrw == 0 {
             return;
         }
-        // Consume the 64 bits as pixels in raster order.
-        fn push(gs: &mut Gs, count: u32, mut write: impl FnMut(&mut Gs, u32, u32, u32), data: u64, bits: u32) {
+        // Consume the 64 bits as pixels in raster order. The writer takes
+        // (canvas, bp, bw, x, y, px) so the same closure lands the pixel in
+        // local memory and, scaled, its 2x2 duplicate in the overlay.
+        fn push(gs: &mut Gs, count: u32, write: impl Fn(&Canvas, u32, u32, u32, u32, u32), data: u64, bits: u32, dbp: u32, dbw: u32) {
             let dsax = ((gs.trxpos >> 32) & 0x7FF) as u32;
             let dsay = ((gs.trxpos >> 48) & 0x7FF) as u32;
             let rrw = (gs.trxreg & 0xFFF) as u32;
@@ -572,7 +591,13 @@ impl Gs {
                     return;
                 }
                 let px = (data >> (i * bits)) as u32 & (((1u64 << bits) - 1) as u32);
-                write(gs, dsax + gs.trx_x, dsay + gs.trx_y, px);
+                let (x, y) = (dsax + gs.trx_x, dsay + gs.trx_y);
+                write(&gs.canvas, dbp, dbw, x, y, px);
+                if let Some(ov) = &gs.overlay {
+                    for d in 0..4u32 {
+                        write(ov, dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
+                    }
+                }
                 gs.trx_x += 1;
                 if gs.trx_x >= rrw {
                     gs.trx_x = 0;
@@ -584,16 +609,20 @@ impl Gs {
             PSMCT32 => push(
                 self,
                 2,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct32(dbp, dbw, x, y, px),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmct32(bp, bw, x, y, px),
                 v,
                 32,
+                dbp,
+                dbw,
             ),
             PSMZ32 => push(
                 self,
                 2,
-                move |gs: &mut Gs, x, y, px| gs.write_psmz32(dbp, dbw, x, y, px),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmz32(bp, bw, x, y, px),
                 v,
                 32,
+                dbp,
+                dbw,
             ),
             PSMCT24 => {
                 // Packed stream, 3 bytes per pixel with no 64-bit alignment:
@@ -611,7 +640,13 @@ impl Gs {
                     let px = u32::from(self.trx24[0])
                         | u32::from(self.trx24[1]) << 8
                         | u32::from(self.trx24[2]) << 16;
-                    self.write_psmct32(dbp, dbw, dsax + self.trx_x, dsay + self.trx_y, px);
+                    let (x, y) = (dsax + self.trx_x, dsay + self.trx_y);
+                    self.write_psmct32(dbp, dbw, x, y, px);
+                    if let Some(ov) = &self.overlay {
+                        for d in 0..4u32 {
+                            ov.write_psmct32(dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
+                        }
+                    }
                     self.trx_x += 1;
                     if self.trx_x >= rrw {
                         self.trx_x = 0;
@@ -622,46 +657,58 @@ impl Gs {
             PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => push(
                 self,
                 4,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct16(dbp, dbw, x, y, dpsm, px as u16),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmct16(bp, bw, x, y, dpsm, px as u16),
                 v,
                 16,
+                dbp,
+                dbw,
             ),
             PSMT8 => push(
                 self,
                 8,
-                move |gs: &mut Gs, x, y, px| gs.write_psmt8(dbp, dbw, x, y, px as u8),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmt8(bp, bw, x, y, px as u8),
                 v,
                 8,
+                dbp,
+                dbw,
             ),
             PSMT4 => push(
                 self,
                 16,
-                move |gs: &mut Gs, x, y, px| gs.write_psmt4(dbp, dbw, x, y, px as u8),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmt4(bp, bw, x, y, px as u8),
                 v,
                 4,
+                dbp,
+                dbw,
             ),
             // Index-in-upper-bits formats share the 32-bit pixel's storage
             // and leave its colour bits alone.
             PSMT8H => push(
                 self,
                 8,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0xFF00_0000),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmct32_bits(bp, bw, x, y, px << 24, 0xFF00_0000),
                 v,
                 8,
+                dbp,
+                dbw,
             ),
             PSMT4HL => push(
                 self,
                 16,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 24, 0x0F00_0000),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmct32_bits(bp, bw, x, y, px << 24, 0x0F00_0000),
                 v,
                 4,
+                dbp,
+                dbw,
             ),
             PSMT4HH => push(
                 self,
                 16,
-                move |gs: &mut Gs, x, y, px| gs.write_psmct32_bits(dbp, dbw, x, y, px << 28, 0xF000_0000),
+                |cv: &Canvas, bp, bw, x, y, px| cv.write_psmct32_bits(bp, bw, x, y, px << 28, 0xF000_0000),
                 v,
                 4,
+                dbp,
+                dbw,
             ),
             _ => {
                 if self.warned_trx_psm & (1 << dpsm) == 0 {
@@ -721,6 +768,7 @@ impl Gs {
                 }
             }
         }
+        self.mirror_upload_rect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
 
     // --- VRAM accessors (see `Canvas`) -----------------------------------
@@ -729,6 +777,60 @@ impl Gs {
     pub fn vram_snapshot(&mut self) -> Box<[u8]> {
         self.flush_batch();
         self.canvas.to_vec()
+    }
+
+    /// Turn the internal-2x overlay on or off. It starts black and fills
+    /// in as buffers are redrawn or uploaded (typically within a frame).
+    pub fn set_internal_2x(&mut self, on: bool) {
+        if on == self.overlay.is_some() {
+            return;
+        }
+        self.flush_batch();
+        self.overlay = on.then(|| Canvas::with_size(4 * VRAM_SIZE));
+    }
+
+    pub fn internal_2x(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Mirror a just-written rect of local memory into the overlay as 2x2
+    /// duplicates (IMAGE uploads and local copies; `psm` names the
+    /// destination format).
+    fn mirror_upload_rect(&self, bp: u32, bw: u32, psm: u32, x0: u32, y0: u32, w: u32, h: u32) {
+        let Some(ov) = &self.overlay else { return };
+        let (bp2, bw2) = (bp * 4, bw * 2);
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let dup = |f: &dyn Fn(u32, u32)| {
+                    for d in 0..4u32 {
+                        f(2 * x + (d & 1), 2 * y + (d >> 1));
+                    }
+                };
+                match psm {
+                    PSMCT32 | PSMCT24 => {
+                        let v = self.canvas.read_psmct32(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmct32(bp2, bw2, xx, yy, v));
+                    }
+                    PSMZ32 | PSMZ24 => {
+                        let v = self.canvas.read_psmz32(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmz32(bp2, bw2, xx, yy, v));
+                    }
+                    PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                        let v = self.canvas.read_psmct16(bp, bw, x, y, psm);
+                        dup(&|xx, yy| ov.write_psmct16(bp2, bw2, xx, yy, psm, v));
+                    }
+                    PSMT8 => {
+                        let v = self.canvas.read_psmt8(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmt8(bp2, bw2, xx, yy, v));
+                    }
+                    PSMT4 => {
+                        let v = self.canvas.read_psmt4(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmt4(bp2, bw2, xx, yy, v));
+                    }
+                    _ => return,
+                }
+            }
+        }
     }
 
     #[inline]
@@ -783,6 +885,8 @@ impl Gs {
     pub fn framebuffer(&mut self) -> (u32, u32, Vec<u8>) {
         self.flush_batch();
         let (w, h, view) = self.display_view();
+        let s = self.scanout().1;
+        let (w, h) = (w * s, h * s);
         let mut out = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             let sy = if view.field_buffer { y / 2 } else { y };
@@ -797,14 +901,20 @@ impl Gs {
     /// game's half-line field offset as a 30 Hz shake.
     pub fn framebuffer_woven(&mut self, field: bool, mode: Deinterlace) -> (u32, u32, Vec<u8>) {
         self.flush_batch();
-        let (w, h, view) = self.display_view();
+        let (w1, h1, view) = self.display_view();
         if !view.field_buffer {
             return self.framebuffer();
         }
-        if w == 0 || h < 2 {
+        if w1 == 0 || h1 < 2 {
             // Nothing displayable yet (DISPLAY not programmed).
-            return (w, h, vec![0u8; (w * h * 4) as usize]);
+            return (w1, h1, vec![0u8; (w1 * h1 * 4) as usize]);
         }
+        // At display scale sc the frame is sc*w1 x sc*h1 physical pixels;
+        // hardware line y (of h1) covers physical rows sc*y+k. Each fixed
+        // k slices a standard interlaced frame of h1 rows, so the weave
+        // and the deinterlacers run per sub-image k with a strided view.
+        let sc = self.scanout().1;
+        let (w, h) = (w1 * sc, h1 * sc);
         if self.woven_dims != (w, h) {
             self.woven = vec![0u8; (w * h * 4) as usize];
             self.motion = vec![0u8; (w * h) as usize];
@@ -820,7 +930,8 @@ impl Gs {
         // ago, which is exactly what those rows held until now.
         let mut line = vec![0u8; stride];
         for sy in 0..h / 2 {
-            let y = sy * 2 + field as u32;
+            // Physical field row sy = hardware field line sy/sc, sub sy%sc.
+            let y = sc * (2 * (sy / sc) + field as u32) + sy % sc;
             self.scan_line(&view, sy, &mut line);
             let row = &mut woven[y as usize * stride..][..stride];
             if matches!(mode, Deinterlace::Yadif | Deinterlace::Bwdif) {
@@ -866,11 +977,17 @@ impl Gs {
                     let y0 = band * rows_per_band;
                     for (i, row) in out_band.chunks_mut(stride).enumerate() {
                         let y = (y0 + i) as u32;
-                        if (y & 1 != 0) == missing {
+                        let (j, k) = (y / sc, y % sc);
+                        if (j & 1 != 0) == missing {
+                            let sv = SubView {
+                                base: k as usize * stride,
+                                pitch: sc as usize * stride,
+                                len: stride,
+                            };
                             if mode == Deinterlace::Yadif {
-                                Self::yadif_row(&woven, &history, row, w, h, y, missing);
+                                Self::yadif_row(&woven, &history, row, w, h1, j, missing, sv);
                             } else {
-                                Self::bwdif_row(&woven, &history, row, w, h, y, missing);
+                                Self::bwdif_row(&woven, &history, row, w, h1, j, missing, sv);
                             }
                         }
                     }
@@ -891,7 +1008,8 @@ impl Gs {
             }
             Deinterlace::Blend => {
                 for y in 0..h {
-                    let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+                    let (j, k) = (y / sc, y % sc);
+                    let (ya, yb) = (sc * j.saturating_sub(1) + k, sc * (j + 1).min(h1 - 1) + k);
                     let (ra, rc, rb) = (
                         &woven[ya as usize * stride..][..stride],
                         &woven[y as usize * stride..][..stride],
@@ -905,16 +1023,22 @@ impl Gs {
             }
             Deinterlace::Bob => {
                 // Only the new field is real: rebuild the other rows from it.
-                for y in (0..h).filter(|y| (y & 1 != 0) != field) {
-                    Self::interpolate_row(&woven, &mut out, w, h, y, None);
+                for y in (0..h).filter(|y| ((y / sc) & 1 != 0) != field) {
+                    let (j, k) = (y / sc, y % sc);
+                    let sv = SubView { base: k as usize * stride, pitch: sc as usize * stride, len: stride };
+                    let mv = (k as usize * w as usize, sc as usize * w as usize);
+                    Self::interpolate_row(&woven, &mut out, w, h1, j, None, sv, mv);
                 }
             }
             Deinterlace::Adaptive | Deinterlace::AdaptiveDebug => {
                 // Keep the old field where nothing moved, rebuild from the
                 // new one where it did, mixing by the motion weight.
                 let debug = mode == Deinterlace::AdaptiveDebug;
-                for y in (0..h).filter(|y| (y & 1 != 0) != field) {
-                    Self::interpolate_row(&woven, &mut out, w, h, y, Some((&motion, debug)));
+                for y in (0..h).filter(|y| ((y / sc) & 1 != 0) != field) {
+                    let (j, k) = (y / sc, y % sc);
+                    let sv = SubView { base: k as usize * stride, pitch: sc as usize * stride, len: stride };
+                    let mv = (k as usize * w as usize, sc as usize * w as usize);
+                    Self::interpolate_row(&woven, &mut out, w, h1, j, Some((&motion, debug)), sv, mv);
                 }
             }
         }
@@ -934,27 +1058,26 @@ impl Gs {
     /// and `woven` (after); the shown field's previous instance is
     /// `history[!missing]`. Without a look-ahead field the "next" term of
     /// the motion estimate is dropped.
-    fn yadif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool) {
-        let stride = (w * 4) as usize;
+    fn yadif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool, sv: SubView) {
         let wmax = w as usize - 1;
         let hmax = h - 1;
         // Rows beyond the edges mirror, which keeps their field parity.
-        fn rowof(buf: &[u8], yy: i64, hmax: u32, stride: usize) -> &[u8] {
+        fn rowof(buf: &[u8], yy: i64, hmax: u32, sv: SubView) -> &[u8] {
             let yy = if yy < 0 { -yy } else if yy > hmax as i64 { 2 * hmax as i64 - yy } else { yy };
             let yy = yy.clamp(0, hmax as i64) as usize;
-            &buf[yy * stride..][..stride]
+            &buf[sv.base + yy * sv.pitch..][..sv.len]
         }
         let y = y as i64;
         // Rows of the shown field around the missing one, and its own row in
         // the fields before and after.
-        let (cm1, cp1) = (rowof(woven, y - 1, hmax, stride), rowof(woven, y + 1, hmax, stride));
+        let (cm1, cp1) = (rowof(woven, y - 1, hmax, sv), rowof(woven, y + 1, hmax, sv));
         let prev2 = &history[missing as usize];
         let (p0, pm2, pp2) =
-            (rowof(prev2, y, hmax, stride), rowof(prev2, y - 2, hmax, stride), rowof(prev2, y + 2, hmax, stride));
+            (rowof(prev2, y, hmax, sv), rowof(prev2, y - 2, hmax, sv), rowof(prev2, y + 2, hmax, sv));
         let (n0, nm2, np2) =
-            (rowof(woven, y, hmax, stride), rowof(woven, y - 2, hmax, stride), rowof(woven, y + 2, hmax, stride));
+            (rowof(woven, y, hmax, sv), rowof(woven, y - 2, hmax, sv), rowof(woven, y + 2, hmax, sv));
         let prev = &history[!missing as usize];
-        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, stride), rowof(prev, y + 1, hmax, stride));
+        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, sv), rowof(prev, y + 1, hmax, sv));
         let interior = 3..(w as usize).saturating_sub(3);
         for x in 0..w as usize {
             let xi = x as i64;
@@ -1023,18 +1146,18 @@ impl Gs {
     /// The outermost rows fall back to plain averaging, as in ffmpeg.
     /// Without a look-ahead field the "next" term of the motion estimate
     /// is dropped (one field of display latency, like yadif here).
-    fn bwdif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool) {
+    fn bwdif_row(woven: &[u8], history: &[Vec<u8>; 2], row: &mut [u8], w: u32, h: u32, y: u32, missing: bool, sv: SubView) {
         // 13-bit fixed-point coefficients from ffmpeg's bwdifdsp.c.
         const LF: [i32; 2] = [4309, 213];
         const HF: [i32; 3] = [5570, 3801, 1016];
         const SP: [i32; 2] = [5077, 981];
-        let stride = (w * 4) as usize;
+        let _ = w;
         let hmax = h - 1;
         // Rows beyond the edges mirror, which keeps their field parity.
-        fn rowof(buf: &[u8], yy: i64, hmax: u32, stride: usize) -> &[u8] {
+        fn rowof(buf: &[u8], yy: i64, hmax: u32, sv: SubView) -> &[u8] {
             let yy = if yy < 0 { -yy } else if yy > hmax as i64 { 2 * hmax as i64 - yy } else { yy };
             let yy = yy.clamp(0, hmax as i64) as usize;
-            &buf[yy * stride..][..stride]
+            &buf[sv.base + yy * sv.pitch..][..sv.len]
         }
         // ffmpeg runs the simpler edge filter on the outermost rows, and on
         // the very first/last pair skips even its spatial clamp.
@@ -1044,18 +1167,18 @@ impl Gs {
         // Rows of the shown field around the missing one, the missing
         // parity's fields before (`p*`) and after (`n*`) at y and y±2/±4,
         // and the shown field's previous instance around y.
-        let (cm1, cp1) = (rowof(woven, y - 1, hmax, stride), rowof(woven, y + 1, hmax, stride));
-        let (cm3, cp3) = (rowof(woven, y - 3, hmax, stride), rowof(woven, y + 3, hmax, stride));
+        let (cm1, cp1) = (rowof(woven, y - 1, hmax, sv), rowof(woven, y + 1, hmax, sv));
+        let (cm3, cp3) = (rowof(woven, y - 3, hmax, sv), rowof(woven, y + 3, hmax, sv));
         let prev2 = &history[missing as usize];
         let (p0, pm2, pp2) =
-            (rowof(prev2, y, hmax, stride), rowof(prev2, y - 2, hmax, stride), rowof(prev2, y + 2, hmax, stride));
-        let (pm4, pp4) = (rowof(prev2, y - 4, hmax, stride), rowof(prev2, y + 4, hmax, stride));
+            (rowof(prev2, y, hmax, sv), rowof(prev2, y - 2, hmax, sv), rowof(prev2, y + 2, hmax, sv));
+        let (pm4, pp4) = (rowof(prev2, y - 4, hmax, sv), rowof(prev2, y + 4, hmax, sv));
         let (n0, nm2, np2) =
-            (rowof(woven, y, hmax, stride), rowof(woven, y - 2, hmax, stride), rowof(woven, y + 2, hmax, stride));
-        let (nm4, np4) = (rowof(woven, y - 4, hmax, stride), rowof(woven, y + 4, hmax, stride));
+            (rowof(woven, y, hmax, sv), rowof(woven, y - 2, hmax, sv), rowof(woven, y + 2, hmax, sv));
+        let (nm4, np4) = (rowof(woven, y - 4, hmax, sv), rowof(woven, y + 4, hmax, sv));
         let prev = &history[!missing as usize];
-        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, stride), rowof(prev, y + 1, hmax, stride));
-        for x in 0..w as usize {
+        let (pvm1, pvp1) = (rowof(prev, y - 1, hmax, sv), rowof(prev, y + 1, hmax, sv));
+        for x in 0..sv.len / 4 {
             for ch in 0..3 {
                 let i = x * 4 + ch;
                 let at = |r: &[u8]| i32::from(r[i]);
@@ -1105,15 +1228,15 @@ impl Gs {
     /// row and its neighbours (adaptive). Rebuilt pixels use edge-directed
     /// interpolation (the best-matching of five directions between the
     /// rows, as in yadif's spatial predictor) so diagonals do not stair.
-    fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<(&[u8], bool)>) {
-        let stride = (w * 4) as usize;
+    fn interpolate_row(woven: &[u8], out: &mut [u8], w: u32, h: u32, y: u32, motion: Option<(&[u8], bool)>, sv: SubView, mv: (usize, usize)) {
         let above = y.saturating_sub(1);
         let below = (y + 1).min(h - 1);
         // Edge rows have one real neighbour only.
         let (above, below) = if y == 0 { (below, below) } else if y == h - 1 { (above, above) } else { (above, below) };
-        let (ra, rb) = (&woven[above as usize * stride..][..stride], &woven[below as usize * stride..][..stride]);
-        let cur = &woven[y as usize * stride..][..stride];
-        let row = &mut out[y as usize * stride..][..stride];
+        let at = |j: u32| sv.base + j as usize * sv.pitch;
+        let (ra, rb) = (&woven[at(above)..][..sv.len], &woven[at(below)..][..sv.len]);
+        let cur = &woven[at(y)..][..sv.len];
+        let row = &mut out[at(y)..][..sv.len];
         let wmax = w as usize - 1;
         fn px(r: &[u8], x: usize) -> &[u8] {
             &r[x * 4..x * 4 + 3]
@@ -1122,7 +1245,8 @@ impl Gs {
             let weight = match motion {
                 None => 255u32,
                 Some((m, _)) => {
-                    let wgt = m[(above * w) as usize + x].max(m[(below * w) as usize + x]).max(m[(y * w) as usize + x]);
+                    let mat = |j: u32| mv.0 + j as usize * mv.1 + x;
+                    let wgt = m[mat(above)].max(m[mat(below)]).max(m[mat(y)]);
                     if wgt == 0 {
                         continue;
                     }
@@ -1193,18 +1317,29 @@ impl Gs {
         (w, h & !1, view)
     }
 
-    /// Read one displayed line (`sy` in buffer lines) as RGBA8 into `out`.
-    fn scan_line(&self, v: &DisplayView, sy: u32, out: &mut [u8]) {
+    /// The canvas scanout reads and the display scale it implies: the
+    /// overlay at 2x when present, else local memory at 1x.
+    fn scanout(&self) -> (&Canvas, u32) {
+        match &self.overlay {
+            Some(ov) => (ov, 2),
+            None => (&self.canvas, 1),
+        }
+    }
+
+    /// Read one displayed line (`sy` in buffer lines, already scaled) as
+    /// RGBA8 into `out`, from `canvas` addressed by the (possibly
+    /// overlay-scaled) buffer geometry.
+    fn scan_row(canvas: &Canvas, fbp: u32, fbw: u32, psm: u32, x0: u32, y: u32, out: &mut [u8]) {
         let w = out.len() as u32 / 4;
-        if matches!(v.psm, PSMCT32 | PSMCT24) && v.dbx == 0 {
+        if matches!(psm, PSMCT32 | PSMCT24) && x0 == 0 {
             // Common scanout: even x and its neighbour share an aligned
             // 8-byte column pair, so the row moves as u64 loads.
-            let y = v.dby + sy;
-            let base = layout::row_base32(v.fbp, v.fbw, y, false);
+            let base = layout::row_base32(fbp, fbw, y, false);
+            let m = canvas.mask();
             let mut x = 0u32;
             while x + 1 < w {
-                let o = (base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
-                let pair = self.canvas.rd64(o);
+                let o = (base + layout::col_off32(y, x, false)) & m;
+                let pair = canvas.rd64(o);
                 let (p0, p1) = (pair as u32, (pair >> 32) as u32);
                 let d = (x * 4) as usize;
                 out[d..d + 4].copy_from_slice(&(p0 | 0xFF00_0000).to_le_bytes());
@@ -1212,20 +1347,20 @@ impl Gs {
                 x += 2;
             }
             if x < w {
-                let o = (base + layout::col_off32(y, x, false)) & (VRAM_SIZE - 1);
-                let px = self.canvas.rd32(o) | 0xFF00_0000;
+                let o = (base + layout::col_off32(y, x, false)) & m;
+                let px = canvas.rd32(o) | 0xFF00_0000;
                 out[(x * 4) as usize..][..4].copy_from_slice(&px.to_le_bytes());
             }
             return;
         }
         for x in 0..w {
-            let (r, g, b) = match v.psm {
+            let (r, g, b) = match psm {
                 PSMCT32 | PSMCT24 => {
-                    let px = self.read_psmct32(v.fbp, v.fbw, v.dbx + x, v.dby + sy);
+                    let px = canvas.read_psmct32(fbp, fbw, x0 + x, y);
                     (px as u8, (px >> 8) as u8, (px >> 16) as u8)
                 }
                 PSMCT16 | PSMCT16S => {
-                    let px = self.read_psmct16(v.fbp, v.fbw, v.dbx + x, v.dby + sy, v.psm);
+                    let px = canvas.read_psmct16(fbp, fbw, x0 + x, y, psm);
                     (
                         ((px & 0x1F) << 3) as u8,
                         (((px >> 5) & 0x1F) << 3) as u8,
@@ -1241,6 +1376,13 @@ impl Gs {
             out[o + 3] = 255;
         }
     }
+
+    /// Read displayed line `sy` (in buffer lines at display scale) into
+    /// `out`, honoring the internal-2x overlay.
+    fn scan_line(&self, v: &DisplayView, sy: u32, out: &mut [u8]) {
+        let (canvas, s) = self.scanout();
+        Self::scan_row(canvas, v.fbp * s * s, v.fbw * s, v.psm, v.dbx * s, v.dby * s + sy, out);
+    }
 }
 
 /// One decoded texture row: RGBA8 texels `u_lo..` of row `key.1` of the
@@ -1250,6 +1392,17 @@ pub(super) struct TexRow {
     pub key: (u64, i32),
     pub u_lo: i32,
     pub data: Vec<u32>,
+}
+
+/// A strided view of the rows of one deinterlace sub-image inside a
+/// physical frame: logical row `j` starts at byte `base + j * pitch` and
+/// is `len` bytes wide. At display scale 1 this is the whole frame
+/// (`base 0, pitch == len`).
+#[derive(Clone, Copy)]
+struct SubView {
+    base: usize,
+    pitch: usize,
+    len: usize,
 }
 
 /// How interlaced field buffers are shown (see [`Gs::framebuffer_woven`]).

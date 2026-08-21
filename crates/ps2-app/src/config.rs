@@ -38,6 +38,11 @@ deinterlace = "bwdif"
 # output looks line-swapped or bobs by a whole line.
 swap_fields = false
 
+# Render internally at 2x resolution: 3D geometry gets true 2x edges,
+# textures and video stay at their native size. Costs roughly 5x the GS
+# pixel work.
+internal_2x = false
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -52,6 +57,7 @@ pub struct Config {
     pub scaler: crate::display::ScaleMode,
     pub deinterlace: DeinterlaceSetting,
     pub swap_fields: bool,
+    pub internal_2x: bool,
 }
 
 /// Config/UI form of [`ps2_core::gs::Deinterlace`].
@@ -115,6 +121,7 @@ impl Default for Config {
             scaler: crate::display::ScaleMode::Sharp,
             deinterlace: DeinterlaceSetting::Bwdif,
             swap_fields: false,
+            internal_2x: false,
         }
     }
 }

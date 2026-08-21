@@ -78,6 +78,8 @@ enum Cmd {
     Vram(std::sync::mpsc::SyncSender<Box<[u8]>>),
     /// Reply with the statistics.
     Stats(std::sync::mpsc::SyncSender<Stats>),
+    /// Turn the internal-2x overlay on or off.
+    Internal2x(bool),
 }
 
 /// Flush a batch to the worker once it holds this many commands.
@@ -128,6 +130,8 @@ pub struct GsFront {
     pub deinterlace: super::Deinterlace,
     /// Flip which rows each field lands on (see `vblank`).
     pub swap_fields: bool,
+    /// EE-side copy of the internal-2x switch (commands are sent on change).
+    internal_2x: bool,
 }
 
 impl Default for GsFront {
@@ -212,6 +216,7 @@ impl GsFront {
             publish_frames: false,
             deinterlace: super::Deinterlace::default(),
             swap_fields: false,
+            internal_2x: false,
         }
     }
 
@@ -234,6 +239,7 @@ impl GsFront {
             Cmd::Stats(reply) => {
                 let _ = reply.send(Stats::of(gs));
             }
+            Cmd::Internal2x(on) => gs.set_internal_2x(on),
         }
     }
 
@@ -275,6 +281,16 @@ impl GsFront {
     }
 
     /// Composite the display at every vblank (for a live front-end).
+    /// Render internally at 2x and scan out the overlay (see
+    /// [`super::Gs::set_internal_2x`]).
+    pub fn set_internal_2x(&mut self, on: bool) {
+        if self.internal_2x == on {
+            return;
+        }
+        self.internal_2x = on;
+        self.push(Cmd::Internal2x(on));
+    }
+
     pub fn set_publish_frames(&mut self, on: bool) {
         self.publish_frames = on;
     }

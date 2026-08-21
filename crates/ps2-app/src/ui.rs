@@ -52,6 +52,7 @@ pub struct App {
     scale_mode: crate::display::ScaleMode,
     deinterlace: crate::config::DeinterlaceSetting,
     swap_fields: bool,
+    internal_2x: bool,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
     config: Config,
@@ -70,6 +71,7 @@ impl App {
             scale_mode: config.scaler,
             deinterlace: config.deinterlace,
             swap_fields: config.swap_fields,
+            internal_2x: config.internal_2x,
             volume,
             config,
             config_path,
@@ -111,12 +113,14 @@ impl Drop for App {
             && ((self.config.volume - self.volume).abs() > f32::EPSILON
                 || self.config.scaler != self.scale_mode
                 || self.config.deinterlace != self.deinterlace
-                || self.config.swap_fields != self.swap_fields)
+                || self.config.swap_fields != self.swap_fields
+                || self.config.internal_2x != self.internal_2x)
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
             self.config.deinterlace = self.deinterlace;
             self.config.swap_fields = self.swap_fields;
+            self.config.internal_2x = self.internal_2x;
             self.config.save(path);
         }
     }
@@ -137,6 +141,7 @@ impl eframe::App for App {
             .store(self.volume.to_bits(), Ordering::Relaxed);
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
         self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
+        self.emu.shared.internal_2x.store(self.internal_2x, Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
         let debugger_active = self.emu.shared.debugger_active.load(Ordering::Relaxed);
@@ -200,6 +205,8 @@ impl eframe::App for App {
                             ui.radio_value(&mut self.deinterlace, mode, mode.label());
                         }
                         ui.checkbox(&mut self.swap_fields, "Swap field order");
+                        ui.separator();
+                        ui.checkbox(&mut self.internal_2x, "Internal 2x resolution");
                         ui.separator();
                         ui.checkbox(&mut self.show_tty, "TTY panel");
                         ui.checkbox(&mut self.show_regs, "Registers panel");

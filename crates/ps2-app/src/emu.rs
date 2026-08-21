@@ -101,6 +101,8 @@ pub struct Shared {
     pub deinterlace: std::sync::atomic::AtomicU8,
     /// Flip which rows each field lands on (UI -> worker).
     pub swap_fields: AtomicBool,
+    /// Render internally at 2x (UI -> worker).
+    pub internal_2x: AtomicBool,
     /// Debugger attached/halted (set by the worker) drives UI enablement.
     pub debugger_active: AtomicBool,
 }
@@ -233,6 +235,7 @@ impl Worker {
             self.sys.bus.sio2.buttons = self.shared.buttons.load(Ordering::Relaxed);
             self.sys.bus.gs.deinterlace = deinterlace_mode(self.shared.deinterlace.load(Ordering::Relaxed));
             self.sys.bus.gs.swap_fields = self.shared.swap_fields.load(Ordering::Relaxed);
+            self.sys.bus.gs.set_internal_2x(self.shared.internal_2x.load(Ordering::Relaxed));
 
             // While a debugger is attached (or awaited) it owns execution.
             let mut worked = false;
