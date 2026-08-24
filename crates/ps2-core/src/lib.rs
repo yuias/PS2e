@@ -292,6 +292,17 @@ impl Ps2System {
                 n -= 1;
                 continue;
             }
+            // Groups carrying nothing but their IOP slot run as one loop.
+            // Only the idle-EE wake-up is left out, and it is a no-op with
+            // the EE running.
+            if !self.ee.idle {
+                let g = self.quiet_iop_groups(n / EE_PER_IOP);
+                if g > 0 {
+                    self.run_iop_groups(g);
+                    n -= g * EE_PER_IOP;
+                    continue;
+                }
+            }
             self.machine_cycle();
             n -= 1;
             // Cycles 1..7 of the group can only see a vblank edge.
@@ -308,6 +319,48 @@ impl Ps2System {
                 }
                 n -= EE_PER_IOP - 1;
             }
+        }
+    }
+
+    /// How many whole IOP groups from a group-aligned `self.cycles` carry
+    /// nothing but their IOP slot: no timer tick that is due and no vblank
+    /// edge. Both land on group starts (the tick cadence and the frame
+    /// edges are multiples of [`EE_PER_IOP`]), so counting groups is exact.
+    #[inline]
+    fn quiet_iop_groups(&self, limit: u64) -> u64 {
+        let vbl_start = EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+        // An edge on the current cycle is `machine_cycle`'s to fire.
+        if self.frame_pos == 0 || self.frame_pos == vbl_start {
+            return 0;
+        }
+        let to_vblank = if self.frame_pos < vbl_start {
+            vbl_start - self.frame_pos
+        } else {
+            EE_CYCLES_PER_FRAME - self.frame_pos
+        };
+        let due = self.bus.timers_due.max(self.cycles);
+        let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
+        (to_timer / EE_PER_IOP).min(to_vblank / EE_PER_IOP).min(limit)
+    }
+
+    /// `g` IOP slots, [`EE_PER_IOP`] cycles apart, with nothing else due.
+    fn run_iop_groups(&mut self, g: u64) {
+        let _guard = prof::scope(prof::Slot::Iop);
+        for _ in 0..g {
+            self.bus.now = self.cycles;
+            // Same idle-loop skip as `machine_cycle`.
+            if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
+                self.iop.idle = false;
+                self.iop.step(&mut self.bus);
+            }
+            self.cycles += EE_PER_IOP;
+            self.frame_pos += EE_PER_IOP;
+        }
+        // The batch may end exactly on the frame edge; `machine_cycle`
+        // recognises the vblank-end edge by a wrapped position, not by the
+        // frame length.
+        if self.frame_pos == EE_CYCLES_PER_FRAME {
+            self.frame_pos = 0;
         }
     }
 
