@@ -190,9 +190,9 @@ impl Cpu {
     /// recognised — the caller must then let [`Cpu::step`] finish the
     /// pending delay slot before continuing at `pc`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(super) fn exec_at(&mut self, bus: &mut Bus, addr: u32, instr: u32) -> bool {
+    pub(super) fn exec_at(&mut self, bus: &mut Bus, addr: u32, instr: u32, in_delay: bool) -> bool {
         self.current_pc = addr;
-        self.in_delay = false;
+        self.in_delay = in_delay;
         self.next_is_delay = false;
         self.pc = addr.wrapping_add(4);
         self.next_pc = addr.wrapping_add(8);

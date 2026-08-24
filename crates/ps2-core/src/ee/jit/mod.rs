@@ -243,9 +243,11 @@ impl Jit {
             // its head. Decided on the instruction words alone, exactly as
             // the interpreter does, so both worlds charge the same cycles.
             let free = addr & 7 == 4 && prev.is_some_and(|p| super::issue::dual_issue(p, instr));
-            // A control-flow instruction in the delay slot is undefined
-            // behaviour on MIPS; leave such branches to the interpreter.
-            let mut emitted = if is_control_flow(instr) && is_control_flow(next) {
+            // A branch in a delay slot is undefined behaviour on MIPS;
+            // leave those to the interpreter. An exception-raising slot
+            // (the `beql $x,$0,+1; break` divide guard) is fine: the
+            // fallback call diverts and ends the block by itself.
+            let mut emitted = if is_control_flow(instr) && is_branch(next) {
                 emit::Emitted::Interp
             } else {
                 emit::emit(&mut ops, addr, instr)
@@ -262,7 +264,7 @@ impl Jit {
                     emit::emit_likely_skip(&mut ops, ds_addr.wrapping_add(4), cycles, &mut exits);
                 }
                 if let emit::Emitted::Interp = emit::emit(&mut ops, ds_addr, next) {
-                    emit_interp(&mut ops, ds_addr, next, cycles + 1, &mut interp_exits);
+                    emit_interp(&mut ops, ds_addr, next, cycles + 1, true, &mut interp_exits);
                 }
                 count += 1;
                 cycles += 1;
@@ -275,7 +277,7 @@ impl Jit {
                 cycles += 1;
             }
             if let emit::Emitted::Interp = emitted {
-                emit_interp(&mut ops, addr, instr, cycles, &mut interp_exits);
+                emit_interp(&mut ops, addr, instr, cycles, false, &mut interp_exits);
                 emitted = emit::Emitted::Plain;
             }
             let _ = emitted;
@@ -361,16 +363,19 @@ impl Jit {
 }
 
 /// Call the interpreter for one instruction; exit the block with
-/// `retired` cycles if it diverted control.
+/// `retired` cycles if it diverted control. `delay` marks a delay slot, so
+/// an exception raised there reports the branch as its EPC.
 fn emit_interp(
     ops: &mut emit::Ops,
     addr: u32,
     instr: u32,
     retired: u32,
+    delay: bool,
     exits: &mut Vec<(dynasmrt::DynamicLabel, u32)>,
 ) {
     let exit = ops.new_dynamic_label();
-    emit_call4(ops, interp_one as *const () as usize, addr, instr);
+    let f = if delay { interp_delay_one } else { interp_one };
+    emit_call4(ops, f as *const () as usize, addr, instr);
     dynasm!(ops
         ; .arch x64
         ; test eax, eax
@@ -393,37 +398,60 @@ fn is_idle_loop(bus: &mut Bus, addr: u32, instr: u32, delay_slot: u32) -> bool {
     (target..addr).step_by(4).all(|a| bus.fetch32(a) == 0)
 }
 
-/// Instructions after which a block must end: anything that may change PC
-/// other than by falling through.
-fn is_control_flow(instr: u32) -> bool {
+/// Instructions that set the PC themselves, delay slot and all.
+fn is_branch(instr: u32) -> bool {
     let rs = (instr >> 21) & 0x1F;
     match instr >> 26 {
-        // SPECIAL: jr, jalr, syscall, break, traps.
-        0x00 => matches!(instr & 0x3F, 0x08 | 0x09 | 0x0C | 0x0D | 0x30..=0x36),
-        // REGIMM branches (0x00-0x03, 0x10-0x13); j/jal, beq..bgtz, likely.
+        // SPECIAL: jr, jalr.
+        0x00 => matches!(instr & 0x3F, 0x08 | 0x09),
+        // REGIMM branches (0x00-0x03, 0x10-0x13).
         0x01 => matches!((instr >> 16) & 0x1F, 0x00..=0x03 | 0x10..=0x13),
+        // j/jal, beq..bgtz and the likely forms.
         0x02..=0x07 | 0x14..=0x17 => true,
-        // COP0: bc0 and the TLB/eret group. mtc0 and ei/di are translated
-        // in place; an interrupt they unmask waits for the block to end,
-        // within the latency the chain budget already allows.
-        0x10 => rs == 0x08 || (matches!(rs, 0x10..=0x1F) && !matches!(instr & 0x3F, 0x38 | 0x39)),
+        // COP0 bc0 and eret.
+        0x10 => rs == 0x08 || (matches!(rs, 0x10..=0x1F) && instr & 0x3F == 0x18),
         // COP1 bc1, COP2 bc2.
         0x11 | 0x12 => rs == 0x08,
         _ => false,
     }
 }
 
+/// Instructions after which a block must end: anything that may change PC
+/// other than by falling through.
+fn is_control_flow(instr: u32) -> bool {
+    let rs = (instr >> 21) & 0x1F;
+    is_branch(instr)
+        || match instr >> 26 {
+            // SPECIAL: syscall, break, traps.
+            0x00 => matches!(instr & 0x3F, 0x0C | 0x0D | 0x30..=0x36),
+            // The COP0 TLB group. mtc0 and ei/di are translated in place;
+            // an interrupt they unmask waits for the block to end, within
+            // the latency the chain budget already allows.
+            0x10 => matches!(rs, 0x10..=0x1F) && !matches!(instr & 0x3F, 0x18 | 0x38 | 0x39),
+            _ => false,
+        }
+}
+
 // --- helpers called from generated code ----------------------------------
+
+/// [`interp_one`] for an instruction sitting in a branch's delay slot.
+extern "C" fn interp_delay_one(cpu: *mut Cpu, bus: *mut Bus, addr: u32, instr: u32) -> u32 {
+    interp(cpu, bus, addr, instr, true)
+}
 
 /// Run one instruction through the interpreter as if fetched at `addr`.
 /// Returns 1 when control was diverted (see [`Cpu::exec_at`]).
 extern "C" fn interp_one(cpu: *mut Cpu, bus: *mut Bus, addr: u32, instr: u32) -> u32 {
+    interp(cpu, bus, addr, instr, false)
+}
+
+fn interp(cpu: *mut Cpu, bus: *mut Bus, addr: u32, instr: u32, in_delay: bool) -> u32 {
     // Panics must not unwind through the native frames.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the dispatcher passes live, exclusively owned pointers
         // for the duration of the block call.
         let (cpu, bus) = unsafe { (&mut *cpu, &mut *bus) };
-        cpu.exec_at(bus, addr, instr)
+        cpu.exec_at(bus, addr, instr, in_delay)
     }));
     match r {
         Ok(diverted) => diverted as u32,
