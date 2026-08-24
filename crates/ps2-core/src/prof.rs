@@ -219,7 +219,16 @@ pub fn count_ee(pc: u32, instr: u32) {
     #[cfg(feature = "profile")]
     {
         let op = instr >> 26;
-        let key = if op == 0 || op == 0x1C { (op << 6) | (instr & 0x3F) } else { op << 6 };
+        // COP0 splits by rs (mfc0/mtc0/bc0); its CO forms (eret, ei/di,
+        // the TLB group) land in the unused COP3 slot so they stay apart.
+        let key = match op {
+            0 | 0x1C => (op << 6) | (instr & 0x3F),
+            0x10 => match (instr >> 21) & 0x1F {
+                rs @ 0..=0x0F => (op << 6) | rs,
+                _ => (0x13 << 6) | (instr & 0x3F),
+            },
+            _ => op << 6,
+        };
         OPS[key as usize].fetch_add(1, Ordering::Relaxed);
         if pc & 0x1E00_0000 == 0 {
             pcs()[((pc & 0x1FF_FFFF) >> 2) as usize].fetch_add(1, Ordering::Relaxed);
@@ -275,7 +284,7 @@ pub fn report() -> Option<String> {
             PARTS[2].load(Ordering::Relaxed) as f64 / n,
             PARTS[3].load(Ordering::Relaxed) as f64 / n,
         ));
-        out.push_str("EE instruction mix (op<<6|funct for SPECIAL/MMI):
+        out.push_str("EE instruction mix (op<<6|funct for SPECIAL/MMI/COP0-CO, op<<6|rs for COP0):
 ");
         for (k, n) in ops.iter().take(24) {
             out.push_str(&format!("  {:#05x} {:5.1}%
