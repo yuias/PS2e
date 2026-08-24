@@ -11,9 +11,9 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-/// Keyboard -> digital pad mapping. egui's `Key` enum has no Shift variant
-/// (shift is tracked as a modifier, not a key), so SELECT binds to Backspace
-/// only.
+/// Keyboard -> digital pad mapping: face buttons on S/D/X/Z laid out like
+/// the pad (square left, triangle up, circle right, cross down), shoulders
+/// on the row above, and the d-pad on the arrow keys.
 const KEYMAP: [(egui::Key, u16); 16] = [
     (egui::Key::ArrowUp, pad::UP),
     (egui::Key::ArrowDown, pad::DOWN),
@@ -21,16 +21,16 @@ const KEYMAP: [(egui::Key, u16); 16] = [
     (egui::Key::ArrowRight, pad::RIGHT),
     (egui::Key::Z, pad::CROSS),
     (egui::Key::X, pad::CIRCLE),
-    (egui::Key::C, pad::SQUARE),
-    (egui::Key::V, pad::TRIANGLE),
-    (egui::Key::Q, pad::L1),
-    (egui::Key::W, pad::R1),
+    (egui::Key::S, pad::SQUARE),
+    (egui::Key::D, pad::TRIANGLE),
+    (egui::Key::W, pad::L1),
     (egui::Key::E, pad::L2),
-    (egui::Key::R, pad::R2),
+    (egui::Key::R, pad::R1),
+    (egui::Key::U, pad::R2),
     (egui::Key::Num1, pad::L3),
     (egui::Key::Num3, pad::R3),
-    (egui::Key::Enter, pad::START),
-    (egui::Key::Backspace, pad::SELECT),
+    (egui::Key::V, pad::START),
+    (egui::Key::C, pad::SELECT),
 ];
 
 /// MIPS GPR names, index-aligned with `Cpu::gpr` (shared by EE and IOP).
