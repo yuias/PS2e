@@ -2543,6 +2543,22 @@ impl Bus {
         self.iop_write::<4>(vaddr, v)
     }
 
+    /// Instruction fetch. Code only ever runs from IOP RAM or the BIOS, so
+    /// those two are read directly and everything else defers to the full
+    /// [`Bus::iop_read32`] dispatch.
+    #[inline]
+    pub fn iop_fetch32(&mut self, vaddr: u32) -> u32 {
+        let addr = vaddr & 0x1FFF_FFFF;
+        let (mem, off) = if addr < 0x0080_0000 {
+            (&self.iop_ram, (addr & 0x1F_FFFF) as usize)
+        } else if addr >= 0x1FC0_0000 {
+            (&self.bios, (addr & 0x3F_FFFF) as usize)
+        } else {
+            return self.iop_read32(vaddr);
+        };
+        u32::from_le_bytes(mem[off..off + 4].try_into().unwrap())
+    }
+
     pub fn iop_irq_pending(&self) -> bool {
         self.iop_i_ctrl & 1 != 0 && (self.iop_i_stat & self.iop_i_mask) != 0
     }

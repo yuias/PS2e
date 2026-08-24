@@ -178,7 +178,7 @@ impl Cpu {
         self.current_pc = self.pc;
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;
-        let instr = bus.iop_read32(self.pc);
+        let instr = bus.iop_fetch32(self.pc);
         crate::prof::count_iop(self.pc);
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
