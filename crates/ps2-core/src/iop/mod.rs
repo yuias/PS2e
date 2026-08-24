@@ -164,6 +164,12 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) {
         if self.interrupt_pending(bus) {
+            // A load issued before the interrupt still writes back: the
+            // handler's first instruction sees the loaded value, as on the
+            // R3000, rather than the stale register.
+            if let Some((reg, v)) = self.pending_load.take() {
+                self.gpr[reg] = v;
+            }
             self.cop0[CAUSE] = (self.cop0[CAUSE] & !0xFF) | (1 << 10);
             self.in_delay = self.next_is_delay;
             self.current_pc = self.pc;
@@ -478,6 +484,29 @@ mod tests {
         ]);
         step_iop(&mut sys, 5);
         assert_eq!(sys.iop.gpr[9], 0x77);
+    }
+
+    #[test]
+    fn interrupt_completes_the_pending_load() {
+        // BEV is still set at reset, so the handler lives at 0xBFC00180;
+        // the gap is zero-filled (nop).
+        let mut code = [0u32; 0x61];
+        code[..4].copy_from_slice(&[
+            0x3C01_0000, // lui $at, 0
+            0x2408_0055, // addiu $t0, $0, 0x55
+            0xAC28_0000, // sw $t0, 0($at)
+            0x8C29_0000, // lw $t1, 0($at)  (load still in flight)
+        ]);
+        code[0x60] = 0x0009_5021; // addu $t2, $0, $t1
+        let mut sys = iop_system(&code);
+        sys.iop.cop0[super::STATUS] |= super::STATUS_IEC | (1 << 10);
+        step_iop(&mut sys, 4);
+
+        sys.bus.iop_i_stat = 1;
+        sys.bus.iop_i_mask = 1;
+        sys.bus.iop_i_ctrl = 1;
+        step_iop(&mut sys, 1);
+        assert_eq!(sys.iop.gpr[10], 0x55);
     }
 
     #[test]
