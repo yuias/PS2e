@@ -28,6 +28,7 @@ assets/
 
 # Claude Code
 .claude/
+CLAUDE.local.md
 
 # Local bring-up artifacts
 dumps/
