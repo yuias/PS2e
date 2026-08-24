@@ -403,9 +403,10 @@ fn is_control_flow(instr: u32) -> bool {
         // REGIMM branches (0x00-0x03, 0x10-0x13); j/jal, beq..bgtz, likely.
         0x01 => matches!((instr >> 16) & 0x1F, 0x00..=0x03 | 0x10..=0x13),
         0x02..=0x07 | 0x14..=0x17 => true,
-        // COP0: bc0, the TLB/eret group, and mtc0 (Status/Cause writes may
-        // unmask an interrupt: end the block so it is taken promptly).
-        0x10 => matches!(rs, 0x04 | 0x08 | 0x10..=0x1F),
+        // COP0: bc0 and the TLB/eret group. mtc0 and ei/di are translated
+        // in place; an interrupt they unmask waits for the block to end,
+        // within the latency the chain budget already allows.
+        0x10 => rs == 0x08 || (matches!(rs, 0x10..=0x1F) && !matches!(instr & 0x3F, 0x38 | 0x39)),
         // COP1 bc1, COP2 bc2.
         0x11 | 0x12 => rs == 0x08,
         _ => false,

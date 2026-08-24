@@ -15,6 +15,19 @@ pub extern "C" fn cop0_read(cpu: *mut Cpu, bus: *mut Bus, rd: u32) -> u32 {
     }
 }
 
+/// mtc0: the register file's own write rules (read-only PRId, the
+/// partially writable Cause) live in [`crate::ee::cop0`].
+pub extern "C" fn cop0_write(cpu: *mut Cpu, rd: u32, v: u32) {
+    // SAFETY: see module docs.
+    unsafe { (*cpu).cop0.write(rd as usize, v) }
+}
+
+/// ei / di.
+pub extern "C" fn cop0_set_eie(cpu: *mut Cpu, enable: u32) {
+    // SAFETY: see module docs.
+    unsafe { (*cpu).cop0.set_eie(enable != 0) }
+}
+
 /// MMI (128-bit multimedia) instruction, straight to the interpreter's
 /// handler: none of them divert control.
 pub extern "C" fn mmi(cpu: *mut Cpu, instr: u32) {

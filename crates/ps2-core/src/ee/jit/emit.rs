@@ -56,6 +56,9 @@ pub fn next_pc_off() -> i32 {
 pub fn idle_off() -> i32 {
     offset_of!(Cpu, idle) as i32
 }
+fn sa_off() -> i32 {
+    offset_of!(Cpu, sa) as i32
+}
 fn fpu_cond_off() -> i32 {
     (offset_of!(Cpu, fpu) + offset_of!(Fpu, condition)) as i32
 }
@@ -149,7 +152,9 @@ pub fn emit(ops: &mut Ops, addr: u32, instr: u32) -> Emitted {
         0x28..=0x2B | 0x3F | 0x39 => "store",
         0x1E | 0x1F | 0x36 | 0x3E => "quad",
         0x11 => "cop1",
-        0x10 if rs == 0 => "cop0",
+        // mfc0 / mtc0 and the ei/di pair; eret and the TLB group divert or
+        // touch state the translator does not model, so they fall back.
+        0x10 if rs == 0 || rs == 4 || (rs >= 0x10 && matches!(instr & 0x3F, 0x38 | 0x39)) => "cop0",
         0x12 if rs != 0x08 => "cop2",
         0x1C => "mmi",
         0x2F => "imm", // cache: no-op
@@ -162,10 +167,25 @@ pub fn emit(ops: &mut Ops, addr: u32, instr: u32) -> Emitted {
         0x00 => emit_special(ops, addr, instr, rs, rt, rd, sa),
         0x01 => emit_regimm(ops, addr, instr, rs, rt, branch_target),
         0x11 => emit_cop1(ops, instr, rs, rt, rd, sa as u32, branch_target),
-        // mfc0
         0x10 => {
-            call_cpu_bus_arg(ops, h::cop0_read as *const () as usize, rd);
-            store32(ops, rt);
+            match rs {
+                // mfc0
+                0 => {
+                    call_cpu_bus_arg(ops, h::cop0_read as *const () as usize, rd);
+                    store32(ops, rt);
+                }
+                // mtc0
+                4 => {
+                    dynasm!(ops ; .arch x64 ; mov eax, DWORD [rbx + gpr(rt)]);
+                    call_cpu_arg_eax(ops, h::cop0_write as *const () as usize, rd);
+                }
+                // ei / di
+                _ => call_cpu_arg(
+                    ops,
+                    h::cop0_set_eie as *const () as usize,
+                    (instr & 0x3F == 0x38) as u32,
+                ),
+            }
             Emitted::Plain
         }
         // COP2 macro ops (not bc2): the interpreter's handler, without the
@@ -552,6 +572,21 @@ fn emit_special(ops: &mut Ops, addr: u32, instr: u32, rs: u32, rt: u32, rd: u32,
                 _ => dynasm!(ops ; .arch x64 ; sar eax, cl),
             }
             store32(ops, rd);
+            Emitted::Plain
+        }
+        // mfsa / mtsa
+        0x28 => {
+            dynasm!(ops ; .arch x64 ; mov eax, DWORD [rbx + sa_off()]);
+            store64(ops, rd);
+            Emitted::Plain
+        }
+        0x29 => {
+            if rs == 0 {
+                dynasm!(ops ; .arch x64 ; xor eax, eax);
+            } else {
+                dynasm!(ops ; .arch x64 ; mov eax, DWORD [rbx + gpr(rs)]);
+            }
+            dynasm!(ops ; .arch x64 ; mov DWORD [rbx + sa_off()], eax);
             Emitted::Plain
         }
         // jr / jalr
@@ -1070,6 +1105,29 @@ fn call_cpu_bus_arg(ops: &mut Ops, f: usize, arg: u32) {
         ; mov rdi, rbx
         ; mov rsi, r12
         ; mov edx, arg as i32
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, QWORD f as i64
+        ; call rax
+    );
+}
+
+/// Call `f(cpu, arg, eax)`.
+fn call_cpu_arg_eax(ops: &mut Ops, f: usize, arg: u32) {
+    #[cfg(windows)]
+    dynasm!(ops
+        ; .arch x64
+        ; mov r8d, eax
+        ; mov rcx, rbx
+        ; mov edx, arg as i32
+    );
+    #[cfg(not(windows))]
+    dynasm!(ops
+        ; .arch x64
+        ; mov edx, eax
+        ; mov rdi, rbx
+        ; mov esi, arg as i32
     );
     dynasm!(ops
         ; .arch x64
