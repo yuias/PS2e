@@ -3,6 +3,8 @@
 //! Offsets are halfword addresses relative to ESA and rotate with the
 //! buffer position, wrapping inside the area.
 
+use std::sync::LazyLock;
+
 /// Reverb register snapshot for one core, as halfword offsets and 16-bit
 /// signed coefficients.
 #[derive(Clone, Copy, Default)]
@@ -50,16 +52,62 @@ const V_APF2: usize = 7;
 const V_LIN: usize = 8;
 const V_RIN: usize = 9;
 
-#[derive(Clone, Copy, Default)]
+/// Length of the resampling filter between the output rate and the
+/// reverb's own half rate, one in each direction.
+const FIR_TAPS: usize = 39;
+/// Ring capacity for the filter histories (a power of two >= FIR_TAPS,
+/// and >= FIR_TAPS / 2 for the half-rate side).
+const HIST: usize = 64;
+
+/// Resampling filter for the reverb path. The hardware runs the reverb at
+/// half the output rate behind a 39-tap FIR in each direction (19 samples
+/// of group delay each way); the coefficients themselves are not
+/// published, so this is a Blackman-windowed sinc of the same length,
+/// cutting off at the half-rate Nyquist. What matters audibly is that the
+/// input is band-limited before it is decimated and that the output is
+/// interpolated rather than held: a plain two-tap average and a
+/// sample-and-hold leave audible aliasing and images behind.
+static FIR: LazyLock<[i32; FIR_TAPS]> = LazyLock::new(|| {
+    use std::f64::consts::PI;
+    let mut h = [0f64; FIR_TAPS];
+    let mid = (FIR_TAPS / 2) as f64;
+    for (i, v) in h.iter_mut().enumerate() {
+        let n = i as f64 - mid;
+        let sinc = if n == 0.0 { 0.5 } else { (PI * n * 0.5).sin() / (PI * n) };
+        let x = 2.0 * PI * i as f64 / (FIR_TAPS - 1) as f64;
+        *v = sinc * (0.42 - 0.5 * x.cos() + 0.08 * (2.0 * x).cos());
+    }
+    // 15-bit weights with unity DC gain, so decimation preserves level.
+    let scale = 32768.0 / h.iter().sum::<f64>();
+    h.map(|v| (v * scale).round() as i32)
+});
+
+#[derive(Clone, Copy)]
 pub struct Reverb {
     /// Rotating offset into the work area.
     pos: u32,
-    /// The algorithm runs every other sample; the even sample's input is
-    /// held here and averaged with the odd one.
+    /// The algorithm runs every other sample.
     phase: bool,
-    held: [i32; 2],
-    /// Last computed output, repeated for the in-between sample.
-    out: [i32; 2],
+    /// Wet input at the output rate, for the decimating filter.
+    input: [[i32; HIST]; 2],
+    /// Reverb output at the half rate, for the interpolating filter.
+    half: [[i32; HIST]; 2],
+    /// Write positions in the two rings.
+    in_pos: usize,
+    half_pos: usize,
+}
+
+impl Default for Reverb {
+    fn default() -> Self {
+        Self {
+            pos: 0,
+            phase: false,
+            input: [[0; HIST]; 2],
+            half: [[0; HIST]; 2],
+            in_pos: 0,
+            half_pos: 0,
+        }
+    }
 }
 
 fn mul(a: i32, v: i32) -> i32 {
@@ -74,15 +122,46 @@ impl Reverb {
     /// Feed one sample pair of wet input; returns the reverb output for
     /// this sample (before EVOL).
     pub fn sample(&mut self, ram: &mut [u8], regs: &ReverbRegs, lin: i32, rin: i32) -> [i32; 2] {
-        if self.phase {
-            let l = (self.held[0] + lin) >> 1;
-            let r = (self.held[1] + rin) >> 1;
-            self.out = self.step(ram, regs, l, r);
-        } else {
-            self.held = [lin, rin];
+        self.in_pos = (self.in_pos + 1) % HIST;
+        self.input[0][self.in_pos] = lin;
+        self.input[1][self.in_pos] = rin;
+        // A half-rate step lands on every other output sample; that sample
+        // is the one the interpolator sees at zero phase.
+        let aligned = self.phase;
+        if aligned {
+            let l = self.decimate(0);
+            let r = self.decimate(1);
+            let out = self.step(ram, regs, l, r);
+            self.half_pos = (self.half_pos + 1) % HIST;
+            self.half[0][self.half_pos] = out[0];
+            self.half[1][self.half_pos] = out[1];
         }
         self.phase = !self.phase;
-        self.out
+        [self.interpolate(0, !aligned), self.interpolate(1, !aligned)]
+    }
+
+    /// Band-limit the wet input and take it down to the reverb's rate.
+    fn decimate(&self, c: usize) -> i32 {
+        let mut acc = 0i64;
+        for (k, &h) in FIR.iter().enumerate() {
+            acc += i64::from(h) * i64::from(self.input[c][(self.in_pos + HIST - k) % HIST]);
+        }
+        sat((acc >> 15) as i32)
+    }
+
+    /// Interpolate the half-rate output back up. Only every other tap sees
+    /// a sample (the rest of the zero-stuffed stream is zero), and the
+    /// extra factor of two makes up for those zeros.
+    fn interpolate(&self, c: usize, odd: bool) -> i32 {
+        let mut acc = 0i64;
+        let mut k = usize::from(odd);
+        let mut j = 0;
+        while k < FIR_TAPS {
+            acc += i64::from(FIR[k]) * i64::from(self.half[c][(self.half_pos + HIST - j) % HIST]);
+            k += 2;
+            j += 1;
+        }
+        sat((acc >> 14) as i32)
     }
 
     fn step(&mut self, ram: &mut [u8], regs: &ReverbRegs, lin: i32, rin: i32) -> [i32; 2] {
@@ -184,9 +263,10 @@ mod tests {
             peak = peak.max(out[0].abs());
         }
         // mLSAME is written at offset 0x200 and read back by the comb at
-        // 0x1F0 (16 halfwords earlier): 16 reverb steps = 32 samples,
-        // plus the 2-sample decimation.
-        assert!(matches!(first_nonzero, Some(30..=36)), "{first_nonzero:?}");
+        // 0x1F0 (16 halfwords earlier): 16 reverb steps = 32 samples, plus
+        // the resampling filters' group delay (19 samples each way, and
+        // their leading skirt reaches the output before the centre does).
+        assert!(matches!(first_nonzero, Some(50..=60)), "{first_nonzero:?}");
         assert!(peak > 0x100 && peak < 0x8000, "{peak:#x}");
         let tail = rv.sample(&mut ram, &regs, 0, 0);
         assert!(tail[0].abs() < 0x100, "{tail:?}");
