@@ -91,26 +91,41 @@ impl App {
         }
     }
 
-    /// Pick a disc image and boot it. The OSD does not notice a disc that
-    /// arrives while it is running, so the drive change is paired with a
-    /// power cycle — the same path as starting with `--disc`.
+    /// Swap the disc the way the console does: the drive opens, the file
+    /// picker comes up, and the drive closes on whatever was picked —
+    /// cancelling puts the old disc back. Emulation never stops, so a
+    /// multi-disc title can change discs where it asks you to.
     fn insert_disc(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        self.emu.send(Command::OpenTray);
+        let disc = self.pick_disc();
+        self.emu.send(Command::CloseTray(disc));
+    }
+
+    /// Put a disc in and power-cycle onto it, the way the console boots one
+    /// that is already in the drive. Needed from the browser, which does
+    /// not notice a disc arriving while it runs.
+    fn boot_disc(&mut self) {
+        if let Some(disc) = self.pick_disc() {
+            self.emu.send(Command::BootDisc(Some(disc)));
+        }
+    }
+
+    /// File picker; `None` on cancel or on a file that will not open.
+    fn pick_disc(&mut self) -> Option<std::fs::File> {
+        let path = rfd::FileDialog::new()
             .add_filter("PlayStation 2 disc image", &["iso", "img", "bin"])
-            .pick_file()
-        else {
-            return;
-        };
+            .pick_file()?;
         match std::fs::File::open(&path) {
             Ok(f) => {
                 self.disc_error = None;
-                tracing::info!(path = %path.display(), "disc inserted");
-                self.emu.send(Command::InsertDisc(Some(f)));
+                tracing::info!(path = %path.display(), "disc loaded");
+                Some(f)
             }
             Err(e) => {
                 let msg = format!("cannot open {}: {e}", path.display());
                 tracing::error!("{msg}");
                 self.disc_error = Some(msg);
+                None
             }
         }
     }
@@ -224,11 +239,21 @@ impl eframe::App for App {
                             if ui
                                 .button("Insert disc...")
                                 .on_hover_text(
-                                    "pick a disc image and boot it; the console restarts,                                      since the browser does not pick up a disc while running",
+                                    "opens the drive and closes it on the new image;                                      swapping mid-game works, no reset needed",
                                 )
                                 .clicked()
                             {
                                 self.insert_disc();
+                                ui.close();
+                            }
+                            if ui
+                                .button("Boot disc...")
+                                .on_hover_text(
+                                    "power-cycle onto a disc; use this from the browser,                                      which does not notice one arriving while it runs",
+                                )
+                                .clicked()
+                            {
+                                self.boot_disc();
                                 ui.close();
                             }
                         });

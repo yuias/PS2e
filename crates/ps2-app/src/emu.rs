@@ -33,8 +33,13 @@ pub enum Command {
     SetRunning(bool),
     Step,
     Reset,
-    /// Put a disc in the drive (`None` empties it) and boot it.
-    InsertDisc(Option<std::fs::File>),
+    /// Open the drive. Whatever was in it is held until the tray closes.
+    OpenTray,
+    /// Close the drive on a disc; `None` puts back the one that came out,
+    /// so a cancelled pick changes nothing.
+    CloseTray(Option<std::fs::File>),
+    /// Put a disc in the drive and power-cycle onto it.
+    BootDisc(Option<std::fs::File>),
     Quit,
 }
 
@@ -184,6 +189,9 @@ struct Worker {
     audio: Option<Audio>,
     running: bool,
     debugger_seen: bool,
+    /// Disc taken out while the drive is open, put back if the pick that
+    /// opened it is cancelled.
+    removed: Option<std::fs::File>,
     /// Wall-clock pacer (only used when no audio device exists).
     clock: Instant,
     deficit: f64,
@@ -212,6 +220,7 @@ impl Worker {
             // wants the reset vector uses --wait-debugger.
             running: true,
             debugger_seen: false,
+            removed: None,
             clock: now,
             deficit: 0.0,
             last_frame_publish: now,
@@ -280,14 +289,24 @@ impl Worker {
                     let disc = self.sys.bus.cdvd.disc.take();
                     self.power_cycle(disc);
                 }
-                Command::InsertDisc(disc) if !debugger_active => {
+                Command::OpenTray if !debugger_active => {
+                    self.removed = self.sys.bus.cdvd.open_tray();
+                }
+                Command::CloseTray(disc) if !debugger_active => {
+                    let disc = disc.or_else(|| self.removed.take());
+                    self.sys.bus.cdvd.close_tray(disc, self.sys.cycles);
+                    self.removed = None;
+                }
+                Command::BootDisc(disc) if !debugger_active => {
                     self.power_cycle(disc);
                     self.running = true;
                 }
                 Command::SetRunning(_)
                 | Command::Step
                 | Command::Reset
-                | Command::InsertDisc(_) => {}
+                | Command::OpenTray
+                | Command::CloseTray(_)
+                | Command::BootDisc(_) => {}
                 Command::Quit => return false,
             }
         }
