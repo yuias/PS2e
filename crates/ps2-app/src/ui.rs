@@ -5,7 +5,7 @@
 //! is deliberate — a wasm frontend could reuse the same snapshot types.
 
 use crate::config::Config;
-use crate::emu::{Command, DebuggerState, Emu};
+use crate::emu::{Command, DebuggerState, Disc, Emu};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -27,6 +27,9 @@ fn resolve_keymap(keys: &crate::config::KeyBindings) -> Vec<(egui::Key, u16)> {
         })
         .collect()
 }
+
+/// Window title with no disc in the drive; an inserted one is appended.
+pub const WINDOW_TITLE: &str = "PS2e";
 
 /// Pad button names, index-aligned with [`crate::config::KeyBindings::pairs`],
 /// for listing the bindings in the Help menu.
@@ -69,6 +72,9 @@ pub struct App {
     disc_error: Option<String>,
     hotkey_save: Option<egui::Key>,
     hotkey_load: Option<egui::Key>,
+    /// Window title last sent to the viewport, so it is only pushed on a
+    /// change rather than every frame.
+    title: String,
 }
 
 impl App {
@@ -94,6 +100,7 @@ impl App {
             disc_error: None,
             hotkey_save,
             hotkey_load,
+            title: WINDOW_TITLE.to_string(),
         }
     }
 
@@ -116,15 +123,15 @@ impl App {
     }
 
     /// File picker; `None` on cancel or on a file that will not open.
-    fn pick_disc(&mut self) -> Option<std::fs::File> {
+    fn pick_disc(&mut self) -> Option<Disc> {
         let path = rfd::FileDialog::new()
             .add_filter("PlayStation 2 disc image", &["iso", "img", "bin"])
             .pick_file()?;
-        match std::fs::File::open(&path) {
-            Ok(f) => {
+        match Disc::open(&path) {
+            Ok(disc) => {
                 self.disc_error = None;
                 tracing::info!(path = %path.display(), "disc loaded");
-                Some(f)
+                Some(disc)
             }
             Err(e) => {
                 let msg = format!("cannot open {}: {e}", path.display());
@@ -197,7 +204,19 @@ impl eframe::App for App {
         self.emu.shared.internal_2x.store(self.internal_2x, Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
+        let disc = self.emu.shared.disc.lock().unwrap().clone();
         let debugger_active = self.emu.shared.debugger_active.load(Ordering::Relaxed);
+
+        // A PS2 disc carries no printable title, so the boot serial stands in
+        // for one; the file name covers images the serial cannot be read from.
+        let title = match &disc {
+            Some(d) => format!("{WINDOW_TITLE} - {}", d.serial.as_deref().unwrap_or(&d.name)),
+            None => WINDOW_TITLE.to_string(),
+        };
+        if title != self.title {
+            self.title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
 
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             self.take_screenshot();
@@ -361,6 +380,10 @@ impl eframe::App for App {
                     ));
                     ui.separator();
                     ui.monospace(format!("cycles {}", status.cycles));
+                    if let Some(d) = &disc {
+                        ui.separator();
+                        ui.monospace(format!("disc {}", d.name));
+                    }
                     if let Some(path) = &self.last_screenshot {
                         ui.separator();
                         ui.monospace(format!("saved {path}"));

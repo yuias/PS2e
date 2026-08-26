@@ -177,6 +177,15 @@ impl Cdvd {
         self.tray_open
     }
 
+    /// The boot serial of the disc in the drive, formatted the way it is
+    /// printed on the disc ("SLPS-25418"). `None` when the drive is empty
+    /// or the image has no readable ISO9660 SYSTEM.CNF.
+    pub fn boot_serial(&mut self) -> Option<String> {
+        let s = self.disc_serial()?;
+        let text = std::str::from_utf8(&s).ok()?;
+        Some(format!("{}-{}", &text[..4], &text[4..]))
+    }
+
     /// Take the disc and the NVRAM file location from `live`: a save state
     /// does not carry either, so a restored drive keeps what is physically
     /// in it.

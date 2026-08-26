@@ -21,7 +21,7 @@ mod state;
 mod ui;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ps2_core::Ps2System;
@@ -299,7 +299,11 @@ fn main() -> ExitCode {
         match std::fs::File::open(path) {
             Ok(f) => {
                 sys.bus.cdvd.disc = Some(f);
-                tracing::info!(path = %path, "disc image attached");
+                tracing::info!(
+                    path = %path,
+                    serial = sys.bus.cdvd.boot_serial().unwrap_or_default(),
+                    "disc image attached"
+                );
             }
             Err(e) => {
                 eprintln!("error: cannot open disc '{path}': {e}");
@@ -365,13 +369,14 @@ fn run_windowed(
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_title("PS2e"),
+            .with_title(ui::WINDOW_TITLE),
         ..Default::default()
     };
     let wait_debugger = args.wait_debugger;
+    let disc_name = args.disc.as_deref().map(|p| emu::disc_name(Path::new(p)));
     let state_path = cfg.state_path(cfg_path.as_ref());
     let result = eframe::run_native(
-        "PS2e",
+        ui::WINDOW_TITLE,
         options,
         Box::new(move |cc| {
             let worker_cfg = emu::WorkerConfig {
@@ -379,6 +384,7 @@ fn run_windowed(
                 nvram_path: Some(nvram_path),
                 memcard_path,
                 state_path,
+                disc_name,
                 debugger,
                 wait_debugger,
                 volume: cfg.volume,

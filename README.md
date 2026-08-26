@@ -47,6 +47,10 @@ internal 2x rendering and the debug panels — TTY console and CPU registers,
 both hidden by default. Audio holds the master volume, and Help lists the
 current key bindings.
 
+The status bar names the image in the drive, and the window title carries the
+disc's boot serial ("PS2e - SLPS-25418"): a PS2 disc has no printable game
+title on it, so the serial stands in for one.
+
 | Keys | |
 |---|---|
 | Arrows | D-pad |

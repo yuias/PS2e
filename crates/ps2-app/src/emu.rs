@@ -29,6 +29,38 @@ const SPEED_WINDOW: Duration = Duration::from_millis(500);
 /// Cap on the accumulated TTY text kept for the UI panel (bytes).
 const TTY_CAP: usize = 64 * 1024;
 
+/// A disc image handed to the worker: the open file plus the name to show
+/// for it. `File` carries no path of its own, so the frontend passes one.
+pub struct Disc {
+    pub file: std::fs::File,
+    pub name: String,
+}
+
+impl Disc {
+    /// Open an image, labelling it with its file name.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::open(path)?,
+            name: disc_name(path),
+        })
+    }
+}
+
+/// The label shown for an image: its file name, falling back to the whole
+/// path for the odd case of one that has none.
+pub fn disc_name(path: &std::path::Path) -> String {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
+}
+
+/// What the UI shows about the disc currently in the drive.
+#[derive(Clone, Default)]
+pub struct DiscInfo {
+    /// File name of the image, e.g. `SLPS-25418.iso`.
+    pub name: String,
+    /// Boot serial read off the disc, e.g. `SLPS-25418`.
+    pub serial: Option<String>,
+}
+
 pub enum Command {
     SetRunning(bool),
     Step,
@@ -37,9 +69,9 @@ pub enum Command {
     OpenTray,
     /// Close the drive on a disc; `None` puts back the one that came out,
     /// so a cancelled pick changes nothing.
-    CloseTray(Option<std::fs::File>),
+    CloseTray(Option<Disc>),
     /// Put a disc in the drive and power-cycle onto it.
-    BootDisc(Option<std::fs::File>),
+    BootDisc(Option<Disc>),
     /// Write the machine to [`WorkerConfig::state_path`].
     SaveState,
     /// Restore it from there.
@@ -119,6 +151,8 @@ pub struct Shared {
     /// Last one-shot result worth showing in the status bar, and whether
     /// it was a failure.
     pub notice: Mutex<Option<(String, bool)>>,
+    /// Disc in the drive, `None` while it is empty or the tray is open.
+    pub disc: Mutex<Option<DiscInfo>>,
 }
 
 /// Deinterlace modes in UI/config order, indexed by `Shared::deinterlace`.
@@ -145,6 +179,8 @@ pub struct WorkerConfig {
     pub memcard_path: Option<PathBuf>,
     /// Where the window's save state lives.
     pub state_path: PathBuf,
+    /// Name of the image already in `sys`'s drive (from `--disc`), if any.
+    pub disc_name: Option<String>,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
     pub volume: f32,
@@ -200,7 +236,10 @@ struct Worker {
     debugger_seen: bool,
     /// Disc taken out while the drive is open, put back if the pick that
     /// opened it is cancelled.
-    removed: Option<std::fs::File>,
+    removed: Option<Disc>,
+    /// File name of the disc in the drive; mirrors `Shared::disc` so the
+    /// worker can restore it across a power cycle without reading it back.
+    disc_name: Option<String>,
     /// Wall-clock pacer (only used when no audio device exists).
     clock: Instant,
     deficit: f64,
@@ -218,7 +257,7 @@ impl Worker {
         ctx: eframe::egui::Context,
     ) -> Self {
         let now = Instant::now();
-        Self {
+        let mut worker = Self {
             sys,
             cfg,
             shared,
@@ -230,12 +269,26 @@ impl Worker {
             running: true,
             debugger_seen: false,
             removed: None,
+            disc_name: None,
             clock: now,
             deficit: 0.0,
             last_frame_publish: now,
             speed_window_start: now,
             speed_window_cycles: 0,
-        }
+        };
+        worker.publish_disc(worker.cfg.disc_name.clone());
+        worker
+    }
+
+    /// Refresh the disc shown by the UI. `name` is the image's file name,
+    /// `None` when the drive is empty; the serial is read off the disc.
+    fn publish_disc(&mut self, name: Option<String>) {
+        self.disc_name = name.clone();
+        let info = name.map(|name| DiscInfo {
+            name,
+            serial: self.sys.bus.cdvd.boot_serial(),
+        });
+        *self.shared.disc.lock().unwrap() = info;
     }
 
     fn debugger_active(&self) -> bool {
@@ -295,19 +348,28 @@ impl Worker {
                 }
                 Command::Reset if !debugger_active => {
                     self.running = false;
+                    let name = self.disc_name.clone();
                     let disc = self.sys.bus.cdvd.disc.take();
                     self.power_cycle(disc);
+                    self.publish_disc(name);
                 }
                 Command::OpenTray if !debugger_active => {
-                    self.removed = self.sys.bus.cdvd.open_tray();
+                    let name = self.disc_name.clone().unwrap_or_default();
+                    self.removed =
+                        self.sys.bus.cdvd.open_tray().map(|file| Disc { file, name });
+                    self.publish_disc(None);
                 }
                 Command::CloseTray(disc) if !debugger_active => {
                     let disc = disc.or_else(|| self.removed.take());
-                    self.sys.bus.cdvd.close_tray(disc, self.sys.cycles);
+                    let name = disc.as_ref().map(|d| d.name.clone());
+                    self.sys.bus.cdvd.close_tray(disc.map(|d| d.file), self.sys.cycles);
                     self.removed = None;
+                    self.publish_disc(name);
                 }
                 Command::BootDisc(disc) if !debugger_active => {
-                    self.power_cycle(disc);
+                    let name = disc.as_ref().map(|d| d.name.clone());
+                    self.power_cycle(disc.map(|d| d.file));
+                    self.publish_disc(name);
                     self.running = true;
                 }
                 Command::SaveState if !debugger_active => {
