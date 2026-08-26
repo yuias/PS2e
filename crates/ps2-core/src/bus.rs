@@ -1150,10 +1150,13 @@ impl IopTimer {
 
 #[derive(Serialize, Deserialize)]
 pub struct Bus {
+    #[serde(with = "serde_bytes")]
     pub ram: Box<[u8]>,
     pub bios: Box<[u8]>,
+    #[serde(with = "serde_bytes")]
     pub spad: Box<[u8]>,
     /// IOP RAM as seen from the EE at 0x1C00_0000 (2 MiB).
+    #[serde(with = "serde_bytes")]
     pub iop_ram: Box<[u8]>,
     /// Earliest cycle at which [`Bus::tick_timers`] has work (timer events,
     /// deferred DMA completions, SPU2 samples); any write that can move an
@@ -1161,6 +1164,7 @@ pub struct Bus {
     pub timers_due: u64,
     /// Shadow storage for EE MMIO registers we don't model yet: reads return
     /// the last written value so BIOS read-modify-write sequences behave.
+    #[serde(with = "serde_bytes")]
     mmio: Box<[u8]>,
     /// Snapshotted separately: the renderer may live on a worker thread.
     /// The placeholder a load builds is the inline one, so deserializing
@@ -1176,12 +1180,14 @@ pub struct Bus {
     pub timers: Timers,
     pub sif: Sif,
     /// IOP scratchpad (1 KiB at 0x1F800000).
+    #[serde(with = "serde_bytes")]
     pub iop_spad: Box<[u8]>,
     pub spu2: Spu2,
     /// IOP DMA ch4 (SPU2 core 0) and ch7 (core 1).
     pub iop_dma_spu: [IopDmaChannel; 2],
     /// Shadow storage for IOP MMIO (0x1F801000..0x1F810000), same idea as
     /// the EE shadow.
+    #[serde(with = "serde_bytes")]
     iop_mmio: Box<[u8]>,
     /// IOP interrupt controller: I_STAT / I_MASK / I_CTRL.
     pub iop_i_stat: u32,

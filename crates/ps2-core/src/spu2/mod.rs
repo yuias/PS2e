@@ -92,6 +92,7 @@ struct Core {
 
 #[derive(Serialize, Deserialize)]
 pub struct Spu2 {
+    #[serde(with = "serde_bytes")]
     pub ram: Box<[u8]>,
     /// Halfword register file mirroring 0x1F900000..0x1F901000.
     regs: Box<[u16]>,
