@@ -65,6 +65,8 @@ pub struct App {
     fullscreen: bool,
     /// Key -> pad bit, resolved from the config once at startup.
     keymap: Vec<(egui::Key, u16)>,
+    /// Last failed disc pick, shown in the status bar until the next one.
+    disc_error: Option<String>,
 }
 
 impl App {
@@ -85,6 +87,31 @@ impl App {
             show_regs: false,
             fullscreen: false,
             keymap,
+            disc_error: None,
+        }
+    }
+
+    /// Pick a disc image and boot it. The OSD does not notice a disc that
+    /// arrives while it is running, so the drive change is paired with a
+    /// power cycle — the same path as starting with `--disc`.
+    fn insert_disc(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PlayStation 2 disc image", &["iso", "img", "bin"])
+            .pick_file()
+        else {
+            return;
+        };
+        match std::fs::File::open(&path) {
+            Ok(f) => {
+                self.disc_error = None;
+                tracing::info!(path = %path.display(), "disc inserted");
+                self.emu.send(Command::InsertDisc(Some(f)));
+            }
+            Err(e) => {
+                let msg = format!("cannot open {}: {e}", path.display());
+                tracing::error!("{msg}");
+                self.disc_error = Some(msg);
+            }
         }
     }
 
@@ -183,8 +210,25 @@ impl eframe::App for App {
                                 self.emu.send(Command::Step);
                                 ui.close();
                             }
-                            if ui.button("Reset").clicked() {
+                            if ui
+                                .button("Reset")
+                                .on_hover_text(
+                                    "power-cycle the console; the disc and memory card stay in",
+                                )
+                                .clicked()
+                            {
                                 self.emu.send(Command::Reset);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button("Insert disc...")
+                                .on_hover_text(
+                                    "pick a disc image and boot it; the console restarts,                                      since the browser does not pick up a disc while running",
+                                )
+                                .clicked()
+                            {
+                                self.insert_disc();
                                 ui.close();
                             }
                         });
@@ -265,6 +309,10 @@ impl eframe::App for App {
                     if let Some(path) = &self.last_screenshot {
                         ui.separator();
                         ui.monospace(format!("saved {path}"));
+                    }
+                    if let Some(err) = &self.disc_error {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
                     }
                 });
             });

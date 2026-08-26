@@ -115,6 +115,13 @@ pub struct Cdvd {
     /// — that hold is what lets the boot chime's reverb tail ring out
     /// before the fresh libsd zeroes the SPU.
     ready_at: u64,
+    /// EE cycle at which the disc in the drive has been identified. Unlike
+    /// [`Cdvd::ready_at`] an IOP reboot leaves it alone (the type stays
+    /// known); only a tray close re-runs the identification.
+    identified_at: u64,
+    /// The drive is open: nothing is readable and the status reports OPEN
+    /// until the tray closes again.
+    tray_open: bool,
 }
 
 /// Initial spin-up/identification time after power-on, and again after an
@@ -129,6 +136,34 @@ const ISO_SECTOR: u64 = 2048;
 const CDVD_MS: u64 = 294_912;
 
 impl Cdvd {
+    /// Open the drive and hand back whatever was in it. Per-disc state
+    /// (the key, the DEC-SET mode, the head position) goes with it.
+    pub fn open_tray(&mut self) -> Option<std::fs::File> {
+        self.tray_open = true;
+        self.key = [0; 15];
+        self.key_flag = 0;
+        self.key_valid = false;
+        self.dec_set = 0;
+        self.last_lsn = 0;
+        self.read_buf.clear();
+        self.read_pos = 0;
+        self.disc.take()
+    }
+
+    /// Close the drive on `disc` (`None` leaves it empty) and re-run the
+    /// spin-up and identification the hardware does on a fresh disc.
+    pub fn close_tray(&mut self, disc: Option<std::fs::File>, now: u64) {
+        self.tray_open = false;
+        self.disc = disc;
+        self.ready_at = now + CDVD_SPINUP;
+        self.identified_at = now + CDVD_SPINUP;
+    }
+
+    /// Whether the drive is open.
+    pub fn tray_open(&self) -> bool {
+        self.tray_open
+    }
+
     /// Execute an N command. CdRead (0x06) and DvdRead (0x08) stage the
     /// requested sectors into `read_buf` for DMA channel 3. Returns the
     /// drive latency (EE cycles) until the completion interrupt: real
@@ -168,6 +203,9 @@ impl Cdvd {
                 let xfer = u64::from(count.min(4096)) * (2 * CDVD_MS / 5);
                 self.last_lsn = lsn.wrapping_add(count);
                 let latency = seek + xfer;
+                if self.tray_open {
+                    return latency;
+                }
                 let Some(disc) = self.disc.as_mut() else {
                     return latency;
                 };
@@ -538,7 +576,8 @@ impl Cdvd {
     }
 
     pub fn read(&mut self, addr: u32, now: u64) -> u32 {
-        let spinning_up = self.disc.is_some() && now < self.ready_at.max(CDVD_SPINUP);
+        let loaded = self.disc.is_some() && !self.tray_open;
+        let spinning_up = loaded && now < self.ready_at.max(CDVD_SPINUP);
         let v = match addr & 0x3F {
             0x04 => self.n_cmd as u32,
             // N status: busy while an N command's latency runs, else
@@ -558,11 +597,13 @@ impl Cdvd {
             // 0x0A (PAUSE); reporting SPIN forever stalls EELOAD's game
             // boot.
             0x0A => {
-                if spinning_up {
+                if self.tray_open {
+                    0x01
+                } else if spinning_up {
                     0x02
-                } else if self.n_busy && self.disc.is_some() {
+                } else if self.n_busy && loaded {
                     0x06
-                } else if self.disc.is_some() {
+                } else if loaded {
                     0x0A
                 } else {
                     0
@@ -574,12 +615,12 @@ impl Cdvd {
             // pick its boot path and would fall back to the browser on
             // "detecting"), then PS2 DVD (0x14) when an image is loaded.
             0x0F => {
-                if self.disc.is_some() && now < CDVD_SPINUP {
-                    0x01
-                } else if self.disc.is_some() {
-                    0x14
-                } else {
+                if !loaded {
                     0
+                } else if now < self.identified_at.max(CDVD_SPINUP) {
+                    0x01
+                } else {
+                    0x14
                 }
             }
             0x16 => self.s_cmd as u32,

@@ -56,6 +56,8 @@ struct Args {
     memcard: Option<String>,
     /// Disc image (2048-byte-sector ISO), streamed on demand.
     disc: Option<String>,
+    /// Insert a disc mid-run: (path, EE cycle), as the drive tray does.
+    insert: Option<(String, u64)>,
     /// Write the SPU2 output (48 kHz stereo) as a WAV file (headless only).
     wav: Option<String>,
 }
@@ -84,6 +86,18 @@ fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
     Ok((mask, from, to))
 }
 
+/// `<path>@<cycle>`: the disc to close the tray on, and when.
+fn parse_insert(spec: &str) -> Result<(String, u64), String> {
+    let (path, cycle) = spec
+        .rsplit_once('@')
+        .ok_or_else(|| format!("--insert needs <path>@<cycle>, got '{spec}'"))?;
+    let cycle = cycle
+        .replace('_', "")
+        .parse()
+        .map_err(|e| format!("bad cycle '{cycle}': {e}"))?;
+    Ok((path.to_string(), cycle))
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         bios: None,
@@ -102,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
         presses: Vec::new(),
         memcard: None,
         disc: None,
+        insert: None,
         wav: None,
     };
     let mut it = std::env::args().skip(1);
@@ -145,6 +160,11 @@ fn parse_args() -> Result<Args, String> {
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
             "--memcard" => args.memcard = Some(it.next().ok_or("--memcard needs a path")?),
             "--disc" => args.disc = Some(it.next().ok_or("--disc needs a path")?),
+            "--insert" => {
+                args.insert = Some(parse_insert(
+                    &it.next().ok_or("--insert needs <path>@<cycle>")?,
+                )?)
+            }
             "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
             "--help" | "-h" => {
                 println!(
@@ -170,6 +190,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
                      --disc           disc image (2048-byte-sector ISO), streamed\n\
+                     --insert         open the drive and close it on a new image,\n\
+                     \x20                <path>@<cycle> (headless)\n\
                      --wav            write the SPU2 output as a 48 kHz stereo WAV (headless)"
                 );
                 std::process::exit(0);
@@ -372,6 +394,7 @@ fn run_headless(
     let mut remaining = cycles;
     let mut debugger_seen = false;
     let mut audio: Vec<i16> = Vec::new();
+    let mut insert = args.insert.clone();
     while remaining > 0 {
         // While a debugger is attached (or awaited), it owns execution: the
         // stub runs the system from inside pump() and we only track cycles.
@@ -389,6 +412,27 @@ fn run_headless(
             }
         }
         let n = remaining.min(SLICE);
+        // The drive opens first and closes a second later, the way it
+        // does behind the window's file picker.
+        if let Some((_, at)) = &insert
+            && sys.cycles >= *at
+            && !sys.bus.cdvd.tray_open()
+        {
+            sys.bus.cdvd.open_tray();
+            tracing::info!(cycles = sys.cycles, "tray opened");
+        }
+        if let Some((path, at)) = &insert
+            && sys.cycles >= at.saturating_add(ps2_core::EE_CLOCK_HZ)
+        {
+            match std::fs::File::open(path) {
+                Ok(f) => {
+                    sys.bus.cdvd.close_tray(Some(f), sys.cycles);
+                    tracing::info!(path = %path, cycles = sys.cycles, "disc inserted");
+                }
+                Err(e) => eprintln!("error: cannot open disc '{path}': {e}"),
+            }
+            insert = None;
+        }
         sys.bus.sio2.buttons = args
             .presses
             .iter()

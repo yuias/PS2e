@@ -33,6 +33,8 @@ pub enum Command {
     SetRunning(bool),
     Step,
     Reset,
+    /// Put a disc in the drive (`None` empties it) and boot it.
+    InsertDisc(Option<std::fs::File>),
     Quit,
 }
 
@@ -275,26 +277,38 @@ impl Worker {
                 }
                 Command::Reset if !debugger_active => {
                     self.running = false;
-                    // Ambient assets survive a reset: disc and memory card
-                    // (mid-write contents included).
                     let disc = self.sys.bus.cdvd.disc.take();
-                    let nvram_path = self.cfg.nvram_path.clone();
-                    let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
-                    let jit = self.sys.jit_enabled();
-                    self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
-                    let _ = self.sys.set_jit(jit);
-                    self.sys.set_publish_frames(true);
-                    if let Some(p) = nvram_path {
-                        self.sys.load_nvram(p);
-                    }
-                    self.sys.bus.cdvd.disc = disc;
-                    self.sys.bus.sio2.memcard = memcard;
+                    self.power_cycle(disc);
                 }
-                Command::SetRunning(_) | Command::Step | Command::Reset => {}
+                Command::InsertDisc(disc) if !debugger_active => {
+                    self.power_cycle(disc);
+                    self.running = true;
+                }
+                Command::SetRunning(_)
+                | Command::Step
+                | Command::Reset
+                | Command::InsertDisc(_) => {}
                 Command::Quit => return false,
             }
         }
         true
+    }
+
+    /// Rebuild the machine from the reset vector with `disc` in the drive.
+    /// The memory card (mid-write contents included) and the mechacon NVRAM
+    /// survive, as they do across a real power cycle.
+    fn power_cycle(&mut self, disc: Option<std::fs::File>) {
+        let nvram_path = self.cfg.nvram_path.clone();
+        let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
+        let jit = self.sys.jit_enabled();
+        self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
+        let _ = self.sys.set_jit(jit);
+        self.sys.set_publish_frames(true);
+        if let Some(p) = nvram_path {
+            self.sys.load_nvram(p);
+        }
+        self.sys.bus.cdvd.disc = disc;
+        self.sys.bus.sio2.memcard = memcard;
     }
 
     /// Run one slice if the pacer allows it. With an audio device the SPU2's
