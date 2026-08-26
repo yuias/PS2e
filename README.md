@@ -41,8 +41,8 @@ while it is running.
 
 The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
-disc, memory card and mechacon NVRAM stay in), the two disc commands and
-screenshots; View toggles fullscreen, the display scaler, the deinterlacer,
+disc, memory card and mechacon NVRAM stay in), the two disc commands,
+save/load state and screenshots; View toggles fullscreen, the display scaler, the deinterlacer,
 internal 2x rendering and the debug panels — TTY console and CPU registers,
 both hidden by default. Audio holds the master volume, and Help lists the
 current key bindings.
@@ -54,13 +54,21 @@ current key bindings.
 | W / E / R / U | L1 / L2 / R1 / R2 |
 | 1 / 3 | L3 / R3 |
 | V / C | Start / Select |
+| F5 / F9 | Save / load state |
 | F11 / F12 | Fullscreen (Esc leaves) / screenshot |
 
-The pad is rebindable; see the `[keys]` table under
-[Configuration](#configuration). Fullscreen and screenshot are fixed.
+The pad and the save/load shortcuts are rebindable; see the `[keys]` and
+`[hotkeys]` tables under [Configuration](#configuration). Fullscreen and
+screenshot are fixed.
 
 A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
 working directory, the same encoding as headless `--screenshot`.
+
+Save states snapshot the whole machine to `state0.sst` next to the memory
+card image, zstd-compressed (about 13 MiB of a 40 MiB image, and roughly
+0.4 s to write, which the machine pauses for). The BIOS, disc image and
+memory card are not part of a state and carry over on load; a state saved
+with a different BIOS loads with a warning.
 
 ## Configuration
 
@@ -80,6 +88,10 @@ internal_2x = false         # true 2x edges on 3D geometry
 [keys]                      # digital pad; egui key names
 cross = "Z"
 start = "V"
+
+[hotkeys]                   # frontend shortcuts
+save_state = "F5"
+load_state = "F9"
 ```
 
 Key names are the ones egui reports: letters and digits as themselves
@@ -107,6 +119,8 @@ to run, which is what changes get checked against.
 | `--cycles N` | EE cycles to run, then exit |
 | `--press` | Hold a pad button, `<button>@<cycle>[-<cycle>]`, repeatable |
 | `--insert` | Open the drive and close it on a new image, `<path>@<cycle>` |
+| `--save-state <p>@<n>` | Write a save state at that cycle |
+| `--load-state <p>` | Start from a save state instead of the reset vector |
 | `--screenshot <p>` | Write the final framebuffer as a BMP |
 | `--screenshot-every N` | Also write `<p>_<n>.bmp` every N cycles |
 | `--wav <p>` | Write the SPU2 output as a 48 kHz stereo WAV |
@@ -146,7 +160,6 @@ that includes the Mips target.
 
 - The IPU (MPEG decoder) is not implemented, so full-motion video does not
   decode.
-- Save states do not exist yet.
 - Only the keyboard drives the pad; there is no gamepad input, and the
   emulated controller is a digital pad with no analog sticks.
 - Memory cards respond in slot 1 only.

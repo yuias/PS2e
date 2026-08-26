@@ -72,7 +72,9 @@ Planned crates:
    music reaches the output bit-exact (`tools/adxcmp.py`). Not yet: IPU,
    VU1 timing, SPU2 sweep volumes.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
-   keyboard pad input, menu/status bar, TTY and register panels, F11
+   keyboard pad input (rebindable), menu/status bar, save states
+   (postcard + zstd), disc swapping through the drive tray, TTY and
+   register panels, F11
    fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest),
    selectable deinterlacing of field-buffer output (weave / bob / blend /
    motion-adaptive / yadif / bwdif, composited at vblank on the GS thread;
