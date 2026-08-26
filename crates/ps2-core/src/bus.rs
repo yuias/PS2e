@@ -2843,6 +2843,18 @@ impl Bus {
             }
             0x1F80_10F4 => self.iop_dicr,
             0x1F80_1574 => self.iop_dicr2,
+            // USB OHCI. No host controller is modelled and nothing is
+            // plugged in, so the register block is the plain shadow below
+            // apart from these two reads.
+            //
+            // HcRevision identifies the controller; zero would say there is
+            // none. HcCommandStatus's HCR bit is the one a driver blocks on:
+            // USBD.IRX sets it and polls until the reset finishes, so it has
+            // to read back clear or the module never finishes loading and
+            // every RPC waiting on it (the EE's boot, for titles that load
+            // USBD) waits forever.
+            0x1F80_1600 => 0x10,
+            0x1F80_1608 => read_le::<N>(&self.iop_mmio, off) as u32 & !1,
             _ => {
                 let v = read_le::<N>(&self.iop_mmio, off) as u32;
                 trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "IOP MMIO read (shadow)");
