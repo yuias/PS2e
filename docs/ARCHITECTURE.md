@@ -70,7 +70,7 @@ Planned crates:
    WAV capture and live cpal output; Amagami (SLPS-25918) is playable
    through its title, menus, name entry and prologue, and its streamed
    music reaches the output bit-exact (`tools/adxcmp.py`). Not yet: IPU,
-   VU1 timing, SPU2 sweep volumes, reverb input/output resampling FIRs.
+   VU1 timing, SPU2 sweep volumes.
 6. **Front-end and speed** *(in progress)* — eframe/wgpu window with
    keyboard pad input, menu/status bar, TTY and register panels, F11
    fullscreen, a GPU display scaler (sharp / Lanczos / linear / nearest),
