@@ -16,12 +16,12 @@ Requires a recent stable Rust toolchain.
 cargo build --release
 ```
 
-Produces `ps2-app` in `target/release/`.
+Produces `ps2e` in `target/release/`.
 
 ## Run
 
 ```
-ps2-app [--bios <path>] [--disc <image>]
+ps2e [--bios <path>] [--disc <image>]
 ```
 
 A disc image is a raw ISO of 2048-byte sectors. 2352-byte CD images are not
@@ -106,7 +106,7 @@ which replaces the template's comments with the plain values.
 ## Headless mode
 
 ```
-ps2-app --cycles <n> [--disc <image>] ...
+ps2e --cycles <n> [--disc <image>] ...
 ```
 
 Runs without a window for the given number of EE cycles and exits, printing
@@ -136,7 +136,7 @@ to run, which is what changes get checked against.
 ## Debugger (LLDB / GDB)
 
 ```
-ps2-app --cycles <n> --debug-ee 9000 --debug-iop 9001 --wait-debugger
+ps2e --cycles <n> --debug-ee 9000 --debug-iop 9001 --wait-debugger
 ```
 
 Each core gets its own port and its own stub, speaking the gdb-remote serial

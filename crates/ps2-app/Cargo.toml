@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Native front-end for ps2-core: headless CLI plus an eframe/wgpu window"
 
+# The executable is `ps2e`; the crate keeps its workspace name.
+[[bin]]
+name = "ps2e"
+path = "src/main.rs"
+
 [dependencies]
 ps2-core = { path = "../ps2-core", features = ["threads", "jit"] }
 ps2-debug = { path = "../ps2-debug" }
