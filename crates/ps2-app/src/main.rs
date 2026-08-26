@@ -17,6 +17,7 @@ mod config;
 mod display;
 mod emu;
 mod pad;
+mod state;
 mod ui;
 
 use std::io::Write;
@@ -58,6 +59,10 @@ struct Args {
     disc: Option<String>,
     /// Insert a disc mid-run: (path, EE cycle), as the drive tray does.
     insert: Option<(String, u64)>,
+    /// Write a save state at (path, EE cycle).
+    save_state: Option<(String, u64)>,
+    /// Start from this save state instead of the reset vector.
+    load_state: Option<String>,
     /// Write the SPU2 output (48 kHz stereo) as a WAV file (headless only).
     wav: Option<String>,
 }
@@ -117,6 +122,8 @@ fn parse_args() -> Result<Args, String> {
         memcard: None,
         disc: None,
         insert: None,
+        save_state: None,
+        load_state: None,
         wav: None,
     };
     let mut it = std::env::args().skip(1);
@@ -165,6 +172,14 @@ fn parse_args() -> Result<Args, String> {
                     &it.next().ok_or("--insert needs <path>@<cycle>")?,
                 )?)
             }
+            "--save-state" => {
+                args.save_state = Some(parse_insert(
+                    &it.next().ok_or("--save-state needs <path>@<cycle>")?,
+                )?)
+            }
+            "--load-state" => {
+                args.load_state = Some(it.next().ok_or("--load-state needs a path")?)
+            }
             "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
             "--help" | "-h" => {
                 println!(
@@ -192,6 +207,8 @@ fn parse_args() -> Result<Args, String> {
                      --disc           disc image (2048-byte-sector ISO), streamed\n\
                      --insert         open the drive and close it on a new image,\n\
                      \x20                <path>@<cycle> (headless)\n\
+                     --save-state     write a save state, <path>@<cycle> (headless)\n\
+                     --load-state     start from a save state, not the reset vector\n\
                      --wav            write the SPU2 output as a 48 kHz stereo WAV (headless)"
                 );
                 std::process::exit(0);
@@ -268,6 +285,16 @@ fn main() -> ExitCode {
         },
     };
 
+    if let Some(path) = &args.load_state {
+        let p = std::path::Path::new(path);
+        match state::read(p).map_err(|e| e.to_string()).and_then(|d| sys.load_state(&d)) {
+            Ok(()) => tracing::info!(path = %path, cycles = sys.cycles, "state loaded"),
+            Err(e) => {
+                eprintln!("error: cannot load '{path}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     if let Some(path) = &args.disc {
         match std::fs::File::open(path) {
             Ok(f) => {
@@ -395,6 +422,7 @@ fn run_headless(
     let mut debugger_seen = false;
     let mut audio: Vec<i16> = Vec::new();
     let mut insert = args.insert.clone();
+    let mut save_state = args.save_state.clone();
     while remaining > 0 {
         // While a debugger is attached (or awaited), it owns execution: the
         // stub runs the system from inside pump() and we only track cycles.
@@ -440,6 +468,21 @@ fn run_headless(
             .fold(0, |acc, &(mask, _, _)| acc | mask);
         sys.run(n);
         remaining -= n;
+        if let Some((path, at)) = &save_state
+            && sys.cycles >= *at
+        {
+            match sys.save_state() {
+                Ok(data) => match state::write(std::path::Path::new(path), &data) {
+                    Ok(len) => tracing::info!(
+                        path = %path, cycles = sys.cycles, raw = data.len(), bytes = len,
+                        "state saved"
+                    ),
+                    Err(e) => eprintln!("error: cannot write '{path}': {e}"),
+                },
+                Err(e) => eprintln!("error: save state failed: {e}"),
+            }
+            save_state = None;
+        }
         flush_tty(&stdout, &mut sys);
         if args.wav.is_some() {
             audio.extend(sys.bus.spu2.take_output());

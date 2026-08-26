@@ -4,6 +4,7 @@
 //! SPU2's 20-bit halfword addressing.
 
 use std::sync::LazyLock;
+use serde::{Deserialize, Serialize};
 
 /// ADPCM prediction filter coefficients (x64), indexed by the block's
 /// filter nibble.
@@ -35,7 +36,7 @@ static GAUSS: LazyLock<[[i32; 4]; 256]> = LazyLock::new(|| {
     out
 });
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Phase {
     Off,
     Attack,
@@ -44,6 +45,7 @@ pub enum Phase {
     Release,
 }
 
+#[derive(Serialize, Deserialize)]
 #[derive(Clone, Copy)]
 pub struct Voice {
     /// Halfword address of the block being played (NAX) and its loop

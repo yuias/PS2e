@@ -9,6 +9,7 @@
 
 use crate::bus::Bus;
 use tracing::{error, trace};
+use serde::{Deserialize, Serialize};
 
 const EXC_INTERRUPT: u32 = 0;
 const EXC_SYSCALL: u32 = 8;
@@ -23,6 +24,7 @@ const STATUS_IEC: u32 = 1;
 const STATUS_ISC: u32 = 1 << 16;
 const STATUS_BEV: u32 = 1 << 22;
 
+#[derive(Serialize, Deserialize)]
 pub struct Cpu {
     pub pc: u32,
     pub next_pc: u32,

@@ -15,6 +15,7 @@ use crate::bus::Bus;
 use cop0::Cop0;
 use fpu::Fpu;
 use tracing::{error, trace, warn};
+use serde::{Deserialize, Serialize};
 
 /// Exception codes (Cause.ExcCode).
 const EXC_INTERRUPT: u32 = 0;
@@ -22,6 +23,7 @@ const EXC_SYSCALL: u32 = 8;
 const EXC_BREAK: u32 = 9;
 const EXC_TRAP: u32 = 13;
 
+#[derive(Serialize, Deserialize)]
 pub struct Cpu {
     pub pc: u32,
     pub next_pc: u32,

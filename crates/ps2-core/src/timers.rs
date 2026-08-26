@@ -5,12 +5,14 @@
 //! not wired up yet; MODE's interrupt flags are write-1-to-clear.
 
 use tracing::trace;
+use serde::{Deserialize, Serialize};
 
 /// BUSCLK runs at half the EE clock.
 const BUSCLK_SHIFT: u64 = 1;
 /// HBLANK rate approximation: BUSCLK / 9371 (NTSC).
 const HBLANK_DIV: u64 = 9371;
 
+#[derive(Serialize, Deserialize)]
 #[derive(Default, Clone, Copy)]
 struct Timer {
     /// COUNT value at `base_cycle`.
@@ -47,6 +49,7 @@ impl Timer {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Timers {
     timers: [Timer; 4],
 }

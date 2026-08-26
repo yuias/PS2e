@@ -10,6 +10,7 @@
 pub(crate) mod raster;
 
 use tracing::{debug, trace, warn};
+use serde::{Deserialize, Serialize};
 
 mod canvas;
 pub mod front;
@@ -38,6 +39,7 @@ pub const PSMZ16S: u32 = 0x3A;
 
 /// Per-pixel write callback used by IMAGE transfers.
 
+#[derive(Serialize, Deserialize)]
 /// One vertex as accumulated from register writes.
 #[derive(Clone, Copy, Default)]
 pub struct Vertex {
@@ -57,6 +59,7 @@ pub struct Vertex {
     pub v: i32,
 }
 
+#[derive(Serialize, Deserialize)]
 #[derive(Default, Clone, Copy)]
 pub struct Context {
     pub xyoffset: u64,
@@ -70,6 +73,7 @@ pub struct Context {
     pub clamp: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Gs {
     /// Local memory, shareable with rasterizer worker threads.
     pub canvas: Canvas,
@@ -119,20 +123,26 @@ pub struct Gs {
     /// Primitives rasterized on the worker pool.
     pub prims_split: u64,
     /// Texture samples per TEX0 PSM, for bring-up logging.
+    #[serde(with = "serde_big_array::BigArray")]
     pub tex_psm_hist: [u64; 64],
     /// IMAGE transfer formats already reported as unhandled (bit per PSM).
     warned_trx_psm: u64,
     /// Distinct TEX0 values already logged (bring-up aid; capped).
+    #[serde(skip)]
     seen_tex0: std::collections::HashSet<u64>,
     /// Render-target setups already logged, with how many prims were shown.
+    #[serde(skip)]
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
     /// Rasterizer scratch for the GS thread and for the worker-pool bands
     /// (see raster.rs; empty pool = never split).
+    #[serde(skip)]
     scratch: raster::Scratch,
+    #[serde(skip, default = "raster_pool")]
     pool: Vec<raster::Scratch>,
     /// Decoded primitives queued for one parallel pass (see raster.rs).
+    #[serde(skip)]
     batch: raster::Batch,
     /// Internal-2x overlay: a 4x-size shadow of local memory in the same
     /// page/block layout at doubled coordinates (`bp*4, bw*2, x*2, y*2`).
@@ -153,11 +163,36 @@ pub struct Gs {
     woven_dims: (u32, u32),
     /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
     /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
+    /// Decoded on demand, so a state load starts with an empty cache and
+    /// a key that cannot match.
+    #[serde(skip, default = "empty_clut")]
     clut: Box<[u32; 512]>,
     /// Palette setup (`TexInfo::clut_key`) the cache was decoded from.
+    #[serde(skip, default = "no_clut_key")]
     clut_key: u64,
     /// VRAM changed by a transfer since the CLUT was decoded.
+    #[serde(skip, default = "yes")]
     clut_dirty: bool,
+}
+
+/// Per-lane rasterizer scratch, as [`Gs::new`] builds it (a state load
+/// restores it rather than carrying it).
+fn raster_pool() -> Vec<raster::Scratch> {
+    if cfg!(feature = "threads") {
+        (0..raster::PARALLEL_LANES).map(|_| raster::Scratch::default()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn empty_clut() -> Box<[u32; 512]> {
+    Box::new([0; 512])
+}
+fn no_clut_key() -> u64 {
+    u64::MAX
+}
+fn yes() -> bool {
+    true
 }
 
 impl Default for Gs {

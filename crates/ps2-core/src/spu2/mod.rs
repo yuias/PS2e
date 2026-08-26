@@ -14,6 +14,7 @@ mod voice;
 use reverb::{Reverb, ReverbRegs};
 use tracing::{debug, trace};
 use voice::{Voice, VoiceRegs};
+use serde::{Deserialize, Serialize};
 
 pub const SPU2_RAM_SIZE: usize = 2 * 1024 * 1024;
 
@@ -66,6 +67,7 @@ const REG_RVOL: usize = 0x774;
 const MODE_DMA_WRITE: u16 = 2;
 const MODE_DMA_READ: u16 = 3;
 
+#[derive(Serialize, Deserialize)]
 #[derive(Default, Clone)]
 struct Core {
     /// Halfword address the next transferred halfword lands at; latched
@@ -88,6 +90,7 @@ struct Core {
     reverb: Reverb,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Spu2 {
     pub ram: Box<[u8]>,
     /// Halfword register file mirroring 0x1F900000..0x1F901000.

@@ -9,7 +9,9 @@ use crate::gif::Gif;
 use crate::gs::GsFront;
 use crate::vu1::Vu1;
 use tracing::{trace, warn};
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
 enum State {
     Cmd,
     /// Next word is the STMASK value.
@@ -38,6 +40,7 @@ enum State {
     },
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Vif {
     state: State,
     /// STCYCL cl/wl: wl > cl shrinks UNPACK's input data length.

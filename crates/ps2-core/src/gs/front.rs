@@ -80,6 +80,32 @@ enum Cmd {
     Stats(std::sync::mpsc::SyncSender<Stats>),
     /// Turn the internal-2x overlay on or off.
     Internal2x(bool),
+    /// Reply with the renderer's serialized state (after draining).
+    Snapshot(std::sync::mpsc::SyncSender<Vec<u8>>),
+    /// Replace the renderer with a state from [`Cmd::Snapshot`].
+    Restore(Vec<u8>),
+}
+
+/// A save state's view of the display side: the EE-visible privileged
+/// register copies plus the renderer's own state, which may have to make a
+/// round trip through the worker thread to be read or written.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GsState {
+    pmode: u64,
+    smode1: u64,
+    smode2: u64,
+    dispfb1: u64,
+    display1: u64,
+    dispfb2: u64,
+    display2: u64,
+    bgcolor: u64,
+    csr: u64,
+    imr: u64,
+    priv_shadow: [u64; 32],
+    intc_pending: bool,
+    internal_2x: bool,
+    /// The renderer, serialized where it lives.
+    renderer: Vec<u8>,
 }
 
 /// Flush a batch to the worker once it holds this many commands.
@@ -240,6 +266,13 @@ impl GsFront {
                 let _ = reply.send(Stats::of(gs));
             }
             Cmd::Internal2x(on) => gs.set_internal_2x(on),
+            Cmd::Snapshot(reply) => {
+                let _ = reply.send(postcard::to_allocvec(&*gs).unwrap_or_default());
+            }
+            Cmd::Restore(data) => match postcard::from_bytes(&data) {
+                Ok(new) => *gs = new,
+                Err(e) => tracing::error!("renderer state load failed: {e}"),
+            },
         }
     }
 
@@ -433,6 +466,65 @@ impl GsFront {
     /// Direct access to an inline renderer (tests).
     pub fn inline_gs(&mut self) -> Option<&mut Gs> {
         self.inline.as_mut()
+    }
+
+    /// Everything a save state needs from the display side, as of every
+    /// command written so far.
+    pub fn snapshot(&mut self) -> Result<GsState, String> {
+        let renderer = match &mut self.inline {
+            Some(gs) => postcard::to_allocvec(&*gs).map_err(|e| e.to_string())?,
+            None => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                self.push(Cmd::Snapshot(tx));
+                self.flush();
+                rx.recv().map_err(|_| "renderer stopped".to_string())?
+            }
+        };
+        Ok(GsState {
+            pmode: self.pmode,
+            smode1: self.smode1,
+            smode2: self.smode2,
+            dispfb1: self.dispfb1,
+            display1: self.display1,
+            dispfb2: self.dispfb2,
+            display2: self.display2,
+            bgcolor: self.bgcolor,
+            csr: self.csr,
+            imr: self.imr,
+            priv_shadow: self.priv_shadow,
+            intc_pending: self.intc_pending,
+            internal_2x: self.internal_2x,
+            renderer,
+        })
+    }
+
+    /// Put back a [`GsFront::snapshot`], keeping the renderer where it is.
+    pub fn restore(&mut self, state: GsState) -> Result<(), String> {
+        self.batch.clear();
+        self.image.clear();
+        self.pmode = state.pmode;
+        self.smode1 = state.smode1;
+        self.smode2 = state.smode2;
+        self.dispfb1 = state.dispfb1;
+        self.display1 = state.display1;
+        self.dispfb2 = state.dispfb2;
+        self.display2 = state.display2;
+        self.bgcolor = state.bgcolor;
+        self.csr = state.csr;
+        self.imr = state.imr;
+        self.priv_shadow = state.priv_shadow;
+        self.intc_pending = state.intc_pending;
+        self.internal_2x = state.internal_2x;
+        match &mut self.inline {
+            Some(gs) => {
+                *gs = postcard::from_bytes(&state.renderer).map_err(|e| e.to_string())?;
+            }
+            None => {
+                self.push(Cmd::Restore(state.renderer));
+                self.flush();
+            }
+        }
+        Ok(())
     }
 }
 

@@ -8,7 +8,9 @@
 
 use std::collections::VecDeque;
 use tracing::trace;
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
 pub struct Sif {
     pub mscom: u32,
     pub smcom: u32,

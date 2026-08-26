@@ -25,6 +25,42 @@ impl Default for Canvas {
     }
 }
 
+/// Save states carry the bytes; the allocation is rebuilt around them.
+impl serde::Serialize for Canvas {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.bytes())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Canvas {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Canvas;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("canvas bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Canvas, E> {
+                if !v.len().is_power_of_two() {
+                    return Err(E::custom(format!("canvas size {} is not a power of two", v.len())));
+                }
+                let c = Canvas::with_size(v.len());
+                // SAFETY: the allocation is ours and exactly `v.len()` long.
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), c.ptr, v.len()) };
+                Ok(c)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Canvas, A::Error> {
+                let mut v: Vec<u8> = Vec::with_capacity(a.size_hint().unwrap_or(0));
+                while let Some(b) = a.next_element::<u8>()? {
+                    v.push(b);
+                }
+                self.visit_bytes(&v)
+            }
+        }
+        d.deserialize_bytes(Visitor)
+    }
+}
+
 impl Canvas {
     pub fn new() -> Self {
         Self::with_size(VRAM_SIZE)

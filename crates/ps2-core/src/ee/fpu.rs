@@ -4,6 +4,9 @@
 //! different rounding). Host f32 arithmetic is used as an approximation for
 //! now; results are clamped away from NaN/Inf where it matters.
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
 pub struct Fpu {
     pub regs: [f32; 32],
     pub acc: f32,

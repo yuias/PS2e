@@ -4,6 +4,7 @@
 //! buffer position, wrapping inside the area.
 
 use std::sync::LazyLock;
+use serde::{Deserialize, Serialize};
 
 /// Reverb register snapshot for one core, as halfword offsets and 16-bit
 /// signed coefficients.
@@ -82,15 +83,17 @@ static FIR: LazyLock<[i32; FIR_TAPS]> = LazyLock::new(|| {
     h.map(|v| (v * scale).round() as i32)
 });
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Reverb {
     /// Rotating offset into the work area.
     pos: u32,
     /// The algorithm runs every other sample.
     phase: bool,
     /// Wet input at the output rate, for the decimating filter.
+    #[serde(with = "rings")]
     input: [[i32; HIST]; 2],
     /// Reverb output at the half rate, for the interpolating filter.
+    #[serde(with = "rings")]
     half: [[i32; HIST]; 2],
     /// Write positions in the two rings.
     in_pos: usize,
@@ -270,5 +273,28 @@ mod tests {
         assert!(peak > 0x100 && peak < 0x8000, "{peak:#x}");
         let tail = rv.sample(&mut ram, &regs, 0, 0);
         assert!(tail[0].abs() < 0x100, "{tail:?}");
+    }
+}
+
+/// The two filter histories, flattened: `serde`'s array impls stop at 32
+/// elements and these rings are longer.
+mod rings {
+    use super::HIST;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[[i32; HIST]; 2], s: S) -> Result<S::Ok, S::Error> {
+        v.concat().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[[i32; HIST]; 2], D::Error> {
+        let flat = Vec::<i32>::deserialize(d)?;
+        if flat.len() != HIST * 2 {
+            return Err(serde::de::Error::custom("bad reverb history length"));
+        }
+        let mut out = [[0i32; HIST]; 2];
+        for (c, chunk) in flat.chunks_exact(HIST).enumerate() {
+            out[c].copy_from_slice(chunk);
+        }
+        Ok(out)
     }
 }

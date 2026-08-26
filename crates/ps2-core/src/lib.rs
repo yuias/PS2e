@@ -30,7 +30,18 @@ const VBLANK_CYCLES: u64 = EE_CYCLES_PER_FRAME / 20;
 /// completions, SPU2 mixing).
 const TIMER_TICK_CYCLES: u64 = 64;
 
+/// Save-state file magic and format version. Bump the version on any
+/// change to a serialized struct.
+const STATE_MAGIC: &[u8; 4] = b"PS2E";
+const STATE_VERSION: u16 = 1;
+
+/// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
+fn bios_fingerprint(bios: &[u8]) -> u32 {
+    bios.iter().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(*b)).wrapping_mul(0x0100_0193))
+}
+
 /// Top-level system: owns every component, mirrors the real console.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ps2System {
     pub ee: ee::Cpu,
     pub iop: iop::Cpu,
@@ -39,8 +50,10 @@ pub struct Ps2System {
     pub cycles: u64,
     /// Position within the current video frame, in EE cycles.
     frame_pos: u64,
-    /// EE recompiler; `None` runs the interpreter.
+    /// EE recompiler; `None` runs the interpreter. Translated code is not
+    /// state: a load starts from an empty cache.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[serde(skip)]
     jit: Option<ee::jit::Jit>,
 }
 
@@ -90,6 +103,59 @@ impl Ps2System {
         {
             if on { Err("built without the jit feature".into()) } else { Ok(()) }
         }
+    }
+
+    /// Serialize the complete machine state. The BIOS image, disc and
+    /// memory card are *not* included: they are ambient assets the
+    /// frontend owns (and rolling a memory card back would corrupt real
+    /// saves). The display side follows the machine, because its renderer
+    /// may have to be asked across a thread for it.
+    pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
+        let gs = self.bus.gs.snapshot()?;
+        let mut out = Vec::with_capacity(48 << 20);
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&bios_fingerprint(&self.bus.bios).to_le_bytes());
+        let out = postcard::to_extend(&*self, out).map_err(|e| format!("serialize failed: {e}"))?;
+        postcard::to_extend(&gs, out).map_err(|e| format!("serialize failed: {e}"))
+    }
+
+    /// Restore a state from [`Ps2System::save_state`], carrying over the
+    /// BIOS, disc, memory card and the running renderer.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
+        let (header, body) = data.split_at_checked(10).ok_or("state file too short")?;
+        if &header[..4] != STATE_MAGIC {
+            return Err("not a PS2e save state".into());
+        }
+        let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        if version != STATE_VERSION {
+            return Err(format!(
+                "state version {version} not supported (expected {STATE_VERSION})"
+            ));
+        }
+        if u32::from_le_bytes(header[6..10].try_into().unwrap())
+            != bios_fingerprint(&self.bus.bios)
+        {
+            tracing::warn!("state was saved with a different BIOS image; expect instability");
+        }
+        let (mut sys, rest) = postcard::take_from_bytes::<Ps2System>(body)
+            .map_err(|e| format!("deserialize failed: {e}"))?;
+        let gs: gs::front::GsState =
+            postcard::from_bytes(rest).map_err(|e| format!("deserialize failed: {e}"))?;
+        // Ambient assets and the live renderer come from the running
+        // machine, not from the file.
+        sys.bus.bios = std::mem::take(&mut self.bus.bios);
+        sys.bus.gs = std::mem::replace(&mut self.bus.gs, gs::front::GsFront::inline());
+        sys.bus.cdvd.carry_over(&mut self.bus.cdvd);
+        sys.bus.sio2.memcard = std::mem::take(&mut self.bus.sio2.memcard);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            sys.jit = self.jit.take();
+        }
+        sys.bus.after_load();
+        sys.bus.gs.restore(gs)?;
+        *self = sys;
+        Ok(())
     }
 
     /// Recompiler counters: (blocks compiled, invalidated, run, interpreter
@@ -400,5 +466,44 @@ impl Ps2System {
     /// Newest vblank-composited frame (see [`Ps2System::set_publish_frames`]).
     pub fn latest_frame(&self) -> Option<gs::Frame> {
         self.bus.gs.latest_frame()
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// A state must round-trip into a machine that keeps running from the
+    /// same place, with the ambient assets left alone.
+    #[test]
+    fn state_round_trips() {
+        let bios = vec![0u8; bus::BIOS_SIZE];
+        let mut a = Ps2System::new_with(bios.clone(), false).unwrap();
+        a.run(200_000);
+        let cycles = a.cycles;
+        a.bus.ram[0x1000] = 0xA5;
+        let blob = a.save_state().unwrap();
+
+        let mut b = Ps2System::new_with(bios, false).unwrap();
+        b.load_state(&blob).unwrap();
+        assert_eq!(b.cycles, cycles);
+        assert_eq!(b.ee.pc, a.ee.pc);
+        assert_eq!(b.iop.pc, a.iop.pc);
+        assert_eq!(b.bus.ram[0x1000], 0xA5);
+        assert_eq!(b.bus.gs.vram(), a.bus.gs.vram());
+
+        // Both step on identically from here.
+        a.run(50_000);
+        b.run(50_000);
+        assert_eq!(a.ee.pc, b.ee.pc);
+        assert_eq!(a.cycles, b.cycles);
+        assert_eq!(a.bus.ram, b.bus.ram);
+    }
+
+    #[test]
+    fn a_foreign_blob_is_rejected() {
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        assert!(sys.load_state(b"nope").is_err());
+        assert!(sys.load_state(&[0u8; 64]).is_err());
     }
 }

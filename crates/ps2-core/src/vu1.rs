@@ -11,10 +11,12 @@
 use crate::gif::Gif;
 use crate::gs::GsFront;
 use tracing::{trace, warn};
+use serde::{Deserialize, Serialize};
 
 const MICRO_SIZE: usize = 16 * 1024;
 const DATA_SIZE: usize = 16 * 1024;
 
+#[derive(Serialize, Deserialize)]
 pub struct Vu1 {
     /// Micro memory (code, filled by VIF MPG or EE stores).
     pub micro: Box<[u8]>,

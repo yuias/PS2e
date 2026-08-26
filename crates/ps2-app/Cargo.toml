@@ -21,6 +21,9 @@ eframe = { version = "0.32", default-features = false, features = [
 cpal = "0.16"
 serde = { version = "1", features = ["derive"] }
 rfd = "0.17"
+# Save states are ~40 MiB of mostly-zero machine state; zstd makes them
+# cheap to write without the core needing a compressor.
+zstd = "0.13"
 toml = "0.9"
 
 # One native wgpu backend per OS keeps naga's shader translators to a single

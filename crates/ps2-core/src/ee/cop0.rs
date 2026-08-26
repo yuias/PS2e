@@ -1,6 +1,7 @@
 //! EE System Control Coprocessor (COP0): exception state, TLB bookkeeping.
 
 use tracing::{debug, trace};
+use serde::{Deserialize, Serialize};
 
 pub const STATUS: usize = 12;
 pub const CAUSE: usize = 13;
@@ -14,6 +15,7 @@ const STATUS_ERL: u32 = 1 << 2;
 const STATUS_BEV: u32 = 1 << 22;
 const STATUS_EIE: u32 = 1 << 16;
 
+#[derive(Serialize, Deserialize)]
 /// One recorded TLB entry. Recorded but not used for translation yet: the
 /// kernel's mappings are identity, and the bus does a direct segment fold.
 #[derive(Clone, Copy, Default)]
@@ -24,8 +26,10 @@ pub struct TlbEntry {
     pub entry_lo1: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Cop0 {
     pub regs: [u32; 32],
+    #[serde(with = "serde_big_array::BigArray")]
     pub tlb: [TlbEntry; 48],
 }
 

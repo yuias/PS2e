@@ -3,7 +3,9 @@
 
 use crate::gs::GsFront;
 use tracing::{trace, warn};
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
 #[derive(Default)]
 pub struct Gif {
     /// Loops left in the current tag.

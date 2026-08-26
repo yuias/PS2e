@@ -14,6 +14,7 @@ use crate::vif::Vif;
 use crate::vu1::Vu1;
 use std::collections::HashSet;
 use tracing::{debug, trace, warn};
+use serde::{Deserialize, Serialize};
 
 pub const RAM_SIZE: usize = 32 * 1024 * 1024;
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
@@ -24,6 +25,7 @@ const MMIO_SIZE: usize = 0x10000;
 /// Number of RDRAM devices reported by the MCH init handshake.
 const RDRAM_DEVICES: u32 = 2;
 
+#[derive(Serialize, Deserialize)]
 /// EE DMAC channel (only SIF0/SIF1 are modeled so far).
 #[derive(Default)]
 pub struct EeDmaChannel {
@@ -39,6 +41,7 @@ const EE_CHCR_STR: u32 = 1 << 8;
 const EE_CHCR_TTE: u32 = 1 << 6;
 const EE_CHCR_TIE: u32 = 1 << 7;
 
+#[derive(Serialize, Deserialize)]
 /// IOP DMA channel (SIF0 = ch9, SIF1 = ch10).
 #[derive(Default)]
 pub struct IopDmaChannel {
@@ -62,6 +65,7 @@ pub struct IopDmaChannel {
 
 const IOP_CHCR_BUSY: u32 = 1 << 24;
 
+#[derive(Serialize, Deserialize)]
 /// CDVD (MECHACON) model: S commands answer instantly; N commands read
 /// sectors from an optional disc image, streamed from disk one request
 /// at a time (PS2 images are far too large to hold in memory).
@@ -86,8 +90,11 @@ pub struct Cdvd {
     /// the first-time setup (PS logo, PS2 logo, language wizard) — plus
     /// region parameters and the i.Link id. Persisted to `nvram_path`.
     nvram: Vec<u8>,
+    /// Frontend-owned; re-attached after a state load, not part of one.
+    #[serde(skip)]
     nvram_path: Option<std::path::PathBuf>,
     /// Disc image (2048-byte sectors), read on demand.
+    #[serde(skip)]
     pub disc: Option<std::fs::File>,
     /// Sector data staged for DMA channel 3, and the drain cursor.
     read_buf: Vec<u8>,
@@ -162,6 +169,14 @@ impl Cdvd {
     /// Whether the drive is open.
     pub fn tray_open(&self) -> bool {
         self.tray_open
+    }
+
+    /// Take the disc and the NVRAM file location from `live`: a save state
+    /// does not carry either, so a restored drive keeps what is physically
+    /// in it.
+    pub(crate) fn carry_over(&mut self, live: &mut Cdvd) {
+        self.disc = live.disc.take();
+        self.nvram_path = live.nvram_path.take();
     }
 
     /// Execute an N command. CdRead (0x06) and DvdRead (0x08) stage the
@@ -696,6 +711,7 @@ impl Cdvd {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 /// SIO2 (pad/memory-card serial controller) with one digital-capable
 /// DualShock in port 0. A transfer is described by the SEND3 slots
 /// (port in bits 0-1, byte length in bits 8-16); command bytes arrive in
@@ -735,6 +751,7 @@ pub struct Sio2 {
 const SIO2_RECV1_CONNECTED: u32 = 0x1100;
 const SIO2_RECV1_DISCONNECTED: u32 = 0x1D100;
 
+#[derive(Serialize, Deserialize)]
 /// A PS2 memory card: 16384 pages of 512 data + 16 ECC bytes, stored as
 /// contiguous 528-byte pages (the common .ps2 image layout). MCMAN talks
 /// to it with `[0x81, cmd, ...]` sub-transfers; replies carry an 0x2B
@@ -1057,6 +1074,7 @@ impl Sio2 {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 /// IOP root counter (0-2: 16-bit PS1-style, 3-5: 32-bit).
 #[derive(Default, Clone, Copy)]
 struct IopTimer {
@@ -1130,6 +1148,7 @@ impl IopTimer {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Bus {
     pub ram: Box<[u8]>,
     pub bios: Box<[u8]>,
@@ -1143,6 +1162,10 @@ pub struct Bus {
     /// Shadow storage for EE MMIO registers we don't model yet: reads return
     /// the last written value so BIOS read-modify-write sequences behave.
     mmio: Box<[u8]>,
+    /// Snapshotted separately: the renderer may live on a worker thread.
+    /// The placeholder a load builds is the inline one, so deserializing
+    /// never starts a renderer thread just to throw it away.
+    #[serde(skip, default = "GsFront::inline")]
     pub gs: GsFront,
     pub gif: Gif,
     pub vif1: Vif,
@@ -1205,8 +1228,10 @@ pub struct Bus {
     /// RDRAM init handshake state (MCH_RICM/MCH_DRD).
     rdram_sdevid: u32,
     /// Unmapped addresses already reported, to keep the log readable.
+    #[serde(skip)]
     warned_unmapped: HashSet<u32>,
     /// EE TLB entries (raw registers) and a 4 KiB-granular lookup cache.
+    #[serde(with = "serde_big_array::BigArray")]
     ee_tlb: [(u32, u32, u32, u32); 48],
     /// (vaddr page | 1) -> phys page; 0 = invalid slot.
     tlb_cache: Box<[(u32, u32)]>,
@@ -2568,6 +2593,19 @@ impl Bus {
         self.iop_read::<2>(vaddr) as u16
     }
     #[inline]
+    /// Re-establish everything a save state deliberately leaves out: the
+    /// raw pointers the recompiler's inline RAM paths use (the boxes moved
+    /// with the load), the instruction-fetch cache, and the recompiler's
+    /// view of which pages hold code.
+    pub(crate) fn after_load(&mut self) {
+        self.ram_ptr = self.ram.as_mut_ptr() as usize;
+        self.code_pages_ptr = self.code_pages.as_ptr() as usize;
+        self.fetch_tag = 1;
+        self.code_pages.fill(false);
+        self.dirty_code_writes.clear();
+        self.jit_flush_needed = true;
+    }
+
     pub fn iop_read32(&mut self, vaddr: u32) -> u32 {
         self.iop_read::<4>(vaddr)
     }
