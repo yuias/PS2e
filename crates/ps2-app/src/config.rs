@@ -46,6 +46,28 @@ internal_2x = false
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
+
+# Digital pad bindings. Names are the ones egui reports: letters and
+# digits as themselves ("X", "1"), arrows as "Up"/"Down"/"Left"/"Right",
+# plus "Enter", "Backspace", "Space" and "F1".."F35". Omitted buttons keep
+# the defaults shown here; an unknown name falls back with a warning.
+#[keys]
+#up = "Up"
+#down = "Down"
+#left = "Left"
+#right = "Right"
+#cross = "Z"
+#circle = "X"
+#square = "S"
+#triangle = "D"
+#l1 = "W"
+#l2 = "E"
+#r1 = "R"
+#r2 = "U"
+#l3 = "1"
+#r3 = "3"
+#start = "V"
+#select = "C"
 "#;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -58,6 +80,79 @@ pub struct Config {
     pub deinterlace: DeinterlaceSetting,
     pub swap_fields: bool,
     pub internal_2x: bool,
+    pub keys: KeyBindings,
+}
+
+/// One egui key name per digital-pad button, as written in the config
+/// file. Resolved to [`egui::Key`] once at startup by the UI.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct KeyBindings {
+    pub up: String,
+    pub down: String,
+    pub left: String,
+    pub right: String,
+    pub cross: String,
+    pub circle: String,
+    pub square: String,
+    pub triangle: String,
+    pub l1: String,
+    pub l2: String,
+    pub r1: String,
+    pub r2: String,
+    pub l3: String,
+    pub r3: String,
+    pub start: String,
+    pub select: String,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self {
+            up: "Up".into(),
+            down: "Down".into(),
+            left: "Left".into(),
+            right: "Right".into(),
+            cross: "Z".into(),
+            circle: "X".into(),
+            square: "S".into(),
+            triangle: "D".into(),
+            l1: "W".into(),
+            l2: "E".into(),
+            r1: "R".into(),
+            r2: "U".into(),
+            l3: "1".into(),
+            r3: "3".into(),
+            start: "V".into(),
+            select: "C".into(),
+        }
+    }
+}
+
+impl KeyBindings {
+    /// Each binding paired with the pad bit it drives, in a fixed order
+    /// (the order the Help menu lists them in).
+    pub fn pairs(&self) -> [(&str, u16); 16] {
+        use crate::pad;
+        [
+            (&self.up, pad::UP),
+            (&self.down, pad::DOWN),
+            (&self.left, pad::LEFT),
+            (&self.right, pad::RIGHT),
+            (&self.cross, pad::CROSS),
+            (&self.circle, pad::CIRCLE),
+            (&self.square, pad::SQUARE),
+            (&self.triangle, pad::TRIANGLE),
+            (&self.l1, pad::L1),
+            (&self.l2, pad::L2),
+            (&self.r1, pad::R1),
+            (&self.r2, pad::R2),
+            (&self.l3, pad::L3),
+            (&self.r3, pad::R3),
+            (&self.start, pad::START),
+            (&self.select, pad::SELECT),
+        ]
+    }
 }
 
 /// Config/UI form of [`ps2_core::gs::Deinterlace`].
@@ -122,6 +217,7 @@ impl Default for Config {
             deinterlace: DeinterlaceSetting::Bwdif,
             swap_fields: false,
             internal_2x: false,
+            keys: KeyBindings::default(),
         }
     }
 }

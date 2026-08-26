@@ -6,31 +6,33 @@
 
 use crate::config::Config;
 use crate::emu::{Command, DebuggerState, Emu};
-use crate::pad;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-/// Keyboard -> digital pad mapping: face buttons on S/D/X/Z laid out like
-/// the pad (square left, triangle up, circle right, cross down), shoulders
-/// on the row above, and the d-pad on the arrow keys.
-const KEYMAP: [(egui::Key, u16); 16] = [
-    (egui::Key::ArrowUp, pad::UP),
-    (egui::Key::ArrowDown, pad::DOWN),
-    (egui::Key::ArrowLeft, pad::LEFT),
-    (egui::Key::ArrowRight, pad::RIGHT),
-    (egui::Key::Z, pad::CROSS),
-    (egui::Key::X, pad::CIRCLE),
-    (egui::Key::S, pad::SQUARE),
-    (egui::Key::D, pad::TRIANGLE),
-    (egui::Key::W, pad::L1),
-    (egui::Key::E, pad::L2),
-    (egui::Key::R, pad::R1),
-    (egui::Key::U, pad::R2),
-    (egui::Key::Num1, pad::L3),
-    (egui::Key::Num3, pad::R3),
-    (egui::Key::V, pad::START),
-    (egui::Key::C, pad::SELECT),
+/// Resolve the configured key names to egui keys once at startup. An
+/// unknown name falls back to the default for that button rather than
+/// leaving it unbound.
+fn resolve_keymap(keys: &crate::config::KeyBindings) -> Vec<(egui::Key, u16)> {
+    let fallback = crate::config::KeyBindings::default();
+    keys.pairs()
+        .into_iter()
+        .zip(fallback.pairs())
+        .filter_map(|((name, bit), (default_name, _))| match egui::Key::from_name(name) {
+            Some(key) => Some((key, bit)),
+            None => {
+                tracing::warn!("unknown key name '{name}'; using '{default_name}'");
+                egui::Key::from_name(default_name).map(|key| (key, bit))
+            }
+        })
+        .collect()
+}
+
+/// Pad button names, index-aligned with [`crate::config::KeyBindings::pairs`],
+/// for listing the bindings in the Help menu.
+const BUTTON_NAMES: [&str; 16] = [
+    "up", "down", "left", "right", "cross", "circle", "square", "triangle", "L1", "L2", "R1", "R2",
+    "L3", "R3", "start", "select",
 ];
 
 /// MIPS GPR names, index-aligned with `Cpu::gpr` (shared by EE and IOP).
@@ -61,11 +63,14 @@ pub struct App {
     show_tty: bool,
     show_regs: bool,
     fullscreen: bool,
+    /// Key -> pad bit, resolved from the config once at startup.
+    keymap: Vec<(egui::Key, u16)>,
 }
 
 impl App {
     pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
+        let keymap = resolve_keymap(&config.keys);
         Self {
             emu,
             scale_mode: config.scaler,
@@ -79,6 +84,7 @@ impl App {
             show_tty: false,
             show_regs: false,
             fullscreen: false,
+            keymap,
         }
     }
 
@@ -129,7 +135,7 @@ impl Drop for App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let buttons = ctx.input(|i| {
-            KEYMAP
+            self.keymap
                 .iter()
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
@@ -219,8 +225,13 @@ impl eframe::App for App {
                         );
                     });
                     ui.menu_button("Help", |ui| {
-                        ui.label("Pad: arrows = d-pad, Z/X/C/V = cross/circle/square/triangle,");
-                        ui.label("Q/W/E/R = L1/R1/L2/R2, Enter = start, Backspace = select.");
+                        ui.label("Pad, as bound in the config file:");
+                        for (name, (key, _)) in
+                            BUTTON_NAMES.iter().zip(self.config.keys.pairs())
+                        {
+                            ui.monospace(format!("{name:>8} = {key}"));
+                        }
+                        ui.separator();
                         ui.label("F11 fullscreen (Esc leaves), F12 screenshot.");
                     });
                 });
@@ -381,5 +392,20 @@ impl eframe::App for App {
                 },
             ));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_default_binding_resolves() {
+        let keys = crate::config::KeyBindings::default();
+        let map = resolve_keymap(&keys);
+        assert_eq!(map.len(), BUTTON_NAMES.len());
+        // Distinct keys, and every pad bit covered exactly once.
+        let bits = map.iter().fold(0u16, |acc, (_, b)| acc | b);
+        assert_eq!(bits, u16::MAX);
     }
 }
