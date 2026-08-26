@@ -1010,8 +1010,27 @@ impl Sio2 {
         let b = !self.buttons;
         let mut r = vec![0xFF, id, 0x5A];
         if self.pad_config {
-            // Config-mode commands: only the transitions matter to us.
-            r.extend([0u8; 6]);
+            // Config-mode queries. A DualShock 2 answers these with fixed
+            // constants; a driver that reads zeros back decides the pad is
+            // not a DS2 and stays in digital mode -- and some (Ace Combat
+            // 5's DS2U.IRX) then ignore its input entirely.
+            let arg = cmd.get(3).copied().unwrap_or(0);
+            r.extend(match op {
+                // Query model: DS2, current mode, one mode entry.
+                0x45 => [0x03, 0x02, u8::from(self.pad_analog), 0x02, 0x01, 0x00],
+                // Query act: the two actuators' descriptions.
+                0x46 if arg == 0 => [0x00, 0x00, 0x02, 0x00, 0x0A, 0x00],
+                0x46 => [0x00, 0x00, 0x01, 0x01, 0x01, 0x14],
+                // Query comb: one combination driving two actuators.
+                0x47 => [0x00, 0x00, 0x02, 0x00, 0x01, 0x00],
+                // Query mode: the digital and analog mode ids.
+                0x4C if arg == 0 => [0x00, 0x00, 0x04, 0x00, 0x00, 0x00],
+                0x4C => [0x00, 0x00, 0x07, 0x00, 0x00, 0x00],
+                // Vibration mapping: the slots as they stood before this
+                // write, i.e. unmapped.
+                0x4D => [0xFF; 6],
+                _ => [0; 6],
+            });
         } else if op == 0x42 || op == 0x43 {
             r.extend([b as u8, (b >> 8) as u8]);
             if self.pad_analog {
