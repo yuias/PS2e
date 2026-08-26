@@ -108,8 +108,7 @@ impl App {
     }
 
     /// Put a disc in and power-cycle onto it, the way the console boots one
-    /// that is already in the drive. Needed from the browser, which does
-    /// not notice a disc arriving while it runs.
+    /// that is already in the drive.
     fn boot_disc(&mut self) {
         if let Some(disc) = self.pick_disc() {
             self.emu.send(Command::BootDisc(Some(disc)));
@@ -277,7 +276,7 @@ impl eframe::App for App {
                             if ui
                                 .button("Boot disc...")
                                 .on_hover_text(
-                                    "power-cycle onto a disc; use this from the browser,                                      which does not notice one arriving while it runs",
+                                    "power-cycle onto a disc, the way the console starts                                      one that is already in the drive",
                                 )
                                 .clicked()
                             {

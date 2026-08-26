@@ -139,6 +139,12 @@ const CDVD_RESETTLE: u64 = 1200 * CDVD_MS;
 /// ISO sector payload size; DVD reads wrap it in a 2064-byte raw sector.
 const ISO_SECTOR: u64 = 2048;
 
+/// How long the EE takes to recognise a raised INTC line, in EE cycles.
+/// Long enough for a spin loop reading INTC_STAT to get a look in (the
+/// OSD's vertical-blank wait reads it every five cycles), short beside
+/// anything the interrupt timing itself feeds.
+const INTC_LATENCY: u64 = 32;
+
 /// EE cycles per millisecond, for the drive-latency model.
 const CDVD_MS: u64 = 294_912;
 
@@ -1198,6 +1204,9 @@ pub struct Bus {
     /// EE INTC.
     pub intc_stat: u32,
     pub intc_mask: u32,
+    /// Cycle from which the EE may recognise the INTC line, or `u64::MAX`
+    /// while nothing is pending (see [`Bus::intc_changed`]).
+    intc_ready_at: u64,
     /// EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) and SIF1 (ch6),
     /// interrupt status/mask.
     pub dma_vif1: EeDmaChannel,
@@ -1293,6 +1302,7 @@ impl Bus {
             iop_i_ctrl: 0,
             iop_timers: [IopTimer::default(); 6],
             intc_stat: 0,
+            intc_ready_at: u64::MAX,
             intc_mask: 0,
             dma_vif1: EeDmaChannel::default(),
             dma_gif: EeDmaChannel::default(),
@@ -1816,10 +1826,12 @@ impl Bus {
             // INTC: STAT is write-1-to-clear, MASK is write-1-to-toggle.
             0x1000_F000 => {
                 self.intc_stat &= !(v as u32);
+                self.intc_changed();
                 return;
             }
             0x1000_F010 => {
                 self.intc_mask ^= v as u32 & 0xFFFF;
+                self.intc_changed();
                 return;
             }
             0x1000_F200..=0x1000_F26F => {
@@ -1881,6 +1893,7 @@ impl Bus {
         if self.gs.intc_pending {
             self.gs.intc_pending = false;
             self.intc_stat |= 1;
+            self.intc_changed();
         }
     }
 
@@ -1927,6 +1940,7 @@ impl Bus {
             self.iop_i_stat |= 1 << 9;
         }
         self.intc_stat |= self.timers.check_irqs(self.now);
+        self.intc_changed();
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
         let now = self.now;
@@ -1984,11 +1998,13 @@ impl Bus {
     pub fn vblank(&mut self, begin: bool) {
         if begin {
             self.intc_stat |= 1 << 2;
+            self.intc_changed();
             self.iop_i_stat |= 1 << 0;
             self.gs.vblank();
             self.gs_sync_int();
         } else {
             self.intc_stat |= 1 << 3;
+            self.intc_changed();
             self.iop_i_stat |= 1 << 11;
         }
     }
@@ -2161,8 +2177,24 @@ impl Bus {
 
     /// EE interrupt lines: INT0 = INTC, INT1 = DMAC.
     pub fn ee_int0_pending(&self) -> bool {
-        self.intc_stat & self.intc_mask != 0
+        self.now >= self.intc_ready_at
     }
+    /// Re-arm the INTC line after any change to its status or mask.
+    ///
+    /// The EE does not see an interrupt in the cycle its source raises it:
+    /// the line has to reach the core and be recognised at an instruction
+    /// boundary. Modelling that window matters because software polls
+    /// INTC_STAT directly — the OSD waits for vertical blank by clearing
+    /// bit 2 and spinning on it, and with no window at all the kernel's
+    /// own handler acknowledges the bit before the spin can ever read it.
+    fn intc_changed(&mut self) {
+        if self.intc_stat & self.intc_mask == 0 {
+            self.intc_ready_at = u64::MAX;
+        } else if self.intc_ready_at == u64::MAX {
+            self.intc_ready_at = self.now + INTC_LATENCY;
+        }
+    }
+
     pub fn ee_int1_pending(&self) -> bool {
         self.d_stat & self.d_mask & 0x3FF != 0
     }
@@ -2702,6 +2734,7 @@ impl Bus {
                 // EE handler folds the flags into its SREG array and acks.
                 if addr & 0xF0 == 0x30 {
                     self.intc_stat |= 1 << 1;
+                    self.intc_changed();
                 }
             }
             0x1F40_2000..=0x1F40_203F => {

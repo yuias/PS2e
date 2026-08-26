@@ -27,17 +27,17 @@ ps2-app [--bios <path>] [--disc <image>]
 A disc image is a raw ISO of 2048-byte sectors. 2352-byte CD images are not
 supported — the PS2 titles this targets are DVDs.
 
-Without `--disc` the BIOS browser runs, and "Boot disc..." in the Emulation
-menu picks an image and starts the console on it. The machine starts running
-as soon as the window opens.
+Without `--disc` the BIOS browser runs. The machine starts running as soon
+as the window opens.
 
-"Insert disc..." swaps the disc the way the console does: the drive opens,
-the file picker comes up, and the drive closes on whatever was picked —
-cancelling puts the old disc back. Emulation never stops, so a multi-disc
-title can change discs where it asks you to. It takes the drive a few
-seconds to spin the new disc up and identify it, as it does on hardware.
-"Boot disc..." exists because the browser does not notice a disc arriving
-while it is running.
+"Insert disc..." in the Emulation menu swaps the disc the way the console
+does: the drive opens, the file picker comes up, and the drive closes on
+whatever was picked — cancelling puts the old disc back. Emulation never
+stops, so a multi-disc title can change discs where it asks you to, and
+from the browser the console picks the new disc up and boots it on its own.
+It takes the drive a few seconds to spin a disc up and identify it, as it
+does on hardware. "Boot disc..." is the same thing plus a power cycle, for
+starting a disc over.
 
 The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
@@ -163,10 +163,8 @@ that includes the Mips target.
 - Only the keyboard drives the pad; there is no gamepad input, and the
   emulated controller is a digital pad with no analog sticks.
 - Memory cards respond in slot 1 only.
-- The browser does not notice a disc that arrives while it is running;
-  "Boot disc..." power-cycles onto one instead. Swapping mid-game works.
-  A game asking for the next disc has not been tried against a real
-  multi-disc title yet.
+- A game asking for the next disc has not been tried against a real
+  multi-disc title yet, though swapping mid-game works.
 - VU1 has no timing model, and its microprogram runs to completion when
   kicked rather than in step with the EE.
 
