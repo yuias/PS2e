@@ -68,6 +68,11 @@ internal_2x = false
 #r3 = "3"
 #start = "V"
 #select = "C"
+
+# Frontend shortcuts, same key names as [keys].
+#[hotkeys]
+#save_state = "F5"
+#load_state = "F9"
 "#;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -81,6 +86,23 @@ pub struct Config {
     pub swap_fields: bool,
     pub internal_2x: bool,
     pub keys: KeyBindings,
+    pub hotkeys: HotKeys,
+    /// Save-state file. Defaults to state0.sst next to this file.
+    pub state: Option<PathBuf>,
+}
+
+/// Frontend shortcuts, same key names as [`KeyBindings`].
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct HotKeys {
+    pub save_state: String,
+    pub load_state: String,
+}
+
+impl Default for HotKeys {
+    fn default() -> Self {
+        Self { save_state: "F5".into(), load_state: "F9".into() }
+    }
 }
 
 /// One egui key name per digital-pad button, as written in the config
@@ -218,6 +240,8 @@ impl Default for Config {
             swap_fields: false,
             internal_2x: false,
             keys: KeyBindings::default(),
+            hotkeys: HotKeys::default(),
+            state: None,
         }
     }
 }
@@ -244,7 +268,7 @@ impl Config {
                     Ok(mut cfg) => {
                         // Relative paths resolve against the config dir
                         if let Some(dir) = path.parent() {
-                            for p in [&mut cfg.bios, &mut cfg.memcard] {
+                            for p in [&mut cfg.bios, &mut cfg.memcard, &mut cfg.state] {
                                 if let Some(v) = p
                                     && v.is_relative()
                                 {
@@ -276,6 +300,17 @@ impl Config {
             }
         }
         (Config::default(), path)
+    }
+
+    /// Save-state location for windowed sessions: configured path, or
+    /// state0.sst next to the config file.
+    pub fn state_path(&self, cfg_path: Option<&PathBuf>) -> PathBuf {
+        self.state.clone().unwrap_or_else(|| {
+            cfg_path
+                .and_then(|p| p.parent())
+                .map(|d| d.join("state0.sst"))
+                .unwrap_or_else(|| PathBuf::from("state0.sst"))
+        })
     }
 
     /// Memory card image location for windowed sessions: configured path,

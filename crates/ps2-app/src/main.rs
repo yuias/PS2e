@@ -369,6 +369,7 @@ fn run_windowed(
         ..Default::default()
     };
     let wait_debugger = args.wait_debugger;
+    let state_path = cfg.state_path(cfg_path.as_ref());
     let result = eframe::run_native(
         "PS2e",
         options,
@@ -377,6 +378,7 @@ fn run_windowed(
                 bios,
                 nvram_path: Some(nvram_path),
                 memcard_path,
+                state_path,
                 debugger,
                 wait_debugger,
                 volume: cfg.volume,

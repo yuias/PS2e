@@ -40,6 +40,10 @@ pub enum Command {
     CloseTray(Option<std::fs::File>),
     /// Put a disc in the drive and power-cycle onto it.
     BootDisc(Option<std::fs::File>),
+    /// Write the machine to [`WorkerConfig::state_path`].
+    SaveState,
+    /// Restore it from there.
+    LoadState,
     Quit,
 }
 
@@ -112,6 +116,9 @@ pub struct Shared {
     pub internal_2x: AtomicBool,
     /// Debugger attached/halted (set by the worker) drives UI enablement.
     pub debugger_active: AtomicBool,
+    /// Last one-shot result worth showing in the status bar, and whether
+    /// it was a failure.
+    pub notice: Mutex<Option<(String, bool)>>,
 }
 
 /// Deinterlace modes in UI/config order, indexed by `Shared::deinterlace`.
@@ -136,6 +143,8 @@ pub struct WorkerConfig {
     pub nvram_path: Option<PathBuf>,
     /// None disables persistence (headless-style, no card mounted).
     pub memcard_path: Option<PathBuf>,
+    /// Where the window's save state lives.
+    pub state_path: PathBuf,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
     pub volume: f32,
@@ -301,16 +310,53 @@ impl Worker {
                     self.power_cycle(disc);
                     self.running = true;
                 }
+                Command::SaveState if !debugger_active => {
+                    let path = self.cfg.state_path.clone();
+                    let outcome = match self.sys.save_state() {
+                        Ok(data) => match crate::state::write(&path, &data) {
+                            Ok(len) => Ok(format!("state saved ({} MiB)", len / (1 << 20))),
+                            Err(e) => Err(format!("cannot write the state: {e}")),
+                        },
+                        Err(e) => Err(e),
+                    };
+                    self.report(outcome);
+                }
+                Command::LoadState if !debugger_active => {
+                    let path = self.cfg.state_path.clone();
+                    let outcome = crate::state::read(&path)
+                        .map_err(|e| format!("cannot read the state: {e}"))
+                        .and_then(|d| self.sys.load_state(&d))
+                        .map(|()| "state loaded".to_string());
+                    self.report(outcome);
+                }
                 Command::SetRunning(_)
                 | Command::Step
                 | Command::Reset
                 | Command::OpenTray
                 | Command::CloseTray(_)
-                | Command::BootDisc(_) => {}
+                | Command::BootDisc(_)
+                | Command::SaveState
+                | Command::LoadState => {}
                 Command::Quit => return false,
             }
         }
         true
+    }
+
+    /// Publish a one-shot result for the status bar, and log it.
+    fn report(&self, outcome: Result<String, String>) {
+        let text = match &outcome {
+            Ok(msg) => {
+                tracing::info!("{msg}");
+                msg.clone()
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+                e.clone()
+            }
+        };
+        *self.shared.notice.lock().unwrap() = Some((text, outcome.is_err()));
+        self.ctx.request_repaint();
     }
 
     /// Rebuild the machine from the reset vector with `disc` in the drive.

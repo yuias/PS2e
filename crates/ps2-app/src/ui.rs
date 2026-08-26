@@ -67,12 +67,16 @@ pub struct App {
     keymap: Vec<(egui::Key, u16)>,
     /// Last failed disc pick, shown in the status bar until the next one.
     disc_error: Option<String>,
+    hotkey_save: Option<egui::Key>,
+    hotkey_load: Option<egui::Key>,
 }
 
 impl App {
     pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keymap = resolve_keymap(&config.keys);
+        let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
+        let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
         Self {
             emu,
             scale_mode: config.scaler,
@@ -88,6 +92,8 @@ impl App {
             fullscreen: false,
             keymap,
             disc_error: None,
+            hotkey_save,
+            hotkey_load,
         }
     }
 
@@ -198,6 +204,16 @@ impl eframe::App for App {
             self.take_screenshot();
         }
 
+        // Save/load shortcuts; the debugger owns execution while attached.
+        if !debugger_active {
+            if self.hotkey_save.is_some_and(|k| ctx.input(|i| i.key_pressed(k))) {
+                self.emu.send(Command::SaveState);
+            }
+            if self.hotkey_load.is_some_and(|k| ctx.input(|i| i.key_pressed(k))) {
+                self.emu.send(Command::LoadState);
+            }
+        }
+
         // F11 toggles fullscreen; the chrome (menu, status bar, panels)
         // hides while fullscreen so only the display shows.
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
@@ -246,6 +262,18 @@ impl eframe::App for App {
                                 self.insert_disc();
                                 ui.close();
                             }
+                            ui.separator();
+                            let save = &self.config.hotkeys.save_state;
+                            if ui.button(format!("Save state	{save}")).clicked() {
+                                self.emu.send(Command::SaveState);
+                                ui.close();
+                            }
+                            let load = &self.config.hotkeys.load_state;
+                            if ui.button(format!("Load state	{load}")).clicked() {
+                                self.emu.send(Command::LoadState);
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui
                                 .button("Boot disc...")
                                 .on_hover_text(
@@ -301,6 +329,9 @@ impl eframe::App for App {
                             ui.monospace(format!("{name:>8} = {key}"));
                         }
                         ui.separator();
+                        ui.monospace(format!("    save = {}", self.config.hotkeys.save_state));
+                        ui.monospace(format!("    load = {}", self.config.hotkeys.load_state));
+                        ui.separator();
                         ui.label("F11 fullscreen (Esc leaves), F12 screenshot.");
                     });
                 });
@@ -338,6 +369,14 @@ impl eframe::App for App {
                     if let Some(err) = &self.disc_error {
                         ui.separator();
                         ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    }
+                    if let Some((text, failed)) = &*self.emu.shared.notice.lock().unwrap() {
+                        ui.separator();
+                        if *failed {
+                            ui.colored_label(egui::Color32::LIGHT_RED, text);
+                        } else {
+                            ui.monospace(text);
+                        }
                     }
                 });
             });
