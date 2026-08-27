@@ -374,6 +374,12 @@ impl eframe::App for App {
                         _ => "debugger: listening",
                     };
                     ui.monospace(state);
+                    // The image name sits next to the run state: it is what
+                    // identifies the session at a glance.
+                    if let Some(d) = &disc {
+                        ui.separator();
+                        ui.monospace(&d.name);
+                    }
                     ui.separator();
                     ui.monospace(format!(
                         "speed {:3.0}% ({:.0} fps)   audio {:3} ms{}",
@@ -388,10 +394,6 @@ impl eframe::App for App {
                     ));
                     ui.separator();
                     ui.monospace(format!("cycles {}", status.cycles));
-                    if let Some(d) = &disc {
-                        ui.separator();
-                        ui.monospace(format!("disc {}", d.name));
-                    }
                     if let Some(path) = &self.last_screenshot {
                         ui.separator();
                         ui.monospace(format!("saved {path}"));
