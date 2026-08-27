@@ -329,7 +329,7 @@ pub fn report() -> Option<String> {
 ", fills.join(" ")));
         out.push_str("EE hot words (physical RAM address):
 ");
-        for (k, n) in pcs.iter().take(200000) {
+        for (k, n) in pcs.iter().take(40) {
             out.push_str(&format!("  {:#09x} {:5.1}%
 ", k << 2, *n as f64 * 100.0 / total_ops as f64));
         }
