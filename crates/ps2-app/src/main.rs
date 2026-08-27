@@ -16,6 +16,7 @@ mod audio;
 mod config;
 mod display;
 mod emu;
+mod gamepad;
 mod pad;
 mod state;
 mod ui;

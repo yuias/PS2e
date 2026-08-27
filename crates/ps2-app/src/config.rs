@@ -69,6 +69,29 @@ internal_2x = false
 #start = "V"
 #select = "C"
 
+# Gamepad bindings for the same pad. Values name gilrs buttons:
+# "South"/"East"/"North"/"West" for the action pad, "DPadUp".."DPadRight",
+# "LeftTrigger"/"LeftTrigger2"/"RightTrigger"/"RightTrigger2", "Start",
+# "Select", "LeftThumb", "RightThumb", "Mode", "C", "Z". Gamepad input is
+# merged with the keyboard, so either can drive any button.
+#[pad]
+#up = "DPadUp"
+#down = "DPadDown"
+#left = "DPadLeft"
+#right = "DPadRight"
+#cross = "South"
+#circle = "East"
+#square = "West"
+#triangle = "North"
+#l1 = "LeftTrigger"
+#l2 = "LeftTrigger2"
+#r1 = "RightTrigger"
+#r2 = "RightTrigger2"
+#l3 = "LeftThumb"
+#r3 = "RightThumb"
+#start = "Start"
+#select = "Select"
+
 # Frontend shortcuts, same key names as [keys].
 #[hotkeys]
 #save_state = "F5"
@@ -86,6 +109,7 @@ pub struct Config {
     pub swap_fields: bool,
     pub internal_2x: bool,
     pub keys: KeyBindings,
+    pub pad: PadBindings,
     pub hotkeys: HotKeys,
     /// Save-state file. Defaults to state0.sst next to this file.
     pub state: Option<PathBuf>,
@@ -177,6 +201,79 @@ impl KeyBindings {
     }
 }
 
+/// One gilrs button name per digital-pad button, as written in the config
+/// file. Resolved to [`gilrs::Button`] once at startup by
+/// [`crate::gamepad::Gamepad`].
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct PadBindings {
+    pub up: String,
+    pub down: String,
+    pub left: String,
+    pub right: String,
+    pub cross: String,
+    pub circle: String,
+    pub square: String,
+    pub triangle: String,
+    pub l1: String,
+    pub l2: String,
+    pub r1: String,
+    pub r2: String,
+    pub l3: String,
+    pub r3: String,
+    pub start: String,
+    pub select: String,
+}
+
+impl Default for PadBindings {
+    fn default() -> Self {
+        Self {
+            up: "DPadUp".into(),
+            down: "DPadDown".into(),
+            left: "DPadLeft".into(),
+            right: "DPadRight".into(),
+            cross: "South".into(),
+            circle: "East".into(),
+            square: "West".into(),
+            triangle: "North".into(),
+            l1: "LeftTrigger".into(),
+            l2: "LeftTrigger2".into(),
+            r1: "RightTrigger".into(),
+            r2: "RightTrigger2".into(),
+            l3: "LeftThumb".into(),
+            r3: "RightThumb".into(),
+            start: "Start".into(),
+            select: "Select".into(),
+        }
+    }
+}
+
+impl PadBindings {
+    /// Each binding paired with the pad bit it drives, in the same order as
+    /// [`KeyBindings::pairs`].
+    pub fn pairs(&self) -> [(&str, u16); 16] {
+        use crate::pad;
+        [
+            (&self.up, pad::UP),
+            (&self.down, pad::DOWN),
+            (&self.left, pad::LEFT),
+            (&self.right, pad::RIGHT),
+            (&self.cross, pad::CROSS),
+            (&self.circle, pad::CIRCLE),
+            (&self.square, pad::SQUARE),
+            (&self.triangle, pad::TRIANGLE),
+            (&self.l1, pad::L1),
+            (&self.l2, pad::L2),
+            (&self.r1, pad::R1),
+            (&self.r2, pad::R2),
+            (&self.l3, pad::L3),
+            (&self.r3, pad::R3),
+            (&self.start, pad::START),
+            (&self.select, pad::SELECT),
+        ]
+    }
+}
+
 /// Config/UI form of [`ps2_core::gs::Deinterlace`].
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -240,6 +337,7 @@ impl Default for Config {
             swap_fields: false,
             internal_2x: false,
             keys: KeyBindings::default(),
+            pad: PadBindings::default(),
             hotkeys: HotKeys::default(),
             state: None,
         }
@@ -340,5 +438,29 @@ impl Config {
             }
             Err(e) => tracing::warn!("failed to serialize config: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TOML cannot emit a scalar after a table, so the order of `Config`'s
+    /// fields is load-bearing for [`Config::save`].
+    #[test]
+    fn a_saved_config_round_trips() {
+        let mut cfg = Config::default();
+        cfg.bios = Some("bios.bin".into());
+        cfg.memcard = Some("memcard0.ps2".into());
+        cfg.state = Some("state0.sst".into());
+        let text = toml::to_string_pretty(&cfg).expect("serializes");
+        let back: Config = toml::from_str(&text).expect("parses back");
+        assert_eq!(back.pad.circle, cfg.pad.circle);
+        assert_eq!(back.state, cfg.state);
+    }
+
+    #[test]
+    fn the_generated_template_parses() {
+        toml::from_str::<Config>(DEFAULT_TEMPLATE).expect("template is valid TOML");
     }
 }

@@ -61,9 +61,12 @@ title on it, so the serial stands in for one.
 | F5 / F9 | Save / load state |
 | F11 / F12 | Fullscreen (Esc leaves) / screenshot |
 
-The pad and the save/load shortcuts are rebindable; see the `[keys]` and
-`[hotkeys]` tables under [Configuration](#configuration). Fullscreen and
-screenshot are fixed.
+A gamepad drives the same pad in parallel with the keyboard, so either can
+press any button. It is picked up automatically when one is plugged in.
+
+The pad and the save/load shortcuts are rebindable; see the `[keys]`,
+`[pad]` and `[hotkeys]` tables under [Configuration](#configuration).
+Fullscreen and screenshot are fixed.
 
 A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
 working directory, the same encoding as headless `--screenshot`.
@@ -93,6 +96,10 @@ internal_2x = false         # true 2x edges on 3D geometry
 cross = "Z"
 start = "V"
 
+[pad]                       # same pad from a gamepad; gilrs button names
+cross = "South"
+start = "Start"
+
 [hotkeys]                   # frontend shortcuts
 save_state = "F5"
 load_state = "F9"
@@ -103,6 +110,11 @@ Key names are the ones egui reports: letters and digits as themselves
 `"Enter"`, `"Backspace"`, `"Space"`, `"F1"`..`"F35"`. Omitted buttons keep
 their defaults, and an unrecognized name falls back to the default with a
 warning in the log.
+
+Gamepad names are the `gilrs` ones: `"South"`/`"East"`/`"North"`/`"West"`
+for the action pad, `"DPadUp"`..`"DPadRight"`,
+`"LeftTrigger"`/`"LeftTrigger2"` and the right-hand pair, `"Start"`,
+`"Select"`, `"LeftThumb"`/`"RightThumb"`, `"Mode"`, `"C"`, `"Z"`.
 
 Settings changed from the menus are written back when the window closes,
 which replaces the template's comments with the plain values.
@@ -164,8 +176,8 @@ that includes the Mips target.
 
 - The IPU (MPEG decoder) is not implemented, so full-motion video does not
   decode.
-- Only the keyboard drives the pad; there is no gamepad input, and the
-  emulated controller is a digital pad with no analog sticks.
+- The emulated controller is a digital pad: the keyboard and a gamepad both
+  drive it, but the analog sticks read as centred.
 - Memory cards respond in slot 1 only.
 - A game asking for the next disc has not been tried against a real
   multi-disc title yet, though swapping mid-game works.

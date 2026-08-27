@@ -7,6 +7,7 @@
 use crate::config::Config;
 use crate::emu::{Command, DebuggerState, Disc, Emu};
 use eframe::egui;
+use crate::gamepad::Gamepad;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -68,6 +69,8 @@ pub struct App {
     fullscreen: bool,
     /// Key -> pad bit, resolved from the config once at startup.
     keymap: Vec<(egui::Key, u16)>,
+    /// Absent when no gamepad backend is available.
+    gamepad: Option<Gamepad>,
     /// Last failed disc pick, shown in the status bar until the next one.
     disc_error: Option<String>,
     hotkey_save: Option<egui::Key>,
@@ -81,6 +84,7 @@ impl App {
     pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keymap = resolve_keymap(&config.keys);
+        let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
         let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
         Self {
@@ -97,6 +101,7 @@ impl App {
             show_regs: false,
             fullscreen: false,
             keymap,
+            gamepad,
             disc_error: None,
             hotkey_save,
             hotkey_load,
@@ -194,6 +199,7 @@ impl eframe::App for App {
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
         });
+        let buttons = buttons | self.gamepad.as_mut().map_or(0, Gamepad::poll);
         self.emu.shared.buttons.store(buttons, Ordering::Relaxed);
         self.emu
             .shared
@@ -341,10 +347,12 @@ impl eframe::App for App {
                     });
                     ui.menu_button("Help", |ui| {
                         ui.label("Pad, as bound in the config file:");
-                        for (name, (key, _)) in
-                            BUTTON_NAMES.iter().zip(self.config.keys.pairs())
+                        for ((name, (key, _)), (btn, _)) in BUTTON_NAMES
+                            .iter()
+                            .zip(self.config.keys.pairs())
+                            .zip(self.config.pad.pairs())
                         {
-                            ui.monospace(format!("{name:>8} = {key}"));
+                            ui.monospace(format!("{name:>8} = {key} / {btn}"));
                         }
                         ui.separator();
                         ui.monospace(format!("    save = {}", self.config.hotkeys.save_state));
