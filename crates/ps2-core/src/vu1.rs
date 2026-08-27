@@ -27,6 +27,9 @@ pub struct Vu1 {
     /// 16-bit integer registers; vi00 = 0.
     pub(crate) vi: [u16; 16],
     acc: [u32; 4],
+    /// Opcodes already reported as unimplemented, to keep the log readable.
+    #[serde(skip)]
+    warned_ops: std::collections::HashSet<(u8, u8)>,
     pub(crate) q: f32,
     pub(crate) i: f32,
     pub(crate) r: u32,
@@ -58,6 +61,7 @@ impl Vu1 {
             vf,
             vi: [0; 16],
             acc: [0; 4],
+            warned_ops: std::collections::HashSet::new(),
             q: 0.0,
             i: 0.0,
             r: 0,
@@ -91,6 +95,18 @@ impl Vu1 {
         match op {
             // Integer ops (VIADD..VIOR) only exist in the lower pipeline.
             0x30..=0x35 => self.exec_lower_special(gs, gif, 0, instr),
+            // VCALLMS / VCALLMSR start a VU0 microprogram. There is no VU0
+            // micro engine: its memory windows are stubbed and VIF0's
+            // channel discards, so nothing was ever uploaded to run.
+            0x38 | 0x39 => {
+                if self.warned_ops.insert((0, op as u8)) {
+                    warn!(
+                        target: "ps2_core::vu1",
+                        instr = format_args!("{instr:#010x}"),
+                        "VU0 microprogram start ignored, no VU0 (reported once)"
+                    );
+                }
+            }
             0x3C..=0x3F => {
                 let op2 = (instr & 3) | ((instr >> 4) & 0x7C);
                 if op2 >= 0x30 {
@@ -179,14 +195,21 @@ impl Vu1 {
         }
     }
 
-    fn unimplemented(&self, kind: &str, pc: u16, instr: u32) -> ! {
-        tracing::error!(
-            target: "ps2_core::vu1",
-            pc,
-            instr = format_args!("{instr:#010x}"),
-            "unimplemented VU1 {kind}"
-        );
-        panic!("unimplemented VU1 {kind}: instr {instr:#010x} at pair {pc:#x}");
+    /// An opcode with nothing behind it. Killing the machine over one loses
+    /// everything running around it, so the slot behaves as a nop and the
+    /// gap is named once per opcode.
+    fn unimplemented(&mut self, kind: &str, pc: u16, instr: u32) {
+        let op = instr & 0x3F;
+        if self.warned_ops.insert((kind.len() as u8, op as u8)) {
+            warn!(
+                target: "ps2_core::vu1",
+                pc,
+                instr = format_args!("{instr:#010x}"),
+                op = format_args!("{op:#04x}"),
+                "unimplemented VU1 {kind}, running it as a nop (reported once)"
+            );
+
+        }
     }
 
     // --- main loop -------------------------------------------------------
