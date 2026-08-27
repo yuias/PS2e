@@ -35,6 +35,10 @@ pub struct EeDmaChannel {
     pub tadr: u32,
     /// Current tag asked to stop the chain after its data.
     tag_end: bool,
+    /// Return addresses pushed by `call` tags, popped by `ret`. Two deep,
+    /// the same as the DMAC's ASR0/ASR1.
+    asr: [u32; 2],
+    asr_depth: u8,
 }
 
 const EE_CHCR_STR: u32 = 1 << 8;
@@ -2396,6 +2400,29 @@ impl Bus {
                     self.dma_vif1.madr = addr;
                     self.dma_vif1.tadr = self.dma_vif1.tadr.wrapping_add(16);
                 }
+                // call: run the block at `addr`, remembering where to
+                // come back to. ret pops that back off.
+                5 => {
+                    self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
+                    let back = self.dma_vif1.madr.wrapping_add(qwc * 16);
+                    let d = self.dma_vif1.asr_depth as usize;
+                    if d < 2 {
+                        self.dma_vif1.asr[d] = back;
+                        self.dma_vif1.asr_depth += 1;
+                    } else {
+                        warn!(target: "ps2_core::bus::dma", "chain call stack overflow");
+                    }
+                    self.dma_vif1.tadr = addr;
+                }
+                6 => {
+                    self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
+                    if self.dma_vif1.asr_depth > 0 {
+                        self.dma_vif1.asr_depth -= 1;
+                        self.dma_vif1.tadr = self.dma_vif1.asr[self.dma_vif1.asr_depth as usize];
+                    } else {
+                        self.dma_vif1.tag_end = true;
+                    }
+                }
                 7 => {
                     self.dma_vif1.madr = self.dma_vif1.tadr.wrapping_add(16);
                     self.dma_vif1.tag_end = true;
@@ -2475,6 +2502,29 @@ impl Bus {
                     self.dma_ipu_to.madr = addr;
                     self.dma_ipu_to.tadr = self.dma_ipu_to.tadr.wrapping_add(16);
                 }
+                // call: run the block at `addr`, remembering where to
+                // come back to. ret pops that back off.
+                5 => {
+                    self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    let back = self.dma_ipu_to.madr.wrapping_add(qwc * 16);
+                    let d = self.dma_ipu_to.asr_depth as usize;
+                    if d < 2 {
+                        self.dma_ipu_to.asr[d] = back;
+                        self.dma_ipu_to.asr_depth += 1;
+                    } else {
+                        warn!(target: "ps2_core::bus::dma", "chain call stack overflow");
+                    }
+                    self.dma_ipu_to.tadr = addr;
+                }
+                6 => {
+                    self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    if self.dma_ipu_to.asr_depth > 0 {
+                        self.dma_ipu_to.asr_depth -= 1;
+                        self.dma_ipu_to.tadr = self.dma_ipu_to.asr[self.dma_ipu_to.asr_depth as usize];
+                    } else {
+                        self.dma_ipu_to.tag_end = true;
+                    }
+                }
                 7 => {
                     self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
                     self.dma_ipu_to.tag_end = true;
@@ -2544,6 +2594,29 @@ impl Bus {
                 3 | 4 => {
                     self.dma_gif.madr = addr;
                     self.dma_gif.tadr = self.dma_gif.tadr.wrapping_add(16);
+                }
+                // call: run the block at `addr`, remembering where to
+                // come back to. ret pops that back off.
+                5 => {
+                    self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
+                    let back = self.dma_gif.madr.wrapping_add(qwc * 16);
+                    let d = self.dma_gif.asr_depth as usize;
+                    if d < 2 {
+                        self.dma_gif.asr[d] = back;
+                        self.dma_gif.asr_depth += 1;
+                    } else {
+                        warn!(target: "ps2_core::bus::dma", "chain call stack overflow");
+                    }
+                    self.dma_gif.tadr = addr;
+                }
+                6 => {
+                    self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
+                    if self.dma_gif.asr_depth > 0 {
+                        self.dma_gif.asr_depth -= 1;
+                        self.dma_gif.tadr = self.dma_gif.asr[self.dma_gif.asr_depth as usize];
+                    } else {
+                        self.dma_gif.tag_end = true;
+                    }
                 }
                 7 => {
                     self.dma_gif.madr = self.dma_gif.tadr.wrapping_add(16);
