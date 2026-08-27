@@ -3057,6 +3057,10 @@ impl Bus {
             // USBD) waits forever.
             0x1F80_1600 => 0x10,
             0x1F80_1608 => read_le::<N>(&self.iop_mmio, off) as u32 & !1,
+            0x1F80_160C..=0x1F80_16FF => {
+                self.warn_stub(addr, "USB host controller");
+                read_le::<N>(&self.iop_mmio, off) as u32
+            }
             _ => {
                 let v = read_le::<N>(&self.iop_mmio, off) as u32;
                 trace!(target: "ps2_core::iop::bus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "IOP MMIO read (shadow)");
