@@ -19,10 +19,11 @@ const DEFAULT_TEMPLATE: &str = r#"# PS2e configuration
 # this file is in. Falls back to assets/SCPH-50000.bin when unset.
 #bios = "path/to/bios.bin"
 
-# Video timing: "ntsc" (60 Hz) or "pal" (50 Hz). This sets the refresh and
-# the horizontal-blank rates only; it does not change what software detects
-# as the console's region, which comes from the BIOS image itself, so a PAL
-# title still wants a PAL BIOS. --region overrides this.
+# Video timing before software programs the CRTC: "ntsc" (60 Hz) or "pal"
+# (50 Hz). The kernel's SetGsCrt takes over from there, and an NTSC BIOS
+# programs NTSC during its own boot, so this is a pre-boot default rather
+# than a way to force 50 Hz -- for that, run a PAL BIOS. --region overrides
+# this.
 region = "ntsc"
 
 # Master volume, 0.0 .. 1.0
@@ -109,7 +110,8 @@ internal_2x = false
 #[serde(default)]
 pub struct Config {
     pub bios: Option<PathBuf>,
-    /// Video timing region; `--region` overrides it.
+    /// Video timing region before software programs the CRTC; `--region`
+    /// overrides it.
     pub region: Region,
     pub volume: f32,
     pub memcard: Option<PathBuf>,

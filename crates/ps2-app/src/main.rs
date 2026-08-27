@@ -52,7 +52,8 @@ struct Args {
     no_jit: bool,
     /// Render internally at 2x and scan out the overlay.
     internal_2x: bool,
-    /// Video timing region; overrides the config file when set.
+    /// Video timing region before software programs the CRTC; overrides the
+    /// config file when set.
     region: Option<Region>,
     /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
@@ -208,7 +209,7 @@ fn parse_args() -> Result<Args, String> {
                      --gs-inline      render on the emulation thread (no GS worker)\n\
                      --no-jit         interpret the EE instead of recompiling it\n\
                      --internal-2x    render internally at 2x (sharper 3D)\n\
-                     --region         video timing, 'ntsc' (default) or 'pal'\n\
+                     --region         video timing until SetGsCrt, 'ntsc' (default) or 'pal'\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
@@ -403,7 +404,7 @@ fn run_windowed(
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
             let render_state = cc.wgpu_render_state.as_ref().expect("the wgpu renderer is selected");
             display::init(render_state);
-            Ok(Box::new(ui::App::new(emu, cfg, cfg_path, region)))
+            Ok(Box::new(ui::App::new(emu, cfg, cfg_path)))
         }),
     );
     match result {

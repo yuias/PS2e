@@ -104,6 +104,8 @@ pub struct Status {
     pub audio_buffered: usize,
     /// Callbacks that ran out of samples (audible as crackle).
     pub audio_underruns: u64,
+    /// Video timing the machine is running at now (software can change it).
+    pub region: Region,
     /// EE core: pc, 128-bit GPRs (low half first), HI/LO and COP0 regs.
     pub ee_pc: u32,
     pub ee_gpr: [[u64; 2]; 32],
@@ -183,7 +185,7 @@ pub struct WorkerConfig {
     pub disc_name: Option<String>,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
-    /// Video timing region, re-applied on reset.
+    /// Video timing region the machine starts in; re-applied on reset.
     pub region: Region,
     pub volume: f32,
 }
@@ -513,6 +515,7 @@ impl Worker {
             let mut st = self.shared.status.lock().unwrap();
             st.cycles = self.sys.cycles;
             st.running = self.running;
+            st.region = self.sys.region();
             st.debugger = match &self.cfg.debugger {
                 None => DebuggerState::None,
                 Some(d) if d.attached() && d.halted() => DebuggerState::Halted,

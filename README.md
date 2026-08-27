@@ -85,7 +85,7 @@ run. CLI flags override the file.
 
 ```toml
 bios = "path/to/bios.bin"   # falls back to assets/SCPH-50000.bin
-region = "ntsc"             # video timing: ntsc (60 Hz) | pal (50 Hz)
+region = "ntsc"             # video timing before SetGsCrt: ntsc | pal
 volume = 0.5                # master volume, 0.0..1.0
 memcard = "memcard0.ps2"    # created and formatted automatically
 scaler = "sharp"            # nearest | linear | sharp | lanczos
@@ -147,13 +147,16 @@ to run, which is what changes get checked against.
 | `--no-jit` | Interpret the EE instead of recompiling it |
 | `--gs-inline` | Render on the emulation thread, no GS worker |
 | `--internal-2x` | Render internally at 2x |
-| `--region <r>` | Video timing, `ntsc` (default) or `pal` |
+| `--region <r>` | Video timing until `SetGsCrt`, `ntsc` (default) or `pal` |
 
 `--window` opens the window even when `--cycles` is given.
 
-`--region` sets the refresh and horizontal-blank rates only. What software
-detects as the console's region comes from the BIOS image itself, so a PAL
-title still wants a PAL BIOS.
+`--region` only sets the refresh and horizontal-blank rates the machine
+starts with. Software owns the CRTC from there: the kernel's `SetGsCrt`
+programs SMODE1's `CMOD` field, and an NTSC BIOS does so during its own
+boot, so this is a pre-boot default rather than a way to force 50 Hz --
+running a PAL BIOS is. It is also not what software *detects* as the
+console's region, which comes from the BIOS image's ROMVER.
 
 ## Debugger (LLDB / GDB)
 
