@@ -1481,6 +1481,28 @@ impl Bus {
     }
 
     /// Queue an EE DMAC completion interrupt a little into the future.
+    /// Report an unmodelled corner of the machine once, so the log names the
+    /// gap without drowning in it.
+    fn warn_stub(&mut self, addr: u32, what: &str) {
+        if self.warned_unmapped.insert(addr & !0xFFF) {
+            warn!(target: "ps2_core::bus::stub", addr = format_args!("{addr:#010x}"), what,
+                "not modelled (reported once per page)");
+        }
+    }
+
+    /// A DMA channel with nothing behind it: complete the transfer so the
+    /// software does not wait on it forever, and say so.
+    fn ee_dma_stub<const N: usize>(&mut self, addr: u32, ch: u32, v: u64, what: &str) {
+        let off = (addr & 0xFFFF) as usize;
+        if v as u32 & EE_CHCR_STR == 0 {
+            write_le::<N>(&mut self.mmio, off, v);
+            return;
+        }
+        self.warn_stub(addr, what);
+        write_le::<N>(&mut self.mmio, off, v & !(EE_CHCR_STR as u64));
+        self.ee_dma_irq(ch);
+    }
+
     fn ee_dma_irq(&mut self, ch: u32) {
         self.dma_irq_queue.push((1 << ch, self.now + 1024));
         self.timers_due = 0;
@@ -1702,14 +1724,14 @@ impl Bus {
                 read_le::<N>(&self.vu1.data, (addr & 0x3FFF) as usize)
             }
             0x1100_0000..=0x1100_7FFF => {
-                trace!(target: "ps2_core::bus", addr, "VU0 memory read (stub)");
+                self.warn_stub(addr, "VU0 memory");
                 0
             }
             0x1200_0000..=0x1200_1FFF => self.read_gs_priv::<N>(addr),
             0x1C00_0000..=0x1C1F_FFFF => read_le::<N>(&self.iop_ram, (addr & 0x1F_FFFF) as usize),
             0x1F80_0000..=0x1F80_FFFF => {
                 // IOP MMIO window as seen from the EE.
-                trace!(target: "ps2_core::bus", addr, "IOP MMIO read from EE (stub)");
+                self.warn_stub(addr, "IOP MMIO window seen from the EE");
                 0
             }
             0x1FC0_0000..=0x1FFF_FFFF => read_le::<N>(&self.bios, (addr & 0x3F_FFFF) as usize),
@@ -1721,7 +1743,7 @@ impl Bus {
             // SBUS CRT-controller command interface used by ROMGSCRT:
             // +0x06 status (bit1 = command done, bit0 = busy), +0x10 data.
             0x1A00_0000..=0x1A00_FFFF => {
-                trace!(target: "ps2_core::bus::sbus", addr = format_args!("{addr:#010x}"), "SBUS read (stub)");
+                self.warn_stub(addr, "SBUS");
                 match addr & 0xFF {
                     0x06 => 2,
                     _ => 0,
@@ -1752,20 +1774,20 @@ impl Bus {
                 write_le::<N>(&mut self.vu1.data, (addr & 0x3FFF) as usize, v)
             }
             0x1100_0000..=0x1100_7FFF => {
-                trace!(target: "ps2_core::bus", addr, "VU0 memory write (stub)");
+                self.warn_stub(addr, "VU0 memory");
             }
             0x1200_0000..=0x1200_1FFF => self.write_gs_priv::<N>(addr, v),
             0x1C00_0000..=0x1C1F_FFFF => {
                 write_le::<N>(&mut self.iop_ram, (addr & 0x1F_FFFF) as usize, v)
             }
             0x1F80_0000..=0x1F80_FFFF => {
-                trace!(target: "ps2_core::bus", addr, "IOP MMIO write from EE (stub)");
+                self.warn_stub(addr, "IOP MMIO window seen from the EE");
             }
             0x1FC0_0000..=0x1FFF_FFFF => {
                 warn!(target: "ps2_core::bus", addr = format_args!("{addr:#010x}"), "write to BIOS ROM ignored");
             }
             0x1A00_0000..=0x1A00_FFFF => {
-                trace!(target: "ps2_core::bus::sbus", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#x}"), "SBUS write (stub)");
+                self.warn_stub(addr, "SBUS");
             }
             _ => {
                 if self.warned_unmapped.insert(addr) {
@@ -1889,20 +1911,30 @@ impl Bus {
                 self.dma_gif.tadr = v as u32;
                 return;
             }
-            // VIF0 (ch0): no VU0 yet. Complete immediately so nothing waits
-            // forever on it; log so the gap stays visible.
+            // Channels with nothing behind them. They complete immediately so
+            // nothing waits forever, and each names itself once in the log.
             0x1000_8000 => {
-                if v as u32 & EE_CHCR_STR != 0 {
-                    warn!(target: "ps2_core::bus::dma", "VIF0 DMA discarded (no VU0 yet)");
-                    self.ee_dma_irq(0);
-                    write_le::<4>(
-                        &mut self.mmio,
-                        (addr & 0xFFFF) as usize,
-                        v & !(EE_CHCR_STR as u64),
-                    );
-                } else {
-                    write_le::<4>(&mut self.mmio, (addr & 0xFFFF) as usize, v);
-                }
+                self.ee_dma_stub::<N>(addr, 0, v, "VIF0 channel (no VU0)");
+                return;
+            }
+            0x1000_B000 => {
+                self.ee_dma_stub::<N>(addr, 3, v, "IPU_FROM channel (no IPU)");
+                return;
+            }
+            0x1000_B400 => {
+                self.ee_dma_stub::<N>(addr, 4, v, "IPU_TO channel (no IPU)");
+                return;
+            }
+            0x1000_C800 => {
+                self.ee_dma_stub::<N>(addr, 7, v, "SIF2 channel");
+                return;
+            }
+            0x1000_D000 => {
+                self.ee_dma_stub::<N>(addr, 8, v, "fromSPR channel");
+                return;
+            }
+            0x1000_D400 => {
+                self.ee_dma_stub::<N>(addr, 9, v, "toSPR channel");
                 return;
             }
             // VIF1 channel: starting a transfer runs it to completion.
@@ -1924,6 +1956,13 @@ impl Bus {
             0x1000_9030 => {
                 self.dma_vif1.tadr = v as u32;
                 return;
+            }
+            // IPU command and control registers, and the IPU's own FIFO.
+            // Nothing decodes MPEG yet: the block is the plain shadow below,
+            // which lets the setup commands the BIOS issues read back, but a
+            // decode would produce nothing. Say so rather than go quiet.
+            0x1000_2000..=0x1000_203F | 0x1000_7000..=0x1000_7FF0 => {
+                self.warn_stub(addr, "IPU");
             }
             // GIF FIFO: PATH3 fed by programmed writes instead of channel 2
             // (the BIOS initialises the GS register file this way). The
