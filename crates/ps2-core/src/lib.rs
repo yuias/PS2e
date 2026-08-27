@@ -26,12 +26,14 @@ pub const EE_PER_IOP: u64 = 8;
 /// EE cycles per video frame on an NTSC machine (~60 Hz).
 pub const EE_CYCLES_PER_FRAME: u64 = EE_CLOCK_HZ / 60;
 
-/// Video timing region, fixed when the machine is built.
+/// Video timing region: the vertical refresh and the horizontal-blank rates
+/// the timers count.
 ///
-/// This selects the vertical refresh and the horizontal-blank rates the
-/// timers count. It does *not* change what software detects as the
-/// console's region: that comes from the BIOS image's own ROMVER, so a PAL
-/// title still wants a PAL BIOS.
+/// Software owns this. The kernel's `SetGsCrt` programs SMODE1's CMOD field
+/// from its `pal_ntsc` argument, and [`bus::Bus`] follows that write, so the
+/// region a machine is built with only holds until the first one. It is
+/// still not what software *detects* as the console's region: that comes
+/// from the BIOS image's own ROMVER, so a PAL title wants a PAL BIOS.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -143,9 +145,9 @@ impl Ps2System {
         Self::new_with_region(bios, cfg!(feature = "threads"), region)
     }
 
-    /// [`Ps2System::new_with`] in a chosen video timing [`Region`]. The
-    /// region is fixed for the life of the machine; a loaded save state
-    /// brings its own.
+    /// [`Ps2System::new_with`] in a chosen video timing [`Region`], which
+    /// holds until software programs the CRTC (and a loaded save state
+    /// brings its own).
     pub fn new_with_region(
         bios: Vec<u8>,
         gs_threaded: bool,
@@ -295,6 +297,19 @@ impl Ps2System {
         self.bus.region.vblank_start()
     }
 
+    /// Bring `frame_pos` back inside the frame. Software can change the
+    /// region mid-frame (see [`bus::Bus::write_gs_priv`]), leaving a
+    /// position the new, shorter frame has already passed; one subtraction
+    /// always suffices, since the difference between the two frame lengths
+    /// is smaller than either of them.
+    #[inline]
+    fn wrap_frame_pos(&mut self) {
+        let frame = self.frame_cycles();
+        if self.frame_pos >= frame {
+            self.frame_pos -= frame;
+        }
+    }
+
     /// Everything but the EE for one cycle: the IOP slot, timers, vblank
     /// edges, and the idle wake-up check.
     #[inline]
@@ -327,9 +342,7 @@ impl Ps2System {
             event = true;
         }
         self.frame_pos += 1;
-        if self.frame_pos == self.frame_cycles() {
-            self.frame_pos = 0;
-        }
+        self.wrap_frame_pos();
         self.cycles += 1;
         if self.ee.idle && event && self.ee.interrupt_pending(&self.bus) {
             self.ee.idle = false;
@@ -401,9 +414,7 @@ impl Ps2System {
                     self.wake_idle_ee();
                 }
                 self.frame_pos += 1;
-                if self.frame_pos == self.frame_cycles() {
-                    self.frame_pos = 0;
-                }
+                self.wrap_frame_pos();
                 self.cycles += 1;
             }
         }
@@ -424,7 +435,7 @@ impl Ps2System {
         let to_vblank = if self.frame_pos < vbl_start {
             vbl_start - self.frame_pos
         } else {
-            self.frame_cycles() - self.frame_pos
+            self.frame_cycles().saturating_sub(self.frame_pos)
         };
         to_timer.min(to_vblank).min(limit)
     }
@@ -436,9 +447,7 @@ impl Ps2System {
     fn jump(&mut self, k: u64) {
         self.cycles += k;
         self.frame_pos += k;
-        if self.frame_pos == self.frame_cycles() {
-            self.frame_pos = 0;
-        }
+        self.wrap_frame_pos();
     }
 
     /// Run the rest of the machine for `n` cycles after the EE retired that
@@ -503,7 +512,7 @@ impl Ps2System {
         let to_vblank = if self.frame_pos < vbl_start {
             vbl_start - self.frame_pos
         } else {
-            self.frame_cycles() - self.frame_pos
+            self.frame_cycles().saturating_sub(self.frame_pos)
         };
         let due = self.bus.timers_due.max(self.cycles);
         let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
@@ -526,9 +535,7 @@ impl Ps2System {
         // The batch may end exactly on the frame edge; `machine_cycle`
         // recognises the vblank-end edge by a wrapped position, not by the
         // frame length.
-        if self.frame_pos == self.frame_cycles() {
-            self.frame_pos = 0;
-        }
+        self.wrap_frame_pos();
     }
 
     #[inline]

@@ -1321,6 +1321,13 @@ impl IopTimer {
         now + to_target.min(to_wrap) * p - phase
     }
 
+    /// Restart the count from where it stands, so a change of clock rate
+    /// does not reinterpret the span already elapsed.
+    fn rebase(&mut self, idx: usize, now: u64, region: Region) {
+        self.base = self.count(idx, now, region);
+        self.base_cycle = now;
+    }
+
     fn count(&self, idx: usize, now: u64, region: Region) -> u32 {
         let sys = now.saturating_sub(self.base_cycle) / 8;
         let external = self.mode & (1 << 8) != 0;
@@ -1432,7 +1439,8 @@ pub struct Bus {
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
     pub now: u64,
-    /// Video timing region, fixed when the machine is built.
+    /// Video timing region; software moves it by programming SMODE1 (see
+    /// [`Bus::set_region_from_smode1`]).
     pub region: Region,
     /// Kernel TTY output captured from the EE SIO TXFIFO (observation only).
     pub tty_buffer: String,
@@ -2301,7 +2309,36 @@ impl Bus {
             }
         };
         self.gs.priv_write(addr & !0x7, v);
+        if addr & 0x1FF0 == 0x0010 {
+            self.set_region_from_smode1(v);
+        }
         self.gs_sync_int();
+    }
+
+    /// Follow the CRTC mode software programmed: SMODE1's CMOD field selects
+    /// the composite encoder, and the kernel's `SetGsCrt` writes it from the
+    /// caller's `pal_ntsc` argument. Other values are the progressive and
+    /// DTV modes, whose refresh is not encoded here, so they leave the rate
+    /// as it is.
+    fn set_region_from_smode1(&mut self, v: u64) {
+        let region = match (v >> 13) & 3 {
+            2 => Region::Ntsc,
+            3 => Region::Pal,
+            _ => return,
+        };
+        if self.region == region {
+            return;
+        }
+        debug!(target: "ps2_core::gs::crtc", ?region, "video timing changed");
+        // Counts are reconstructed from (now - base_cycle), so the hblank
+        // divisor changing would reinterpret the whole elapsed span. Freeze
+        // each timer at the count it has under the old region first.
+        let (now, old) = (self.now, self.region);
+        self.timers.rebase(now, old);
+        for (t, timer) in self.iop_timers.iter_mut().enumerate() {
+            timer.rebase(t, now, old);
+        }
+        self.region = region;
     }
 
     /// Fold a pending GS interrupt edge into EE INTC bit 0.

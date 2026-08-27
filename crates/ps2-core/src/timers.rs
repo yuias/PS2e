@@ -114,6 +114,15 @@ impl Timers {
     /// only event [`Timers::check_irqs`] reacts to), or `u64::MAX`. A
     /// check at or after that cycle sees the crossing; earlier checks have
     /// nothing to find.
+    /// Restart every count from where it stands, so a change of clock rate
+    /// does not reinterpret the span already elapsed.
+    pub fn rebase(&mut self, now: u64, region: Region) {
+        for timer in &mut self.timers {
+            timer.base = timer.count(now, region);
+            timer.base_cycle = now;
+        }
+    }
+
     pub fn next_event(&self, now: u64, region: Region) -> u64 {
         let mut due = u64::MAX;
         for timer in &self.timers {

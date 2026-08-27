@@ -70,6 +70,50 @@ fn a_loaded_state_brings_its_own_region() {
     assert_eq!(ntsc.region(), Region::Pal);
 }
 
+/// SMODE1 values the reference SCPH-50000 kernel's `SetGsCrt` writes; they
+/// differ only in CMOD (bits 13-14), 2 = NTSC and 3 = PAL.
+const SMODE1_NTSC: u64 = 0x0000_0007_4083_4504;
+const SMODE1_PAL: u64 = 0x0000_0007_4083_6504;
+/// One of the progressive modes: CMOD 0, no composite encoder.
+const SMODE1_VESA: u64 = 0x0014_020c_3080_1e04;
+
+#[test]
+fn smode1_selects_the_region() {
+    let mut sys = Ps2System::new_with_region(vec![0u8; BIOS_SIZE], false, Region::Ntsc).unwrap();
+    sys.bus.write64(0xB200_0010, SMODE1_PAL);
+    assert_eq!(sys.region(), Region::Pal);
+    // A progressive mode carries no refresh here, so it leaves the rate.
+    sys.bus.write64(0xB200_0010, SMODE1_VESA);
+    assert_eq!(sys.region(), Region::Pal);
+    sys.bus.write64(0xB200_0010, SMODE1_NTSC);
+    assert_eq!(sys.region(), Region::Ntsc);
+}
+
+/// Switching to the shorter frame leaves a frame position the new frame has
+/// already passed; without the wrap it would never reach the edge again.
+#[test]
+fn a_switch_to_a_shorter_frame_keeps_the_vblanks_coming() {
+    let mut sys = Ps2System::new_with_region(vec![0u8; BIOS_SIZE], false, Region::Pal).unwrap();
+    // Past the NTSC frame length, but short of PAL's own first edge, so
+    // the frame position is one no NTSC frame can still reach.
+    while sys.cycles < Region::Ntsc.cycles_per_frame() + 500_000 {
+        sys.run(4096);
+    }
+    assert!(sys.cycles < Region::Pal.cycles_per_frame(), "the PAL frame already wrapped");
+    sys.bus.intc_stat &= !(1 << 2);
+    sys.bus.write64(0xB200_0010, SMODE1_NTSC);
+    assert_eq!(sys.region(), Region::Ntsc);
+
+    let started = sys.cycles;
+    while sys.bus.intc_stat & (1 << 2) == 0 {
+        assert!(
+            sys.cycles - started < 2 * Region::Ntsc.cycles_per_frame(),
+            "no vblank within two frames of the switch"
+        );
+        sys.run(4096);
+    }
+}
+
 #[test]
 fn default_region_is_ntsc() {
     let sys = Ps2System::new_with(vec![0u8; BIOS_SIZE], false).unwrap();
