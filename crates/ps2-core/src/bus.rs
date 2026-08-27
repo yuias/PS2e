@@ -789,6 +789,8 @@ pub const MEMCARD_PAGE: usize = 528;
 pub const MEMCARD_PAGES: usize = 16384;
 /// Pages per erase block.
 const MEMCARD_BLOCK: usize = 16;
+/// VIF_STAT.FDR: the VIF FIFO's transfer direction.
+const VIF_STAT_FDR: u64 = 1 << 23;
 /// Sector size the PS1 read command works in, unrelated to the PS2 page size.
 const PS1_SECTOR: usize = 128;
 
@@ -1733,6 +1735,16 @@ impl Bus {
                     0
                 }
             }
+            // GIF_STAT. Channel 2 and the FIFO both run to completion inside
+            // the write that starts them, so the GIF is idle whenever the EE
+            // can look: no path queued or active, FIFO empty, EE-to-GS
+            // direction. The mask bits would come from GIF_MODE, which
+            // nothing has needed yet.
+            0x1000_3020 => 0,
+            // VIF0_STAT / VIF1_STAT. Same story — the parser is never caught
+            // mid-code. FDR is kept as written; GS-to-EE readback through the
+            // FIFO is not modelled, and a set FDR is warned about on write.
+            0x1000_3800 | 0x1000_3C00 => read_le::<4>(&self.mmio, off & !3) & VIF_STAT_FDR,
             // EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) / SIF1 (ch6),
             // interrupt status. Transfers run to completion inside the CHCR
             // write, so a poll of the start bit always sees it clear.
@@ -1850,6 +1862,11 @@ impl Bus {
                     self.gif.process(&mut self.gs, lo, hi);
                 }
                 return;
+            }
+            // VIF1_STAT is read-only apart from FDR, which picks the FIFO's
+            // direction. Nothing has needed the GS-to-EE side yet.
+            0x1000_3C00 if v & u64::from(VIF_STAT_FDR) != 0 => {
+                warn!(target: "ps2_core::bus::vif", "VIF1 GS-to-EE readback requested (not modelled)");
             }
             // VIF1 FIFO: direct programmed writes feed the same parser.
             0x1000_5000..=0x1000_5FF0 => {
