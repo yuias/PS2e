@@ -1719,7 +1719,9 @@ impl Bus {
 
     /// Side-effect-free EE-side read for the debugger. Takes `&mut self`
     /// only because translation feeds the TLB cache (invisible to software).
-    /// MMIO returns `None` so inspection cannot disturb device state.
+    /// MMIO is served only where the read is a plain load of state (see
+    /// [`Bus::peek_mmio`]); anything that would advance a device returns
+    /// `None`.
     pub fn peek8(&mut self, vaddr: u32) -> Option<u8> {
         let addr = self.translate(vaddr);
         match addr {
@@ -1727,8 +1729,51 @@ impl Bus {
             0x7000_0000..=0x7000_3FFF => Some(self.spad[(addr & 0x3FFF) as usize]),
             0x1C00_0000..=0x1C1F_FFFF => Some(self.iop_ram[(addr & 0x1F_FFFF) as usize]),
             0x1FC0_0000..=0x1FFF_FFFF => Some(self.bios[(addr & 0x3F_FFFF) as usize]),
-            _ => None,
+            _ => self.peek_mmio(addr),
         }
+    }
+
+    /// Side-effect-free MMIO byte read for the debugger.
+    ///
+    /// Only registers whose read path is a plain load of state are served,
+    /// so that a peek can never advance the machine: FIFOs, the RDRAM
+    /// handshake at MCH_DRD and everything not listed stay refused
+    /// (`None`), rather than being answered with a value a real read would
+    /// not have produced.
+    fn peek_mmio(&mut self, addr: u32) -> Option<u8> {
+        // GS privileged registers are 64 bits wide; `priv_read` is a shadow
+        // load (CSR's write-1-to-clear lives on the write path).
+        if let 0x1200_0000..=0x1200_1FFF = addr {
+            let v = self.gs.priv_read(addr & !0x7);
+            return Some((v >> ((addr & 7) * 8)) as u8);
+        }
+        let reg = addr & !0x3;
+        let chan = |c: &EeDmaChannel, reg: u32| match reg & 0x30 {
+            0x00 => Some(c.chcr),
+            0x10 => Some(c.madr),
+            0x20 => Some(c.qwc),
+            0x30 => Some(c.tadr),
+            _ => None,
+        };
+        let v = match reg {
+            // EE timers: the count derives from `now`, nothing latches.
+            0x1000_0000..=0x1000_1FFF => self.timers.read(reg, self.now),
+            // EE DMAC channels and its interrupt status/mask.
+            0x1000_8000..=0x1000_803F => chan(&self.dma_vif0, reg)?,
+            0x1000_9000..=0x1000_903F => chan(&self.dma_vif1, reg)?,
+            0x1000_A000..=0x1000_A03F => chan(&self.dma_gif, reg)?,
+            0x1000_B400..=0x1000_B43F => chan(&self.dma_ipu_to, reg)?,
+            0x1000_C000..=0x1000_C03F => chan(&self.dma_sif0, reg)?,
+            0x1000_C400..=0x1000_C43F => chan(&self.dma_sif1, reg)?,
+            0x1000_E010 => self.d_stat | (self.d_mask << 16),
+            // EE INTC.
+            0x1000_F000 => self.intc_stat,
+            0x1000_F010 => self.intc_mask,
+            // SIF mailboxes, flags and the control handshake.
+            0x1000_F200..=0x1000_F26F => self.sif.ee_read(reg),
+            _ => return None,
+        };
+        Some((v >> ((addr & 3) * 8)) as u8)
     }
 
     /// Side-effect-free EE-side write for the debugger. ROM and MMIO are
@@ -3721,5 +3766,24 @@ mod tests {
         assert_eq!(b.read32(0x1000_F440), 0x1F);
         assert_eq!(b.read32(0x1000_F440), 0x1F);
         assert_eq!(b.read32(0x1000_F440), 0);
+    }
+
+    #[test]
+    fn debugger_peeks_gs_priv_and_refuses_the_rdram_handshake() {
+        let mut b = bus();
+        // SMODE1 (write-only to software) still reads back for a debugger.
+        b.write64(0xB200_0010, 0x0000_0000_C74F_0F1E);
+        assert_eq!(b.peek8(0xB200_0010), Some(0x1E));
+        assert_eq!(b.peek8(0xB200_0013), Some(0xC7));
+        // SYNCHV, which is otherwise only visible in the shadow array.
+        b.write64(0xB200_0060, 0x00C7_800A_1500_0801);
+        assert_eq!(b.peek8(0xB200_0066), Some(0xC7));
+
+        b.write32(0x1000_F010, 0x0000_0400);
+        assert_eq!(b.peek8(0xB000_F011), Some(0x04));
+
+        // MCH_DRD advances the RDRAM device count on read, so it stays
+        // refused rather than being answered from a peek.
+        assert_eq!(b.peek8(0xB000_F440), None);
     }
 }

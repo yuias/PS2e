@@ -162,8 +162,10 @@ fn memory_access_and_segment_aliasing() {
     assert_eq!(c.roundtrip("m100000,4"), "11223344");
     // KSEG0 alias of the same RAM.
     assert_eq!(c.roundtrip("m80100000,4"), "11223344");
-    // MMIO refuses debugger access.
-    assert_eq!(c.roundtrip("m10000000,4"), "E01");
+    // MMIO whose read is a plain load of state is peekable (INTC_MASK).
+    assert_eq!(c.roundtrip("mb000f010,4"), "00000000");
+    // Anything else still refuses, so a peek cannot advance a device.
+    assert_eq!(c.roundtrip("mbf800000,4"), "E01");
 
     let mut iop = Client::connect(h.iop_port);
     assert_eq!(iop.roundtrip("M9000,4:aabbccdd"), "OK");
