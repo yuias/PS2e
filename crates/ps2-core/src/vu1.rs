@@ -217,6 +217,7 @@ impl Vu1 {
             warn!(
                 target: "ps2_core::vu1",
                 qw = format_args!("{qw:#x}"),
+                bytes = self.data.len(),
                 "data access past this VU's memory, wrapping (reported once)"
             );
         }

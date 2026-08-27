@@ -1372,6 +1372,7 @@ pub struct Bus {
     pub gs: GsFront,
     pub gif: Gif,
     pub ipu: crate::ipu::Ipu,
+    pub vif0: Vif,
     pub vif1: Vif,
     pub vu1: Vu1,
     /// VU0 register state for COP2 macro mode (reuses the VU core; its
@@ -1403,6 +1404,7 @@ pub struct Bus {
     intc_ready_at: u64,
     /// EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) and SIF1 (ch6),
     /// interrupt status/mask.
+    pub dma_vif0: EeDmaChannel,
     pub dma_vif1: EeDmaChannel,
     pub dma_ipu_to: EeDmaChannel,
     pub dma_gif: EeDmaChannel,
@@ -1483,6 +1485,7 @@ impl Bus {
             mmio,
             gs: if gs_threaded { GsFront::new() } else { GsFront::inline() },
             gif: Gif::new(),
+            vif0: Vif::new(),
             vif1: Vif::new(),
             vu0: Vu1::new(),
             vu1: Vu1::new(),
@@ -1499,6 +1502,7 @@ impl Bus {
             intc_stat: 0,
             intc_ready_at: u64::MAX,
             intc_mask: 0,
+            dma_vif0: EeDmaChannel::default(),
             dma_vif1: EeDmaChannel::default(),
             dma_gif: EeDmaChannel::default(),
             ipu: crate::ipu::Ipu::new(),
@@ -1930,7 +1934,11 @@ impl Bus {
             // mid-code. FDR is kept as written; GS-to-EE readback through the
             // FIFO is not modelled, and a set FDR is warned about on write.
             0x1000_3800 | 0x1000_3C00 => read_le::<4>(&self.mmio, off & !3) & VIF_STAT_FDR,
-            // EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) / SIF1 (ch6),
+            0x1000_8000 => self.dma_vif0.chcr as u64,
+            0x1000_8010 => self.dma_vif0.madr as u64,
+            0x1000_8020 => self.dma_vif0.qwc as u64,
+            0x1000_8030 => self.dma_vif0.tadr as u64,
+            // EE DMAC: VIF0 (ch0), VIF1 (ch1), GIF (ch2), SIF0 (ch5) / SIF1 (ch6),
             // interrupt status. Transfers run to completion inside the CHCR
             // write, so a poll of the start bit always sees it clear.
             0x1000_9000 => self.dma_vif1.chcr as u64,
@@ -1999,8 +2007,34 @@ impl Bus {
             }
             // Channels with nothing behind them. They complete immediately so
             // nothing waits forever, and each names itself once in the log.
+            // VIF0 channel: uploads microcode and data into VU0 and can
+            // start it, the same way channel 1 drives VU1.
             0x1000_8000 => {
-                self.ee_dma_stub::<N>(addr, 0, v, "VIF0 channel (no VU0)");
+                self.dma_vif0.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_vif0();
+                }
+                return;
+            }
+            0x1000_8010 => {
+                self.dma_vif0.madr = v as u32;
+                return;
+            }
+            0x1000_8020 => {
+                self.dma_vif0.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_8030 => {
+                self.dma_vif0.tadr = v as u32;
+                return;
+            }
+            // VIF0 FIFO: programmed writes feed the same parser.
+            0x1000_4000..=0x1000_4FF0 => {
+                for i in 0..(N as u32 / 4) {
+                    let w = (v >> (32 * i)) as u32;
+                    let Bus { vif0, gs, gif, vu0, .. } = self;
+                    vif0.push_word(gs, gif, vu0, w);
+                }
                 return;
             }
             0x1000_B000 => {
@@ -2346,6 +2380,119 @@ impl Bus {
 
     /// Run the VIF1 channel (ch1) to completion: normal or source chain.
     /// With TTE set, each chain tag's upper 64 bits carry two vifcodes.
+    /// Channel 0: the same parser as channel 1, pointed at VU0. There is no
+    /// PATH2 behind VIF0, so a DIRECT in this stream would be a mis-parse.
+    fn pump_vif0(&mut self) {
+        let _p = prof::scope(prof::Slot::Vif1);
+        let mut guard = 0u32;
+        while self.dma_vif0.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "VIF0 DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_vif0.qwc > 0 {
+                let q = self.ee_dma_read128(self.dma_vif0.madr);
+                for w in q {
+                    self.vif0
+                        .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, w);
+                }
+                self.dma_vif0.madr = self.dma_vif0.madr.wrapping_add(16);
+                self.dma_vif0.qwc -= 1;
+                continue;
+            }
+            // Block finished.
+            let chain = (self.dma_vif0.chcr >> 2) & 3 == 1;
+            if !chain || self.dma_vif0.tag_end {
+                self.dma_vif0.chcr &= !EE_CHCR_STR;
+                self.dma_vif0.tag_end = false;
+                self.ee_dma_irq(0);
+                debug!(target: "ps2_core::bus::dma", "VIF0 DMA done");
+                break;
+            }
+            // Source-chain tag.
+            let tag = self.ee_dma_read128(self.dma_vif0.tadr);
+            let qwc = tag[0] & 0xFFFF;
+            let id = (tag[0] >> 28) & 7;
+            let irq = tag[0] & 0x8000_0000 != 0;
+            // Keep bit 31: it selects the scratchpad (SPR) as the source.
+            let addr = tag[1] & 0xFFFF_FFF0;
+            trace!(
+                target: "ps2_core::bus::dma",
+                tadr = format_args!("{:#010x}", self.dma_vif0.tadr),
+                id, qwc,
+                addr = format_args!("{addr:#010x}"),
+                chcr = format_args!("{:#x}", self.dma_vif0.chcr),
+                tag_hi = format_args!("{:08x} {:08x}", tag[2], tag[3]),
+                "VIF1 tag"
+            );
+            match id {
+                0 => {
+                    self.dma_vif0.madr = addr;
+                    self.dma_vif0.tadr = self.dma_vif0.tadr.wrapping_add(16);
+                    self.dma_vif0.tag_end = true;
+                }
+                1 => {
+                    self.dma_vif0.madr = self.dma_vif0.tadr.wrapping_add(16);
+                    self.dma_vif0.tadr = self.dma_vif0.madr.wrapping_add(qwc * 16);
+                }
+                2 => {
+                    self.dma_vif0.madr = self.dma_vif0.tadr.wrapping_add(16);
+                    self.dma_vif0.tadr = addr;
+                }
+                3 | 4 => {
+                    self.dma_vif0.madr = addr;
+                    self.dma_vif0.tadr = self.dma_vif0.tadr.wrapping_add(16);
+                }
+                // call: run the block at `addr`, remembering where to
+                // come back to. ret pops that back off.
+                5 => {
+                    self.dma_vif0.madr = self.dma_vif0.tadr.wrapping_add(16);
+                    let back = self.dma_vif0.madr.wrapping_add(qwc * 16);
+                    let d = self.dma_vif0.asr_depth as usize;
+                    if d < 2 {
+                        self.dma_vif0.asr[d] = back;
+                        self.dma_vif0.asr_depth += 1;
+                    } else {
+                        warn!(target: "ps2_core::bus::dma", "chain call stack overflow");
+                    }
+                    self.dma_vif0.tadr = addr;
+                }
+                6 => {
+                    self.dma_vif0.madr = self.dma_vif0.tadr.wrapping_add(16);
+                    if self.dma_vif0.asr_depth > 0 {
+                        self.dma_vif0.asr_depth -= 1;
+                        self.dma_vif0.tadr = self.dma_vif0.asr[self.dma_vif0.asr_depth as usize];
+                    } else {
+                        self.dma_vif0.tag_end = true;
+                    }
+                }
+                7 => {
+                    self.dma_vif0.madr = self.dma_vif0.tadr.wrapping_add(16);
+                    self.dma_vif0.tag_end = true;
+                }
+                _ => {
+                    warn!(target: "ps2_core::bus::dma", id, "unhandled VIF0 chain tag id");
+                    self.dma_vif0.chcr &= !EE_CHCR_STR;
+                    break;
+                }
+            }
+            if irq && self.dma_vif0.chcr & EE_CHCR_TIE != 0 {
+                self.dma_vif0.tag_end = true;
+            }
+            // The tag's upper 64 bits always reach VIF1 on chain transfers:
+            // OSDSYS relies on DIRECT codes riding there even with TTE
+            // clear (its 2D chains kick with CHCR 0x105). A zero upper half
+            // is just two NOPs, so feeding it unconditionally is safe.
+            self.vif0
+                .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[2]);
+            self.vif0
+                .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[3]);
+            self.dma_vif0.qwc = qwc;
+        }
+    }
+
+    /// Run the GIF channel (ch2) to completion: normal or source chain.
     fn pump_vif1(&mut self) {
         let _p = prof::scope(prof::Slot::Vif1);
         let mut guard = 0u32;
