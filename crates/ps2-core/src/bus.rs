@@ -789,6 +789,8 @@ pub const MEMCARD_PAGE: usize = 528;
 pub const MEMCARD_PAGES: usize = 16384;
 /// Pages per erase block.
 const MEMCARD_BLOCK: usize = 16;
+/// Sector size the PS1 read command works in, unrelated to the PS2 page size.
+const PS1_SECTOR: usize = 128;
 
 impl Default for MemCard {
     fn default() -> Self {
@@ -809,22 +811,43 @@ impl MemCard {
     }
 
     /// Build the `len`-byte reply for one `[0x81, op, ...]` sub-transfer.
+    ///
+    /// Every reply opens with two bytes clocked out while the host sends the
+    /// 0x81 and the command byte: a present card drives them low, an empty
+    /// slot leaves the line high. Most commands then pad with zeros and close
+    /// with an 0x2B acknowledge plus the terminator.
     fn respond(&mut self, cmd: &[u8], len: usize) -> Vec<u8> {
         let op = cmd.get(1).copied().unwrap_or(0);
-        // Default shape: 0xFF while the host clocks out the header, zeros
-        // after, 0x2B acknowledge at len-2 and the terminator at len-1.
-        let mut r = vec![0u8; len];
-        r[..len.min(2)].fill(0xFF);
-        let ack = |r: &mut Vec<u8>| {
-            let n = r.len();
-            if n >= 2 {
-                r[n - 2] = 0x2B;
-                r[n - 1] = self.terminator;
-            }
+        let mut r: Vec<u8> = vec![0x00, 0x00];
+        let term = self.terminator;
+        // Pad to `n - 2` bytes, then acknowledge and terminate.
+        let ack = |r: &mut Vec<u8>, n: usize| {
+            r.resize(n.saturating_sub(2).max(r.len()), 0);
+            r.push(0x2B);
+            r.push(term);
         };
         match op {
-            // Probe / write-delete-end / reset-style commands: bare ack.
-            0x11 | 0x12 | 0x81 | 0xBF | 0xF3 | 0xF7 => ack(&mut r),
+            // Probe / write-delete-end / read-write-end / erase-block: bare
+            // acknowledge. Erase clears the block holding the selected page.
+            0x11 | 0x12 | 0x81 | 0x82 => {
+                if op == 0x82 {
+                    let block = (self.sector as usize / MEMCARD_BLOCK) * MEMCARD_BLOCK;
+                    let start = (block * MEMCARD_PAGE) % self.data.len();
+                    let end = (start + MEMCARD_BLOCK * MEMCARD_PAGE).min(self.data.len());
+                    self.data[start..end].fill(0xFF);
+                    self.dirty = true;
+                }
+                ack(&mut r, 4);
+            }
+            // Boot-time probe MCMAN issues before the auth handshake.
+            0xBF | 0xF7 => ack(&mut r, 5),
+            // MagicGate session reset; also forces the terminator back to 0x55.
+            0xF3 => {
+                self.terminator = 0x55;
+                r.resize(3, 0);
+                r.push(0x2B);
+                r.push(0x55);
+            }
             // SetSector for erase/write/read: 4-byte page + checksum.
             0x21 | 0x22 | 0x23 => {
                 self.sector = u32::from(cmd.get(2).copied().unwrap_or(0))
@@ -832,102 +855,108 @@ impl MemCard {
                     | u32::from(cmd.get(4).copied().unwrap_or(0)) << 16
                     | u32::from(cmd.get(5).copied().unwrap_or(0)) << 24;
                 self.progress = 0;
-                ack(&mut r);
+                ack(&mut r, 9);
             }
             // GetSpecs: sector size, pages per erase block, page count.
             0x26 => {
                 let specs = [0x00u8, 0x02, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00];
-                let xor = specs.iter().fold(0u8, |a, &b| a ^ b);
-                if len >= 13 {
-                    r[2] = 0x2B;
-                    r[3..11].copy_from_slice(&specs);
-                    r[11] = xor;
-                    r[12] = self.terminator;
-                }
+                r.push(0x2B);
+                r.extend(specs);
+                r.push(specs.iter().fold(0u8, |a, &b| a ^ b));
+                r.push(term);
             }
+            // SetTerminator: the reply already carries the new byte.
             0x27 => {
-                // SetTerminator: takes effect for the NEXT command's reply.
-                let old = self.terminator;
                 self.terminator = cmd.get(2).copied().unwrap_or(0x55);
-                let n = r.len();
-                if n >= 2 {
-                    r[n - 2] = 0x2B;
-                    r[n - 1] = old;
-                }
+                r.push(0x00);
+                r.push(0x2B);
+                r.push(self.terminator);
             }
             0x28 => {
                 // GetTerminator.
-                if len >= 5 {
-                    r[2] = 0x2B;
-                    r[3] = self.terminator;
-                    r[4] = self.terminator;
-                }
+                r.push(0x2B);
+                r.push(term);
+                r.push(term);
             }
-            // WriteData: [0x81, 0x42, size, data.., xor]; ack at the tail.
+            // WriteData: [0x81, 0x42, size, data.., xor]; the card echoes
+            // zeros for the payload and answers with its own checksum.
             0x42 => {
                 let size = cmd.get(2).copied().unwrap_or(0) as usize;
-                for i in 0..size.min(cmd.len().saturating_sub(3)) {
+                r.push(0x00);
+                r.push(0x2B);
+                let mut xor = 0u8;
+                for i in 0..size {
+                    let b = cmd.get(3 + i).copied().unwrap_or(0);
+                    xor ^= b;
                     let p = self.pos();
-                    self.data[p] = cmd[3 + i];
+                    self.data[p] = b;
                     self.progress += 1;
+                    r.push(0x00);
                 }
                 self.dirty = true;
-                ack(&mut r);
+                r.push(xor);
+                r.push(term);
             }
             // ReadData: [0x81, 0x43, size]; reply carries the page bytes
             // plus their XOR before the terminator.
             0x43 => {
                 let size = cmd.get(2).copied().unwrap_or(0) as usize;
-                if len >= size + 5 {
-                    r[2] = 0x2B;
-                    let mut xor = 0u8;
-                    for i in 0..size {
-                        let b = self.data[self.pos()];
-                        self.progress += 1;
-                        r[3 + i] = b;
-                        xor ^= b;
-                    }
-                    r[3 + size] = xor;
-                    r[4 + size] = self.terminator;
+                r.push(0x00);
+                r.push(0x2B);
+                let mut xor = 0u8;
+                for _ in 0..size {
+                    let b = self.data[self.pos()];
+                    self.progress += 1;
+                    xor ^= b;
+                    r.push(b);
                 }
+                r.push(xor);
+                r.push(term);
             }
-            // EraseBlock: fill the block holding the selected page.
-            0x82 => {
-                let block = (self.sector as usize / MEMCARD_BLOCK) * MEMCARD_BLOCK;
-                let start = (block * MEMCARD_PAGE) % self.data.len();
-                let end = (start + MEMCARD_BLOCK * MEMCARD_PAGE).min(self.data.len());
-                self.data[start..end].fill(0xFF);
-                self.dirty = true;
-                ack(&mut r);
+            // PS1 card read, used to tell a PS1 card from a PS2 one. The
+            // sector is a raw 128-byte offset, nothing like the PS2 layout.
+            0x52 => {
+                let hi = cmd.get(4).copied().unwrap_or(0);
+                let lo = cmd.get(5).copied().unwrap_or(0);
+                let start = (u32::from(hi) << 8 | u32::from(lo)) as usize * PS1_SECTOR;
+                r.extend([0x5A, 0x5D, 0x00, 0x00, 0x5C, 0x5D, hi, lo]);
+                let mut xor = hi ^ lo;
+                for i in 0..PS1_SECTOR {
+                    let b = self.data[(start + i) % self.data.len()];
+                    xor ^= b;
+                    r.push(b);
+                }
+                r.push(xor);
+                r.push(0x47);
             }
-            // MagicGate auth: formal replies only. "Card responds" subs
-            // return 8 (zero) bytes plus their XOR; "console sends" subs
-            // acknowledge the console's 8 bytes with their XOR.
+            // MagicGate auth: formal replies only. Modes that carry eight
+            // console bytes answer with their XOR; the rest just acknowledge.
             0xF0 => {
-                let sub = cmd.get(2).copied().unwrap_or(0);
-                match sub {
+                let mode = cmd.get(2).copied().unwrap_or(0);
+                match mode {
                     0x01 | 0x02 | 0x04 | 0x0F | 0x11 | 0x13 => {
-                        // SECRMAN checks r[3]==0x2B, r[12]==XOR(r[4..12])
-                        // and r[13] != 0x66 (its "busy" marker).
-                        let n = r.len();
-                        if n >= 6 {
-                            r[3] = 0x2B;
-                            // Data bytes r[4..n-2] stay zero; XOR of zeros.
-                            r[n - 2] = 0;
-                            r[n - 1] = self.terminator;
+                        r.push(0x00);
+                        r.push(0x2B);
+                        let mut xor = 0u8;
+                        for i in 0..8 {
+                            xor ^= cmd.get(3 + i).copied().unwrap_or(0);
+                            r.push(0x00);
                         }
+                        r.push(xor);
+                        r.push(term);
                     }
-                    // Console-to-card subs (06/07/0B) just want the plain
-                    // acknowledge at the tail; everything else likewise.
-                    _ => ack(&mut r),
+                    // These carry eight bytes but want the plain acknowledge.
+                    0x06 | 0x07 | 0x0B => ack(&mut r, 14),
+                    _ => ack(&mut r, 5),
                 }
             }
             _ => {
                 debug!(target: "ps2_core::iop::sio2",
                     op = format_args!("{op:#04x}"), "unhandled memcard command");
-                ack(&mut r);
+                ack(&mut r, len);
             }
         }
+        r.resize(len, 0);
         r
     }
 }
