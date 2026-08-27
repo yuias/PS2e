@@ -167,7 +167,7 @@ impl Vif {
                 *p += esize;
                 v
             };
-            let a = ((*addr as usize) & 0x3FF) * 16;
+            let a = ((*addr & vu1.data_qw_mask) as usize) * 16;
             let write_field = |data: &mut [u8], f: usize, v: u32| {
                 data[a + f * 4..a + f * 4 + 4].copy_from_slice(&v.to_le_bytes());
             };
@@ -264,9 +264,9 @@ impl Vif {
                 self.unpack_drain(vu1);
             }
             State::Mpg { addr, words } => {
-                let a = *addr & 0x3FFF;
+                let a = *addr & vu1.micro_mask;
                 vu1.micro[a..a + 4].copy_from_slice(&w.to_le_bytes());
-                *addr = (*addr + 4) & 0x3FFF;
+                *addr = (*addr + 4) & vu1.micro_mask;
                 *words -= 1;
                 if *words == 0 {
                     self.state = State::Cmd;

@@ -751,7 +751,10 @@ impl Cpu {
                     20 => vu0.r & 0x7F_FFFF,
                     21 => vu0.i.to_bits(),
                     22 => vu0.q.to_bits(),
-                    _ => self.vu0_ctrl[rd], // TPC/CMSAR/FBRST/VPU-STAT shadow
+                    // VPU_STAT: neither VU is ever busy, since a started
+                    // microprogram runs to completion inside the start.
+                    29 => 0,
+                    _ => self.vu0_ctrl[rd], // TPC/CMSAR/FBRST shadow
                 };
                 self.set64(rt, v as i32 as i64 as u64);
             }
@@ -787,7 +790,14 @@ impl Cpu {
             }
             0x10..=0x1F => {
                 let Bus { vu0, gs, gif, .. } = bus;
-                vu0.exec_macro(gs, gif, instr);
+                match instr & 0x3F {
+                    // VCALLMS/VCALLMSR: run a VU0 microprogram, from the
+                    // instruction's own address or from CMSAR0. The address
+                    // counts instruction pairs, as VIF's MSCAL does.
+                    0x38 => vu0.start(gs, gif, ((instr >> 6) & 0x7FFF) as u16),
+                    0x39 => vu0.start(gs, gif, self.vu0_ctrl[27] as u16),
+                    _ => vu0.exec_macro(gs, gif, instr),
+                }
             }
             _ => self.unimplemented("COP2", instr),
         }

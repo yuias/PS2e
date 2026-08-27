@@ -1777,16 +1777,19 @@ impl Bus {
             0x0000_0000..=0x01FF_FFFF => read_le::<N>(&self.ram, addr as usize),
             0x7000_0000..=0x7000_3FFF => read_le::<N>(&self.spad, (addr & 0x3FFF) as usize),
             0x1000_0000..=0x1000_FFFF => self.read_mmio::<N>(addr),
-            // VU memory windows: VU0 micro/data (stubs), VU1 micro/data.
+            // VU memory windows. Each VU's pair of 4 KB (VU0) or 16 KB
+            // (VU1) memories mirrors within its own window.
             0x1100_8000..=0x1100_BFFF => {
                 read_le::<N>(&self.vu1.micro, (addr & 0x3FFF) as usize)
             }
             0x1100_C000..=0x1100_FFFF => {
                 read_le::<N>(&self.vu1.data, (addr & 0x3FFF) as usize)
             }
-            0x1100_0000..=0x1100_7FFF => {
-                self.warn_stub(addr, "VU0 memory");
-                0
+            0x1100_0000..=0x1100_3FFF => {
+                read_le::<N>(&self.vu0.micro, addr as usize & self.vu0.micro_mask)
+            }
+            0x1100_4000..=0x1100_7FFF => {
+                read_le::<N>(&self.vu0.data, addr as usize & (self.vu0.data.len() - 1))
             }
             0x1200_0000..=0x1200_1FFF => self.read_gs_priv::<N>(addr),
             0x1C00_0000..=0x1C1F_FFFF => read_le::<N>(&self.iop_ram, (addr & 0x1F_FFFF) as usize),
@@ -1834,8 +1837,13 @@ impl Bus {
             0x1100_C000..=0x1100_FFFF => {
                 write_le::<N>(&mut self.vu1.data, (addr & 0x3FFF) as usize, v)
             }
-            0x1100_0000..=0x1100_7FFF => {
-                self.warn_stub(addr, "VU0 memory");
+            0x1100_0000..=0x1100_3FFF => {
+                let m = self.vu0.micro_mask;
+                write_le::<N>(&mut self.vu0.micro, addr as usize & m, v)
+            }
+            0x1100_4000..=0x1100_7FFF => {
+                let m = self.vu0.data.len() - 1;
+                write_le::<N>(&mut self.vu0.data, addr as usize & m, v)
             }
             0x1200_0000..=0x1200_1FFF => self.write_gs_priv::<N>(addr, v),
             0x1C00_0000..=0x1C1F_FFFF => {

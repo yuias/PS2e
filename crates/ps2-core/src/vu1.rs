@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 const MICRO_SIZE: usize = 16 * 1024;
 const DATA_SIZE: usize = 16 * 1024;
+/// VU0's memories are a quarter the size of VU1's.
+const VU0_MEM_SIZE: usize = 4 * 1024;
 
 #[derive(Serialize, Deserialize)]
 pub struct Vu1 {
@@ -27,6 +29,12 @@ pub struct Vu1 {
     /// 16-bit integer registers; vi00 = 0.
     pub(crate) vi: [u16; 16],
     acc: [u32; 4],
+    /// Address masks. VU1 has 16 KB of each memory, VU0 a quarter of that:
+    /// `micro_mask` is in bytes, `data_qw_mask` in quadwords, `pc_mask` in
+    /// instruction pairs.
+    pub(crate) micro_mask: usize,
+    pub(crate) data_qw_mask: u32,
+    pc_mask: u16,
     /// Opcodes already reported as unimplemented, to keep the log readable.
     #[serde(skip)]
     warned_ops: std::collections::HashSet<(u8, u8)>,
@@ -61,6 +69,9 @@ impl Vu1 {
             vf,
             vi: [0; 16],
             acc: [0; 4],
+            micro_mask: MICRO_SIZE - 1,
+            data_qw_mask: (DATA_SIZE / 16 - 1) as u32,
+            pc_mask: (MICRO_SIZE / 8 - 1) as u16,
             warned_ops: std::collections::HashSet::new(),
             q: 0.0,
             i: 0.0,
@@ -72,6 +83,19 @@ impl Vu1 {
             top: 0,
             itop: 0,
             next_pc: 0,
+        }
+    }
+
+    /// The same core wired up as VU0: a quarter of the memory, and the
+    /// EE's COP2 macro mode drives it as well as its own microprograms.
+    pub fn new_vu0() -> Self {
+        Self {
+            micro: vec![0u8; VU0_MEM_SIZE].into_boxed_slice(),
+            data: vec![0u8; VU0_MEM_SIZE].into_boxed_slice(),
+            micro_mask: VU0_MEM_SIZE - 1,
+            data_qw_mask: (VU0_MEM_SIZE / 16 - 1) as u32,
+            pc_mask: (VU0_MEM_SIZE / 8 - 1) as u16,
+            ..Self::new()
         }
     }
 
@@ -95,18 +119,6 @@ impl Vu1 {
         match op {
             // Integer ops (VIADD..VIOR) only exist in the lower pipeline.
             0x30..=0x35 => self.exec_lower_special(gs, gif, 0, instr),
-            // VCALLMS / VCALLMSR start a VU0 microprogram. There is no VU0
-            // micro engine: its memory windows are stubbed and VIF0's
-            // channel discards, so nothing was ever uploaded to run.
-            0x38 | 0x39 => {
-                if self.warned_ops.insert((0, op as u8)) {
-                    warn!(
-                        target: "ps2_core::vu1",
-                        instr = format_args!("{instr:#010x}"),
-                        "VU0 microprogram start ignored, no VU0 (reported once)"
-                    );
-                }
-            }
             0x3C..=0x3F => {
                 let op2 = (instr & 3) | ((instr >> 4) & 0x7C);
                 if op2 >= 0x30 {
@@ -180,18 +192,33 @@ impl Vu1 {
         }
     }
 
-    fn data_qword(&self, qw: u32) -> [u32; 4] {
-        let a = ((qw as usize) & 0x3FF) * 16;
+    fn data_qword(&mut self, qw: u32) -> [u32; 4] {
+        self.note_wrapped_data(qw);
+        let a = ((qw & self.data_qw_mask) as usize) * 16;
         let w = |o: usize| u32::from_le_bytes(self.data[a + o..a + o + 4].try_into().unwrap());
         [w(0), w(4), w(8), w(12)]
     }
 
     fn set_data_qword(&mut self, qw: u32, dest: u32, vals: [u32; 4]) {
-        let a = ((qw as usize) & 0x3FF) * 16;
+        self.note_wrapped_data(qw);
+        let a = ((qw & self.data_qw_mask) as usize) * 16;
         for f in 0..4 {
             if dest & (8 >> f) != 0 {
                 self.data[a + f * 4..a + f * 4 + 4].copy_from_slice(&vals[f].to_le_bytes());
             }
+        }
+    }
+
+    /// Past the end of this VU's data memory, VU0 sees VU1's register file
+    /// rather than a wrap. Nothing needs it yet, so say so instead of
+    /// quietly handing back the wrong quadword.
+    fn note_wrapped_data(&mut self, qw: u32) {
+        if qw > self.data_qw_mask && self.warned_ops.insert((0xFF, 0)) {
+            warn!(
+                target: "ps2_core::vu1",
+                qw = format_args!("{qw:#x}"),
+                "data access past this VU's memory, wrapping (reported once)"
+            );
         }
     }
 
@@ -219,11 +246,11 @@ impl Vu1 {
         // vf00/vi00 are architectural constants.
         self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
         self.vi[0] = 0;
-        let mut pc = start & 0x7FF;
+        let mut pc = start & self.pc_mask;
         let mut end_after: i32 = -1; // pairs still to run after E bit
         let mut branch: Option<u16> = None;
         for _ in 0..1_000_000 {
-            let a = (pc as usize & 0x7FF) * 8;
+            let a = (pc & self.pc_mask) as usize * 8;
             let lower = u32::from_le_bytes(self.micro[a..a + 4].try_into().unwrap());
             let upper = u32::from_le_bytes(self.micro[a + 4..a + 8].try_into().unwrap());
             let next = branch.take();
@@ -237,8 +264,8 @@ impl Vu1 {
                 self.exec_lower(gs, gif, pc, lower, &mut branch);
             }
             pc = match next {
-                Some(t) => t & 0x7FF,
-                None => (pc + 1) & 0x7FF,
+                Some(t) => t & self.pc_mask,
+                None => (pc + 1) & self.pc_mask,
             };
             if end_after >= 0 {
                 end_after -= 1;
@@ -842,6 +869,32 @@ mod tests {
         out[..4].copy_from_slice(&lower.to_le_bytes());
         out[4..].copy_from_slice(&upper.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn vu0_is_a_quarter_of_vu1() {
+        let vu1 = Vu1::new();
+        let vu0 = Vu1::new_vu0();
+        assert_eq!(vu1.micro.len(), 4 * vu0.micro.len());
+        assert_eq!(vu1.data.len(), 4 * vu0.data.len());
+        // 4 KB is 512 instruction pairs and 256 quadwords.
+        assert_eq!(vu0.pc_mask, 0x1FF);
+        assert_eq!(vu0.data_qw_mask, 0xFF);
+        assert_eq!(vu0.micro_mask, 0xFFF);
+        assert_eq!(vu1.pc_mask, 0x7FF);
+        assert_eq!(vu1.data_qw_mask, 0x3FF);
+    }
+
+    #[test]
+    fn vu0_data_wraps_inside_its_own_memory() {
+        let mut vu = Vu1::new_vu0();
+        vu.set_data_qword(0, 0xF, [1, 2, 3, 4]);
+        // Quadword 0x100 is the first past VU0's memory.
+        assert_eq!(vu.data_qword(0x100), [1, 2, 3, 4]);
+        // ...and VU1, with four times the memory, does not wrap there.
+        let mut vu1 = Vu1::new();
+        vu1.set_data_qword(0, 0xF, [1, 2, 3, 4]);
+        assert_eq!(vu1.data_qword(0x100), [0, 0, 0, 0]);
     }
 
     fn run_prog(vu: &mut Vu1, pairs: &[(u32, u32)]) {
