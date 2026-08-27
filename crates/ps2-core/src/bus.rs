@@ -1836,6 +1836,21 @@ impl Bus {
                 self.dma_vif1.tadr = v as u32;
                 return;
             }
+            // GIF FIFO: PATH3 fed by programmed writes instead of channel 2
+            // (the BIOS initialises the GS register file this way). The
+            // quadword is assembled in place and handed to the same parser
+            // once its last byte lands.
+            0x1000_6000..=0x1000_6FF0 => {
+                let off = (addr & 0xFFFF) as usize;
+                write_le::<N>(&mut self.mmio, off, v);
+                if (addr as usize & 0xF) + N >= 16 {
+                    let base = off & !0xF;
+                    let lo = read_le::<8>(&self.mmio, base);
+                    let hi = read_le::<8>(&self.mmio, base + 8);
+                    self.gif.process(&mut self.gs, lo, hi);
+                }
+                return;
+            }
             // VIF1 FIFO: direct programmed writes feed the same parser.
             0x1000_5000..=0x1000_5FF0 => {
                 for i in 0..(N as u32 / 4) {
