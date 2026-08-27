@@ -4,13 +4,12 @@
 //! reads reconstruct the value from (now - base). Gates and interrupts are
 //! not wired up yet; MODE's interrupt flags are write-1-to-clear.
 
+use crate::Region;
 use tracing::trace;
 use serde::{Deserialize, Serialize};
 
 /// BUSCLK runs at half the EE clock.
 const BUSCLK_SHIFT: u64 = 1;
-/// HBLANK rate approximation: BUSCLK / 9371 (NTSC).
-const HBLANK_DIV: u64 = 9371;
 
 #[derive(Serialize, Deserialize)]
 #[derive(Default, Clone, Copy)]
@@ -28,22 +27,22 @@ struct Timer {
 
 impl Timer {
     /// EE cycles per COUNT tick for the selected clock.
-    fn cycles_per_tick(&self) -> u64 {
+    fn cycles_per_tick(&self, region: Region) -> u64 {
         (match self.mode & 3 {
             0 => 1,
             1 => 16,
             2 => 256,
-            _ => HBLANK_DIV,
+            _ => region.ee_hblank_div(),
         }) << BUSCLK_SHIFT
     }
 
-    fn count(&self, now: u64) -> u16 {
+    fn count(&self, now: u64, region: Region) -> u16 {
         let busclk = (now.saturating_sub(self.base_cycle)) >> BUSCLK_SHIFT;
         let ticks = match self.mode & 3 {
             0 => busclk,
             1 => busclk / 16,
             2 => busclk / 256,
-            _ => busclk / HBLANK_DIV,
+            _ => busclk / region.ee_hblank_div(),
         };
         self.base.wrapping_add(ticks as u16)
     }
@@ -68,11 +67,11 @@ impl Timers {
     }
 
     /// `addr` is the physical address in 0x1000_0000..0x1000_1FFF.
-    pub fn read(&self, addr: u32, now: u64) -> u32 {
+    pub fn read(&self, addr: u32, now: u64, region: Region) -> u32 {
         let (t, reg) = Self::decode(addr);
         let timer = &self.timers[t];
         let v = match reg {
-            0x00 => timer.count(now) as u32,
+            0x00 => timer.count(now, region) as u32,
             0x10 => timer.mode,
             0x20 => timer.comp as u32,
             0x30 => timer.hold as u32,
@@ -115,14 +114,14 @@ impl Timers {
     /// only event [`Timers::check_irqs`] reacts to), or `u64::MAX`. A
     /// check at or after that cycle sees the crossing; earlier checks have
     /// nothing to find.
-    pub fn next_event(&self, now: u64) -> u64 {
+    pub fn next_event(&self, now: u64, region: Region) -> u64 {
         let mut due = u64::MAX;
         for timer in &self.timers {
             if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
                 continue;
             }
-            let p = timer.cycles_per_tick();
-            let ticks = u64::from(timer.comp.wrapping_sub(timer.count(now)));
+            let p = timer.cycles_per_tick(region);
+            let ticks = u64::from(timer.comp.wrapping_sub(timer.count(now, region)));
             // Equal right now: the crossing (if any) is found by this
             // check; the next one is a full wrap away.
             let ticks = if ticks == 0 { 0x1_0000 } else { ticks };
@@ -134,7 +133,7 @@ impl Timers {
 
     /// Edge-detect compare matches since the last call; returns an INTC bit
     /// mask (bit 9+t per timer). Sets the mode equal-flag as on hardware.
-    pub fn check_irqs(&mut self, now: u64) -> u32 {
+    pub fn check_irqs(&mut self, now: u64, region: Region) -> u32 {
         let mut intc = 0;
         for (t, timer) in self.timers.iter_mut().enumerate() {
             // CUE (bit 7) gates counting. The equal-flag (EQUF, bit 10)
@@ -143,8 +142,8 @@ impl Timers {
             if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
                 continue;
             }
-            let before = timer.count(timer.last_check);
-            let after = timer.count(now);
+            let before = timer.count(timer.last_check, region);
+            let after = timer.count(now, region);
             timer.last_check = now;
             let crossed = if before <= after {
                 before < timer.comp && timer.comp <= after
@@ -178,12 +177,14 @@ impl Timers {
 mod tests {
     use super::*;
 
+    const R: Region = Region::Ntsc;
+
     #[test]
     fn count_follows_busclk() {
         let mut t = Timers::new();
         t.write(0x1000_0000, 0, 1000);
         // 2000 EE cycles later = 1000 BUSCLK ticks.
-        assert_eq!(t.read(0x1000_0000, 3000), 1000);
+        assert_eq!(t.read(0x1000_0000, 3000, R), 1000);
     }
 
     #[test]
@@ -191,14 +192,14 @@ mod tests {
         let mut t = Timers::new();
         t.write(0x1000_0010, 2, 0); // /256
         t.write(0x1000_0000, 0, 0);
-        assert_eq!(t.read(0x1000_0000, 512 * 256 * 2), 512);
+        assert_eq!(t.read(0x1000_0000, 512 * 256 * 2, R), 512);
     }
 
     #[test]
     fn count_write_resets_base() {
         let mut t = Timers::new();
         t.write(0x1000_0000, 100, 0);
-        assert_eq!(t.read(0x1000_0000, 200), 200);
+        assert_eq!(t.read(0x1000_0000, 200, R), 200);
     }
 
     #[test]
@@ -207,10 +208,10 @@ mod tests {
         // T3 as the kernel inits it: CUE on, hblank clock, CMPE clear.
         t.write(0x1000_1810, 0xC83, 0);
         t.write(0x1000_1820, 0xFFFF, 0);
-        let at_comp = 0xFFFF * super::HBLANK_DIV * 2;
-        assert_eq!(t.check_irqs(at_comp), 0);
+        let at_comp = 0xFFFF * R.ee_hblank_div() * 2;
+        assert_eq!(t.check_irqs(at_comp, R), 0);
         // EQUF still latches as a status flag.
-        assert_ne!(t.read(0x1000_1810, at_comp) & (1 << 10), 0);
+        assert_ne!(t.read(0x1000_1810, at_comp, R) & (1 << 10), 0);
     }
 
     #[test]
@@ -219,11 +220,11 @@ mod tests {
         // T3 as the dispatcher arms it: CMPE set.
         t.write(0x1000_1810, 0x583, 0);
         t.write(0x1000_1820, 100, 0);
-        let past = 200 * super::HBLANK_DIV * 2;
-        assert_eq!(t.check_irqs(past), 1 << 12);
+        let past = 200 * R.ee_hblank_div() * 2;
+        assert_eq!(t.check_irqs(past, R), 1 << 12);
         // Latched until rearmed by a MODE write with bit 10.
-        assert_eq!(t.check_irqs(past * 2), 0);
+        assert_eq!(t.check_irqs(past * 2, R), 0);
         t.write(0x1000_1810, 0x583, past * 2);
-        assert_eq!(t.check_irqs(past * 3), 1 << 12);
+        assert_eq!(t.check_irqs(past * 3, R), 1 << 12);
     }
 }

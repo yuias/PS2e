@@ -4,6 +4,7 @@
 //! mappings are essentially identity, so TLB instructions record entries
 //! without remapping (see ARCHITECTURE.md).
 
+use crate::Region;
 use crate::gif::Gif;
 use crate::gs::GsFront;
 use crate::prof;
@@ -1284,8 +1285,6 @@ struct IopTimer {
     last_check: u64,
 }
 
-/// NTSC hblank rate on the IOP sysclock (36.864 MHz / 15734 Hz).
-const IOP_HBLANK_DIV: u64 = 2343;
 /// Longest gap between periodic ticks, whatever the computed events say.
 const MAX_TICK_GAP: u64 = 8192;
 
@@ -1294,11 +1293,11 @@ impl IopTimer {
     /// clock (pixel for counter 0, hblank for counters 1/3), bit 9 is /8 on
     /// counter 2, and wide timers add a sysclock prescaler in bits 13-14.
     /// EE cycles per COUNT tick (mirrors [`IopTimer::count`]).
-    fn cycles_per_tick(&self, idx: usize) -> u64 {
+    fn cycles_per_tick(&self, idx: usize, region: Region) -> u64 {
         let external = self.mode & (1 << 8) != 0;
         8 * match idx {
             0 if external => 3,
-            1 | 3 if external => IOP_HBLANK_DIV,
+            1 | 3 if external => region.iop_hblank_div(),
             2 if self.mode & (1 << 9) != 0 => 8,
             3.. => match (self.mode >> 13) & 3 {
                 0 => 1,
@@ -1311,24 +1310,24 @@ impl IopTimer {
     }
 
     /// Earliest cycle at which this timer reaches its target or wraps.
-    fn next_event(&self, idx: usize, now: u64) -> u64 {
+    fn next_event(&self, idx: usize, now: u64, region: Region) -> u64 {
         let size = if idx < 3 { 1u64 << 16 } else { 1u64 << 32 };
-        let count = u64::from(self.count(idx, now));
+        let count = u64::from(self.count(idx, now, region));
         let to_target = (u64::from(self.target) + size - count) % size;
         let to_target = if to_target == 0 { size } else { to_target };
         let to_wrap = size - count;
-        let p = self.cycles_per_tick(idx);
+        let p = self.cycles_per_tick(idx, region);
         let phase = now.saturating_sub(self.base_cycle) % p;
         now + to_target.min(to_wrap) * p - phase
     }
 
-    fn count(&self, idx: usize, now: u64) -> u32 {
+    fn count(&self, idx: usize, now: u64, region: Region) -> u32 {
         let sys = now.saturating_sub(self.base_cycle) / 8;
         let external = self.mode & (1 << 8) != 0;
         let ticks = match idx {
             // ~13.5 MHz dot clock, coarsely approximated.
             0 if external => sys / 3,
-            1 | 3 if external => sys / IOP_HBLANK_DIV,
+            1 | 3 if external => sys / region.iop_hblank_div(),
             2 if self.mode & (1 << 9) != 0 => sys / 8,
             3.. => match (self.mode >> 13) & 3 {
                 0 => sys,
@@ -1433,6 +1432,8 @@ pub struct Bus {
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
     pub now: u64,
+    /// Video timing region, fixed when the machine is built.
+    pub region: Region,
     /// Kernel TTY output captured from the EE SIO TXFIFO (observation only).
     pub tty_buffer: String,
     /// Current TTY line, flushed to the log on '\n'.
@@ -1470,7 +1471,7 @@ pub struct Bus {
 }
 
 impl Bus {
-    pub fn new(bios: Vec<u8>, gs_threaded: bool) -> Self {
+    pub fn new(bios: Vec<u8>, gs_threaded: bool, region: Region) -> Self {
         assert_eq!(bios.len(), BIOS_SIZE);
         let mut mmio = vec![0u8; MMIO_SIZE].into_boxed_slice();
         // DMAC ENABLER resets to 0x1201; the BIOS uses it as a board-revision
@@ -1489,6 +1490,7 @@ impl Bus {
             vif1: Vif::new(),
             vu0: Vu1::new(),
             vu1: Vu1::new(),
+            region,
             timers: Timers::new(),
             sif: Sif::new(),
             iop_spad: vec![0u8; 1024].into_boxed_slice(),
@@ -1757,7 +1759,7 @@ impl Bus {
         };
         let v = match reg {
             // EE timers: the count derives from `now`, nothing latches.
-            0x1000_0000..=0x1000_1FFF => self.timers.read(reg, self.now),
+            0x1000_0000..=0x1000_1FFF => self.timers.read(reg, self.now, self.region),
             // EE DMAC channels and its interrupt status/mask.
             0x1000_8000..=0x1000_803F => chan(&self.dma_vif0, reg)?,
             0x1000_9000..=0x1000_903F => chan(&self.dma_vif1, reg)?,
@@ -1918,7 +1920,7 @@ impl Bus {
     fn read_mmio<const N: usize>(&mut self, addr: u32) -> u64 {
         let off = (addr & 0xFFFF) as usize;
         match addr & !0x3 {
-            0x1000_0000..=0x1000_1FFF => self.timers.read(addr, self.now) as u64,
+            0x1000_0000..=0x1000_1FFF => self.timers.read(addr, self.now, self.region) as u64,
             // SIO_ISR: no pending serial interrupts.
             0x1000_F130 => 0,
             // MCH_RICM reads back as 0 (busy bit clear = operation done).
@@ -2353,13 +2355,16 @@ impl Bus {
         if self.spu2.take_irq() {
             self.iop_i_stat |= 1 << 9;
         }
-        self.intc_stat |= self.timers.check_irqs(self.now);
+        self.intc_stat |= self.timers.check_irqs(self.now, self.region);
         self.intc_changed();
         const IRQ_BITS: [u32; 6] = [4, 5, 6, 14, 15, 16];
         let mut fired = 0u32;
         let now = self.now;
+        let region = self.region;
         // Next time anything here can happen (bounded, as a safety net).
-        let mut due = (now + MAX_TICK_GAP).min(self.timers.next_event(now)).min(self.spu2.next_due());
+        let mut due = (now + MAX_TICK_GAP)
+            .min(self.timers.next_event(now, region))
+            .min(self.spu2.next_due());
         if let Some(at) = self.cdvd_done_at {
             due = due.min(at);
         }
@@ -2370,9 +2375,9 @@ impl Bus {
             if timer.mode == 0 {
                 continue; // never configured
             }
-            due = due.min(timer.next_event(t, now));
-            let before = timer.count(t, timer.last_check);
-            let after = timer.count(t, now);
+            due = due.min(timer.next_event(t, now, region));
+            let before = timer.count(t, timer.last_check, region);
+            let after = timer.count(t, now, region);
             timer.last_check = now;
             if before == after {
                 continue;
@@ -3447,9 +3452,10 @@ impl Bus {
     fn iop_read_mmio<const N: usize>(&mut self, addr: u32) -> u32 {
         let off = (addr & 0xFFFF) as usize;
         if let Some(t) = Self::iop_timer_index(addr) {
+            let (now, region) = (self.now, self.region);
             let timer = &mut self.iop_timers[t];
             return match addr & 0xF {
-                0x0 => timer.count(t, self.now),
+                0x0 => timer.count(t, now, region),
                 0x4 => {
                     // Reading MODE clears the reached-target flags.
                     let v = timer.mode;
@@ -3728,7 +3734,7 @@ mod tests {
     use super::*;
 
     fn bus() -> Bus {
-        Bus::new(vec![0u8; BIOS_SIZE], false)
+        Bus::new(vec![0u8; BIOS_SIZE], false, Region::Ntsc)
     }
 
     #[test]

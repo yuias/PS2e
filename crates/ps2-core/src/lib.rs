@@ -23,10 +23,77 @@ use bus::Bus;
 pub const EE_CLOCK_HZ: u64 = 294_912_000;
 /// EE cycles per IOP cycle.
 pub const EE_PER_IOP: u64 = 8;
-/// EE cycles per video frame (~60 Hz).
+/// EE cycles per video frame on an NTSC machine (~60 Hz).
 pub const EE_CYCLES_PER_FRAME: u64 = EE_CLOCK_HZ / 60;
-/// Vertical blank occupies roughly the last 5% of the frame.
-const VBLANK_CYCLES: u64 = EE_CYCLES_PER_FRAME / 20;
+
+/// Video timing region, fixed when the machine is built.
+///
+/// This selects the vertical refresh and the horizontal-blank rates the
+/// timers count. It does *not* change what software detects as the
+/// console's region: that comes from the BIOS image's own ROMVER, so a PAL
+/// title still wants a PAL BIOS.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Region {
+    #[default]
+    Ntsc,
+    Pal,
+}
+
+impl Region {
+    /// EE cycles per video frame: ~60 Hz (NTSC) or 50 Hz (PAL).
+    pub const fn cycles_per_frame(self) -> u64 {
+        match self {
+            Region::Ntsc => EE_CYCLES_PER_FRAME,
+            Region::Pal => EE_CLOCK_HZ / 50,
+        }
+    }
+
+    /// Frame position at which vertical blank begins; it occupies roughly
+    /// the last 5% of the frame.
+    pub const fn vblank_start(self) -> u64 {
+        let frame = self.cycles_per_frame();
+        frame - frame / 20
+    }
+
+    /// Nominal vertical refresh, for a front-end's frame-rate display.
+    pub const fn refresh_hz(self) -> f64 {
+        match self {
+            Region::Ntsc => 60.0,
+            Region::Pal => 50.0,
+        }
+    }
+
+    /// BUSCLK cycles per horizontal blank, approximated: 15734 Hz (NTSC) or
+    /// 15625 Hz (PAL).
+    pub const fn ee_hblank_div(self) -> u64 {
+        match self {
+            Region::Ntsc => 9371,
+            Region::Pal => 9437,
+        }
+    }
+
+    /// IOP sysclock cycles per horizontal blank, at the same rates.
+    pub const fn iop_hblank_div(self) -> u64 {
+        match self {
+            Region::Ntsc => 2343,
+            Region::Pal => 2359,
+        }
+    }
+}
+
+impl std::str::FromStr for Region {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "ntsc" => Ok(Region::Ntsc),
+            "pal" => Ok(Region::Pal),
+            other => Err(format!("unknown region {other:?} (expected ntsc or pal)")),
+        }
+    }
+}
 /// Cadence of the periodic bus tick (timers, deferred DMA and SPU2
 /// completions, SPU2 mixing).
 const TIMER_TICK_CYCLES: u64 = 64;
@@ -34,7 +101,7 @@ const TIMER_TICK_CYCLES: u64 = 64;
 /// Save-state file magic and format version. Bump the version on any
 /// change to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS2E";
-const STATE_VERSION: u16 = 7;
+const STATE_VERSION: u16 = 8;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -68,6 +135,22 @@ impl Ps2System {
     /// [`Ps2System::new`] with an explicit choice of a threaded (`true`) or
     /// inline GS renderer; the threaded one needs the `threads` feature.
     pub fn new_with(bios: Vec<u8>, gs_threaded: bool) -> Result<Self, String> {
+        Self::new_with_region(bios, gs_threaded, Region::default())
+    }
+
+    /// [`Ps2System::new`] in a chosen video timing [`Region`].
+    pub fn new_region(bios: Vec<u8>, region: Region) -> Result<Self, String> {
+        Self::new_with_region(bios, cfg!(feature = "threads"), region)
+    }
+
+    /// [`Ps2System::new_with`] in a chosen video timing [`Region`]. The
+    /// region is fixed for the life of the machine; a loaded save state
+    /// brings its own.
+    pub fn new_with_region(
+        bios: Vec<u8>,
+        gs_threaded: bool,
+        region: Region,
+    ) -> Result<Self, String> {
         if bios.len() != bus::BIOS_SIZE {
             return Err(format!(
                 "BIOS must be {} bytes, got {}",
@@ -78,7 +161,7 @@ impl Ps2System {
         Ok(Self {
             ee: ee::Cpu::new(),
             iop: iop::Cpu::new(),
-            bus: Bus::new(bios, gs_threaded),
+            bus: Bus::new(bios, gs_threaded, region),
             cycles: 0,
             frame_pos: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -195,6 +278,23 @@ impl Ps2System {
         self.machine_cycle();
     }
 
+    /// Video timing region this machine was built in.
+    pub fn region(&self) -> Region {
+        self.bus.region
+    }
+
+    /// EE cycles per video frame in this machine's region.
+    #[inline]
+    fn frame_cycles(&self) -> u64 {
+        self.bus.region.cycles_per_frame()
+    }
+
+    /// Frame position at which vertical blank begins.
+    #[inline]
+    fn vblank_start(&self) -> u64 {
+        self.bus.region.vblank_start()
+    }
+
     /// Everything but the EE for one cycle: the IOP slot, timers, vblank
     /// edges, and the idle wake-up check.
     #[inline]
@@ -219,7 +319,7 @@ impl Ps2System {
             event = true;
         }
         // Counted rather than derived with `%`: this runs per instruction.
-        if self.frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
+        if self.frame_pos == self.vblank_start() {
             self.bus.vblank(true);
             event = true;
         } else if self.frame_pos == 0 && self.cycles != 0 {
@@ -227,7 +327,7 @@ impl Ps2System {
             event = true;
         }
         self.frame_pos += 1;
-        if self.frame_pos == EE_CYCLES_PER_FRAME {
+        if self.frame_pos == self.frame_cycles() {
             self.frame_pos = 0;
         }
         self.cycles += 1;
@@ -280,9 +380,9 @@ impl Ps2System {
             // Cycle 0 of the group carries the IOP slot and timers.
             self.step();
             // Cycles 1..7: EE only, plus a vblank edge if one lands here.
-            let vbl_edge = self.frame_pos + EE_PER_IOP > EE_CYCLES_PER_FRAME - VBLANK_CYCLES
-                && self.frame_pos <= EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
-            let wrap = self.frame_pos + EE_PER_IOP >= EE_CYCLES_PER_FRAME;
+            let vbl_edge = self.frame_pos + EE_PER_IOP > self.vblank_start()
+                && self.frame_pos <= self.vblank_start();
+            let wrap = self.frame_pos + EE_PER_IOP >= self.frame_cycles();
             if self.ee.idle && !vbl_edge && !wrap {
                 self.frame_pos += EE_PER_IOP - 1;
                 self.cycles += EE_PER_IOP - 1;
@@ -293,7 +393,7 @@ impl Ps2System {
                 if !self.ee.idle {
                     self.ee.step(&mut self.bus);
                 }
-                if self.frame_pos == EE_CYCLES_PER_FRAME - VBLANK_CYCLES {
+                if self.frame_pos == self.vblank_start() {
                     self.bus.vblank(true);
                     self.wake_idle_ee();
                 } else if self.frame_pos == 0 && self.cycles != 0 {
@@ -301,7 +401,7 @@ impl Ps2System {
                     self.wake_idle_ee();
                 }
                 self.frame_pos += 1;
-                if self.frame_pos == EE_CYCLES_PER_FRAME {
+                if self.frame_pos == self.frame_cycles() {
                     self.frame_pos = 0;
                 }
                 self.cycles += 1;
@@ -320,11 +420,11 @@ impl Ps2System {
         // First tick-aligned cycle at or after the bus's next due time.
         let due = self.bus.timers_due.max(self.cycles);
         let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
-        let vbl_start = EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+        let vbl_start = self.vblank_start();
         let to_vblank = if self.frame_pos < vbl_start {
             vbl_start - self.frame_pos
         } else {
-            EE_CYCLES_PER_FRAME - self.frame_pos
+            self.frame_cycles() - self.frame_pos
         };
         to_timer.min(to_vblank).min(limit)
     }
@@ -336,7 +436,7 @@ impl Ps2System {
     fn jump(&mut self, k: u64) {
         self.cycles += k;
         self.frame_pos += k;
-        if self.frame_pos == EE_CYCLES_PER_FRAME {
+        if self.frame_pos == self.frame_cycles() {
             self.frame_pos = 0;
         }
     }
@@ -373,9 +473,9 @@ impl Ps2System {
             self.machine_cycle();
             n -= 1;
             // Cycles 1..7 of the group can only see a vblank edge.
-            let vbl_edge = self.frame_pos + EE_PER_IOP > EE_CYCLES_PER_FRAME - VBLANK_CYCLES
-                && self.frame_pos <= EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
-            let wrap = self.frame_pos + EE_PER_IOP >= EE_CYCLES_PER_FRAME;
+            let vbl_edge = self.frame_pos + EE_PER_IOP > self.vblank_start()
+                && self.frame_pos <= self.vblank_start();
+            let wrap = self.frame_pos + EE_PER_IOP >= self.frame_cycles();
             if !vbl_edge && !wrap {
                 self.frame_pos += EE_PER_IOP - 1;
                 self.cycles += EE_PER_IOP - 1;
@@ -395,7 +495,7 @@ impl Ps2System {
     /// edges are multiples of [`EE_PER_IOP`]), so counting groups is exact.
     #[inline]
     fn quiet_iop_groups(&self, limit: u64) -> u64 {
-        let vbl_start = EE_CYCLES_PER_FRAME - VBLANK_CYCLES;
+        let vbl_start = self.vblank_start();
         // An edge on the current cycle is `machine_cycle`'s to fire.
         if self.frame_pos == 0 || self.frame_pos == vbl_start {
             return 0;
@@ -403,7 +503,7 @@ impl Ps2System {
         let to_vblank = if self.frame_pos < vbl_start {
             vbl_start - self.frame_pos
         } else {
-            EE_CYCLES_PER_FRAME - self.frame_pos
+            self.frame_cycles() - self.frame_pos
         };
         let due = self.bus.timers_due.max(self.cycles);
         let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
@@ -426,7 +526,7 @@ impl Ps2System {
         // The batch may end exactly on the frame edge; `machine_cycle`
         // recognises the vblank-end edge by a wrapped position, not by the
         // frame length.
-        if self.frame_pos == EE_CYCLES_PER_FRAME {
+        if self.frame_pos == self.frame_cycles() {
             self.frame_pos = 0;
         }
     }
