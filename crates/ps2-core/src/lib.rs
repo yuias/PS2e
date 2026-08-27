@@ -9,6 +9,7 @@ pub mod ee;
 pub mod gif;
 pub mod gs;
 pub mod iop;
+pub mod ipu;
 pub mod prof;
 pub mod sif;
 pub mod spu2;
@@ -33,7 +34,7 @@ const TIMER_TICK_CYCLES: u64 = 64;
 /// Save-state file magic and format version. Bump the version on any
 /// change to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS2E";
-const STATE_VERSION: u16 = 3;
+const STATE_VERSION: u16 = 4;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {

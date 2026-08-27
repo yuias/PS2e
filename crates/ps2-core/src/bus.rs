@@ -1314,6 +1314,7 @@ pub struct Bus {
     #[serde(skip, default = "GsFront::inline")]
     pub gs: GsFront,
     pub gif: Gif,
+    pub ipu: crate::ipu::Ipu,
     pub vif1: Vif,
     pub vu1: Vu1,
     /// VU0 register state for COP2 macro mode (reuses the VU core; its
@@ -1346,6 +1347,7 @@ pub struct Bus {
     /// EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) and SIF1 (ch6),
     /// interrupt status/mask.
     pub dma_vif1: EeDmaChannel,
+    pub dma_ipu_to: EeDmaChannel,
     pub dma_gif: EeDmaChannel,
     pub dma_sif0: EeDmaChannel,
     pub dma_sif1: EeDmaChannel,
@@ -1442,6 +1444,8 @@ impl Bus {
             intc_mask: 0,
             dma_vif1: EeDmaChannel::default(),
             dma_gif: EeDmaChannel::default(),
+            ipu: crate::ipu::Ipu::new(),
+            dma_ipu_to: EeDmaChannel::default(),
             dma_sif0: EeDmaChannel::default(),
             dma_sif1: EeDmaChannel::default(),
             d_stat: 0,
@@ -1834,6 +1838,23 @@ impl Bus {
                     0
                 }
             }
+            // IPU registers. IPU_CMD and IPU_TOP are 64-bit, with a busy
+            // marker in the upper half, so route the width through.
+            0x1000_2000..=0x1000_203F => {
+                if N == 8 {
+                    self.ipu.read64(addr)
+                } else {
+                    u64::from(self.ipu.read32(addr))
+                }
+            }
+            // IPU output FIFO. Nothing decodes yet, so it stays empty.
+            0x1000_7000..=0x1000_700F => 0,
+            // IPU_TO (ch4): the input FIFO is fed by the channel, and the
+            // channel is drained by whatever command is waiting on it.
+            0x1000_B400 => self.dma_ipu_to.chcr as u64,
+            0x1000_B410 => self.dma_ipu_to.madr as u64,
+            0x1000_B420 => self.dma_ipu_to.qwc as u64,
+            0x1000_B430 => self.dma_ipu_to.tadr as u64,
             // GIF_STAT. Channel 2 and the FIFO both run to completion inside
             // the write that starts them, so the GIF is idle whenever the EE
             // can look: no path queued or active, FIFO empty, EE-to-GS
@@ -1921,10 +1942,6 @@ impl Bus {
                 self.ee_dma_stub::<N>(addr, 3, v, "IPU_FROM channel (no IPU)");
                 return;
             }
-            0x1000_B400 => {
-                self.ee_dma_stub::<N>(addr, 4, v, "IPU_TO channel (no IPU)");
-                return;
-            }
             0x1000_C800 => {
                 self.ee_dma_stub::<N>(addr, 7, v, "SIF2 channel");
                 return;
@@ -1957,12 +1974,54 @@ impl Bus {
                 self.dma_vif1.tadr = v as u32;
                 return;
             }
-            // IPU command and control registers, and the IPU's own FIFO.
-            // Nothing decodes MPEG yet: the block is the plain shadow below,
-            // which lets the setup commands the BIOS issues read back, but a
-            // decode would produce nothing. Say so rather than go quiet.
-            0x1000_2000..=0x1000_203F | 0x1000_7000..=0x1000_7FF0 => {
-                self.warn_stub(addr, "IPU");
+            // IPU registers. A finished command raises the IPU interrupt.
+            0x1000_2000..=0x1000_203F => {
+                let done = if N == 8 {
+                    self.ipu.write64(addr, v)
+                } else {
+                    self.ipu.write32(addr, v as u32)
+                };
+                if done {
+                    self.intc_stat |= 1 << 8;
+                    self.intc_changed();
+                }
+                return;
+            }
+            // IPU input FIFO written by programmed I/O: assembled in the
+            // shadow and handed over a quadword at a time, like the GIF's.
+            0x1000_7010..=0x1000_701F => {
+                let off = (addr & 0xFFFF) as usize;
+                write_le::<N>(&mut self.mmio, off, v);
+                if (addr as usize & 0xF) + N >= 16 {
+                    let base = off & !0xF;
+                    let mut q = [0u8; 16];
+                    q.copy_from_slice(&self.mmio[base..base + 16]);
+                    if self.ipu.push_in(q) {
+                        self.intc_stat |= 1 << 8;
+                        self.intc_changed();
+                    }
+                }
+                return;
+            }
+            // IPU_TO (ch4): feed the decoder's input FIFO.
+            0x1000_B400 => {
+                self.dma_ipu_to.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_ipu_to();
+                }
+                return;
+            }
+            0x1000_B410 => {
+                self.dma_ipu_to.madr = v as u32;
+                return;
+            }
+            0x1000_B420 => {
+                self.dma_ipu_to.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_B430 => {
+                self.dma_ipu_to.tadr = v as u32;
+                return;
             }
             // GIF FIFO: PATH3 fed by programmed writes instead of channel 2
             // (the BIOS initialises the GS register file this way). The
@@ -2310,6 +2369,77 @@ impl Bus {
     }
 
     /// Run the GIF channel (ch2) to completion: normal or source chain.
+    /// Channel 4: move quadwords from memory into the IPU's input FIFO,
+    /// letting each one wake a command that ran out of bitstream. Supports
+    /// the source-chain tags the MPEG players build their streams from.
+    fn pump_ipu_to(&mut self) {
+        let mut irq = false;
+        let mut guard = 0u32;
+        while self.dma_ipu_to.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "IPU_TO DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_ipu_to.qwc > 0 {
+                let w = self.ee_dma_read128(self.dma_ipu_to.madr);
+                let mut q = [0u8; 16];
+                for (i, word) in w.iter().enumerate() {
+                    q[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                irq |= self.ipu.push_in(q);
+                self.dma_ipu_to.madr = self.dma_ipu_to.madr.wrapping_add(16);
+                self.dma_ipu_to.qwc -= 1;
+                continue;
+            }
+            let chain = (self.dma_ipu_to.chcr >> 2) & 3 == 1;
+            if !chain || self.dma_ipu_to.tag_end {
+                self.dma_ipu_to.chcr &= !EE_CHCR_STR;
+                self.dma_ipu_to.tag_end = false;
+                self.ee_dma_irq(4);
+                debug!(target: "ps2_core::bus::dma", "IPU_TO DMA done");
+                break;
+            }
+            let tag = self.ee_dma_read128(self.dma_ipu_to.tadr);
+            let qwc = tag[0] & 0xFFFF;
+            let id = (tag[0] >> 28) & 7;
+            let addr = tag[1] & 0xFFFF_FFF0;
+            match id {
+                0 => {
+                    self.dma_ipu_to.madr = addr;
+                    self.dma_ipu_to.tadr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    self.dma_ipu_to.tag_end = true;
+                }
+                1 => {
+                    self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    self.dma_ipu_to.tadr = self.dma_ipu_to.madr.wrapping_add(qwc * 16);
+                }
+                2 => {
+                    self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    self.dma_ipu_to.tadr = addr;
+                }
+                3 | 4 => {
+                    self.dma_ipu_to.madr = addr;
+                    self.dma_ipu_to.tadr = self.dma_ipu_to.tadr.wrapping_add(16);
+                }
+                7 => {
+                    self.dma_ipu_to.madr = self.dma_ipu_to.tadr.wrapping_add(16);
+                    self.dma_ipu_to.tag_end = true;
+                }
+                _ => {
+                    warn!(target: "ps2_core::bus::dma", id, "unhandled IPU_TO tag");
+                    self.dma_ipu_to.chcr &= !EE_CHCR_STR;
+                    break;
+                }
+            }
+            self.dma_ipu_to.qwc = qwc;
+        }
+        if irq {
+            self.intc_stat |= 1 << 8;
+            self.intc_changed();
+        }
+    }
+
     fn pump_gif(&mut self) {
         let _p = prof::scope(prof::Slot::Gif);
         let mut guard = 0u32;
