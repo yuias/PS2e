@@ -9,6 +9,7 @@
 //! Headless (`--cycles`) runs never touch this file's memcard default —
 //! only `--memcard` opts a headless run into a persisted card.
 
+use ps2_core::Region;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -17,6 +18,12 @@ const DEFAULT_TEMPLATE: &str = r#"# PS2e configuration
 # Path to a 4 MiB PS2 BIOS image. Absolute, or relative to the directory
 # this file is in. Falls back to assets/SCPH-50000.bin when unset.
 #bios = "path/to/bios.bin"
+
+# Video timing: "ntsc" (60 Hz) or "pal" (50 Hz). This sets the refresh and
+# the horizontal-blank rates only; it does not change what software detects
+# as the console's region, which comes from the BIOS image itself, so a PAL
+# title still wants a PAL BIOS. --region overrides this.
+region = "ntsc"
 
 # Master volume, 0.0 .. 1.0
 volume = 0.5
@@ -102,6 +109,8 @@ internal_2x = false
 #[serde(default)]
 pub struct Config {
     pub bios: Option<PathBuf>,
+    /// Video timing region; `--region` overrides it.
+    pub region: Region,
     pub volume: f32,
     pub memcard: Option<PathBuf>,
     pub scaler: crate::display::ScaleMode,
@@ -330,6 +339,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bios: None,
+            region: Region::default(),
             volume: 0.5,
             memcard: None,
             scaler: crate::display::ScaleMode::Sharp,
@@ -457,6 +467,13 @@ mod tests {
         let back: Config = toml::from_str(&text).expect("parses back");
         assert_eq!(back.pad.circle, cfg.pad.circle);
         assert_eq!(back.state, cfg.state);
+    }
+
+    #[test]
+    fn region_reads_from_the_file_and_defaults_to_ntsc() {
+        let cfg: Config = toml::from_str(r#"region = "pal""#).expect("parses");
+        assert_eq!(cfg.region, Region::Pal);
+        assert_eq!(Config::default().region, Region::Ntsc);
     }
 
     #[test]

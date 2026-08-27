@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ps2_core::Ps2System;
+use ps2_core::{Ps2System, Region};
 use tracing_subscriber::EnvFilter;
 
 struct Args {
@@ -52,6 +52,8 @@ struct Args {
     no_jit: bool,
     /// Render internally at 2x and scan out the overlay.
     internal_2x: bool,
+    /// Video timing region; overrides the config file when set.
+    region: Option<Region>,
     /// Scripted pad input: (button mask, first cycle, last cycle). Headless.
     presses: Vec<(u16, u64, u64)>,
     /// Memory card image to load and persist (16384 x 528-byte pages).
@@ -119,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
         gs_inline: false,
         no_jit: false,
         internal_2x: false,
+        region: None,
         presses: Vec::new(),
         memcard: None,
         disc: None,
@@ -163,6 +166,9 @@ fn parse_args() -> Result<Args, String> {
             "--gs-inline" => args.gs_inline = true,
             "--no-jit" => args.no_jit = true,
             "--internal-2x" => args.internal_2x = true,
+            "--region" => {
+                args.region = Some(it.next().ok_or("--region needs ntsc or pal")?.parse()?)
+            }
             "--press" => args
                 .presses
                 .push(parse_press(&it.next().ok_or("--press needs <button>@<cycle>")?)?),
@@ -202,6 +208,7 @@ fn parse_args() -> Result<Args, String> {
                      --gs-inline      render on the emulation thread (no GS worker)\n\
                      --no-jit         interpret the EE instead of recompiling it\n\
                      --internal-2x    render internally at 2x (sharper 3D)\n\
+                     --region         video timing, 'ntsc' (default) or 'pal'\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
@@ -260,7 +267,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sys = match Ps2System::new_with(bios.clone(), !args.gs_inline) {
+    let region = args.region.unwrap_or(cfg.region);
+    let mut sys = match Ps2System::new_with_region(bios.clone(), !args.gs_inline, region) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -366,6 +374,7 @@ fn run_windowed(
     memcard_path: Option<PathBuf>,
     nvram_path: PathBuf,
 ) -> ExitCode {
+    let region = sys.region();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
@@ -388,12 +397,13 @@ fn run_windowed(
                 disc_name,
                 debugger,
                 wait_debugger,
+                region,
                 volume: cfg.volume,
             };
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
             let render_state = cc.wgpu_render_state.as_ref().expect("the wgpu renderer is selected");
             display::init(render_state);
-            Ok(Box::new(ui::App::new(emu, cfg, cfg_path)))
+            Ok(Box::new(ui::App::new(emu, cfg, cfg_path, region)))
         }),
     );
     match result {

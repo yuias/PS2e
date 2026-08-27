@@ -7,6 +7,7 @@
 use crate::config::Config;
 use crate::emu::{Command, DebuggerState, Disc, Emu};
 use eframe::egui;
+use ps2_core::Region;
 use crate::gamepad::Gamepad;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -61,6 +62,8 @@ pub struct App {
     internal_2x: bool,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
+    /// Video timing region the machine runs in (fixed at startup).
+    region: Region,
     config: Config,
     config_path: Option<PathBuf>,
     last_screenshot: Option<String>,
@@ -81,7 +84,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>) -> Self {
+    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, region: Region) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keymap = resolve_keymap(&config.keys);
         let gamepad = Gamepad::new(&config.pad);
@@ -94,6 +97,7 @@ impl App {
             swap_fields: config.swap_fields,
             internal_2x: config.internal_2x,
             volume,
+            region,
             config,
             config_path,
             last_screenshot: None,
@@ -378,7 +382,7 @@ impl eframe::App for App {
                     ui.monospace(format!(
                         "speed {:3.0}% ({:.0} fps)   audio {:3} ms{}",
                         status.speed * 100.0,
-                        status.speed * 60.0,
+                        status.speed * self.region.refresh_hz(),
                         status.audio_buffered * 1000 / 48_000,
                         if status.audio_underruns > 0 {
                             format!("   underruns {}", status.audio_underruns)

@@ -8,7 +8,7 @@
 //! a wasm build driving the same snapshots single-threaded).
 
 use crate::audio::Audio;
-use ps2_core::{EE_CLOCK_HZ, Ps2System};
+use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -183,6 +183,8 @@ pub struct WorkerConfig {
     pub disc_name: Option<String>,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
+    /// Video timing region, re-applied on reset.
+    pub region: Region,
     pub volume: f32,
 }
 
@@ -428,7 +430,7 @@ impl Worker {
         let nvram_path = self.cfg.nvram_path.clone();
         let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
         let jit = self.sys.jit_enabled();
-        self.sys = Ps2System::new(self.cfg.bios.clone()).expect("reset failed");
+        self.sys = Ps2System::new_region(self.cfg.bios.clone(), self.cfg.region).expect("reset failed");
         let _ = self.sys.set_jit(jit);
         self.sys.set_publish_frames(true);
         if let Some(p) = nvram_path {
