@@ -375,6 +375,8 @@ impl Gs {
                 }
             }
             0x54 => self.hwreg(v),
+            // NOP: packets pad themselves out with it.
+            0x0F => {}
             _ => {
                 let (slot, bit) = ((reg >> 6) as usize, reg & 63);
                 if self.warned_regs[slot] & (1 << bit) == 0 {
