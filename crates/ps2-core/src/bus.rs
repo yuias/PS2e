@@ -729,11 +729,10 @@ impl Cdvd {
 #[derive(Serialize, Deserialize)]
 /// SIO2 (pad/memory-card serial controller) with one digital-capable
 /// DualShock in port 0. A transfer is described by the SEND3 slots
-/// (port in bits 0-1, byte length in bits 8-16); command bytes arrive in
+/// (port in bit 0, byte length in bits 8-17); command bytes arrive in
 /// the in-FIFO (PIO or DMA ch11) and responses leave through the
 /// out-FIFO (PIO or DMA ch12). The first command byte selects the
 /// device class: 0x01 pad, 0x81 memory card, 0x21 multitap.
-#[derive(Default)]
 pub struct Sio2 {
     send3: [u32; 16],
     fifo_in: Vec<u8>,
@@ -741,6 +740,14 @@ pub struct Sio2 {
     out_pos: usize,
     ctrl: u32,
     recv1: u32,
+    /// RECV2/RECV3 and the two FIFO position registers: plain storage that
+    /// reads back what was written, which is all the hardware does with them.
+    recv2: u32,
+    recv3: u32,
+    fifo_pos: [u32; 2],
+    /// Interrupt status. Bit 0 latches on transfer completion and the ISR
+    /// clears it by writing the bit back.
+    istat: u32,
     /// Buttons currently held, active-high in PS1 bit order
     /// (SELECT=0, L3, R3, START, UP, RIGHT, DOWN, LEFT,
     ///  L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE=15).
@@ -762,9 +769,15 @@ pub struct Sio2 {
     pub memcard: MemCard,
 }
 
-/// RECV1 values SIO2MAN checks after a transfer.
-const SIO2_RECV1_CONNECTED: u32 = 0x1100;
-const SIO2_RECV1_DISCONNECTED: u32 = 0x1D100;
+/// RECV1 bits SIO2MAN checks after a transfer. The third nibble counts the
+/// ports the packet addressed; the high bits tag a port whose device did not
+/// answer. One open port with everything present is `0x1100`.
+const SIO2_RECV1_ONE_PORT: u32 = 0x100;
+const SIO2_RECV1_TWO_PORTS: u32 = 0x200;
+const SIO2_RECV1_ALL_PRESENT: u32 = 0x1000;
+const SIO2_RECV1_PORT1_MISSING: u32 = 0x1D000;
+const SIO2_RECV1_PORT2_MISSING: u32 = 0x2D000;
+const SIO2_RECV1_CONNECTED: u32 = SIO2_RECV1_ONE_PORT | SIO2_RECV1_ALL_PRESENT;
 
 #[derive(Serialize, Deserialize)]
 /// A PS2 memory card: 16384 pages of 512 data + 16 ECC bytes, stored as
@@ -963,22 +976,76 @@ impl MemCard {
     }
 }
 
+impl Default for Sio2 {
+    fn default() -> Self {
+        Self {
+            send3: [0; 16],
+            fifo_in: Vec::new(),
+            fifo_out: Vec::new(),
+            out_pos: 0,
+            ctrl: 0,
+            recv1: 0,
+            // "Command OK", the only value the hardware is ever seen with.
+            recv2: 0xF,
+            recv3: 0,
+            fifo_pos: [0; 2],
+            istat: 0,
+            buttons: 0,
+            pending: false,
+            in_block: (0, 0),
+            pad_config: false,
+            pad_analog: false,
+            memcard: MemCard::default(),
+        }
+    }
+}
+
 impl Sio2 {
+    /// Latch the completion interrupt. Returns true when the IOP's line
+    /// should be pulsed, i.e. the previous one has been acknowledged.
+    pub fn raise_irq(&mut self) -> bool {
+        let first = self.istat == 0;
+        self.istat |= 1;
+        if !first {
+            debug!(target: "ps2_core::iop::sio2", "transfer completed with the last interrupt unacknowledged");
+        }
+        first
+    }
+
+    /// Fold one addressed port into RECV1: the third nibble counts the ports
+    /// the packet touched, and a device that did not answer tags its port.
+    fn note_port(recv1: &mut u32, present: bool, port: u32) {
+        if *recv1 & SIO2_RECV1_ONE_PORT != 0 {
+            *recv1 &= !SIO2_RECV1_ONE_PORT;
+            *recv1 |= SIO2_RECV1_TWO_PORTS;
+        } else {
+            *recv1 |= SIO2_RECV1_ONE_PORT;
+        }
+        *recv1 |= SIO2_RECV1_ALL_PRESENT;
+        if !present {
+            *recv1 |= if port == 0 {
+                SIO2_RECV1_PORT1_MISSING
+            } else {
+                SIO2_RECV1_PORT2_MISSING
+            };
+        }
+    }
+
     /// Execute the queued transfer: walk SEND3, consume the in-FIFO and
     /// synthesize each sub-transfer's response.
     fn run_transfer(&mut self) {
         self.fifo_out.clear();
         self.out_pos = 0;
         let mut pos = 0usize;
-        let mut any_connected = false;
+        let mut recv1 = 0u32;
         let (block_bytes, blocks) = self.in_block;
         let blocked = blocks > 1;
         for (i, slot) in self.send3.into_iter().enumerate() {
             if slot == 0 {
                 break;
             }
-            let port = slot & 3;
-            let len = ((slot >> 8) & 0x1FF) as usize;
+            let port = slot & 1;
+            let len = ((slot >> 8) & 0x3FF) as usize;
             if len == 0 {
                 break;
             }
@@ -991,26 +1058,36 @@ impl Sio2 {
             debug!(target: "ps2_core::iop::sio2",
                 port, len, cmd = format_args!("{:02x?}", &cmd[..cmd.len().min(4)]),
                 "sub-transfer");
-            if port == 0 && cmd.first() == Some(&0x01) {
-                self.pad_respond(&cmd, len);
-                any_connected = true;
-            } else if port == 2 && cmd.first() == Some(&0x81) {
-                let r = self.memcard.respond(&cmd, len);
-                self.fifo_out.extend(r);
-                any_connected = true;
-            } else if port == 2 && cmd.first() == Some(&0x21) {
-                // Multitap query hitting the memory card: the card answers
-                // 0x66 ("not a tap") at byte 5 — replying 0xFF here makes
-                // XSIO2MAN think a tap with a nonsense slot is present.
-                let mut r = vec![0xFFu8; len];
-                if len > 5 {
-                    r[5] = 0x66;
+            // The leading byte picks the device class; both live on port 0.
+            match (port, cmd.first().copied()) {
+                (0, Some(0x01)) => {
+                    self.pad_respond(&cmd, len);
+                    Self::note_port(&mut recv1, true, port);
                 }
-                self.fifo_out.extend(r);
-                any_connected = true;
-            } else {
-                // No device: the line floats high, so reads return 0xFF.
-                self.fifo_out.extend(std::iter::repeat(0xFFu8).take(len));
+                (0, Some(0x81)) => {
+                    let r = self.memcard.respond(&cmd, len);
+                    self.fifo_out.extend(r);
+                    // MCMAN checks one status word for the whole packet and
+                    // the card overwrites it, the way the hardware does.
+                    recv1 = SIO2_RECV1_CONNECTED;
+                }
+                (_, Some(0x21)) => {
+                    // Multitap query. No tap is modelled, and the card behind
+                    // the port answers 0x66 ("not a tap") at byte 5 — replying
+                    // 0xFF there makes XSIO2MAN think a tap with a nonsense
+                    // slot is present. MTAPMAN only looks at the port-1 bit.
+                    let mut r = vec![0xFFu8; len];
+                    if len > 5 {
+                        r[5] = 0x66;
+                    }
+                    self.fifo_out.extend(r);
+                    Self::note_port(&mut recv1, false, 0);
+                }
+                _ => {
+                    // No device: the line floats high, so reads return 0xFF.
+                    self.fifo_out.extend(std::iter::repeat(0xFFu8).take(len));
+                    Self::note_port(&mut recv1, false, port);
+                }
             }
             if blocked {
                 // Each sub-transfer's reply fills its own block.
@@ -1018,14 +1095,7 @@ impl Sio2 {
             }
         }
         self.in_block = (0, 0);
-        // MCMAN wraps its card command between helper sub-transfers and
-        // checks one status word for the whole transfer: a present device
-        // anywhere in the group must win over absent ones.
-        self.recv1 = if any_connected {
-            SIO2_RECV1_CONNECTED
-        } else {
-            SIO2_RECV1_DISCONNECTED
-        };
+        self.recv1 = recv1;
         self.fifo_in.clear();
     }
 
@@ -1101,8 +1171,10 @@ impl Sio2 {
             }
             0x68 => self.ctrl,
             0x6C => self.recv1,
-            0x70 => 0xF, // RECV2: constant "command OK"
-            0x74 => 0,   // RECV3
+            0x70 => self.recv2,
+            0x74 => self.recv3,
+            0x78 | 0x7C => self.fifo_pos[usize::from(addr & 4 != 0)],
+            0x80 => self.istat,
             _ => 0,
         }
     }
@@ -1133,6 +1205,11 @@ impl Sio2 {
                     }
                 }
             }
+            0x70 => self.recv2 = v,
+            0x74 => self.recv3 = v,
+            0x78 | 0x7C => self.fifo_pos[usize::from(addr & 4 != 0)] = v,
+            // ISTAT acknowledges the bits written back as 1.
+            0x80 => self.istat &= !v,
             _ => {}
         }
         false
@@ -2889,7 +2966,7 @@ impl Bus {
             };
         }
         match addr {
-            0x1F80_8200..=0x1F80_827F => self.sio2.read(addr),
+            0x1F80_8200..=0x1F80_82FF => self.sio2.read(addr),
             0x1F80_1070 => self.iop_i_stat,
             0x1F80_1074 => self.iop_i_mask,
             0x1F80_1078 => {
@@ -2971,10 +3048,12 @@ impl Bus {
             return;
         }
         match addr {
-            0x1F80_8200..=0x1F80_827F => {
+            0x1F80_8200..=0x1F80_82FF => {
                 if self.sio2.write(addr, v) {
                     // Transfer completion raises the SIO2 interrupt line.
-                    self.iop_i_stat |= 1 << 17;
+                    if self.sio2.raise_irq() {
+                        self.iop_i_stat |= 1 << 17;
+                    }
                     if self.sio2out_deferred {
                         self.sio2out_deferred = false;
                         self.do_sio2_out();
@@ -3054,7 +3133,9 @@ impl Bus {
                     }
                     debug!(target: "ps2_core::iop::sio2", bytes, "DMA in");
                     if self.sio2.dma_in_done() {
-                        self.iop_i_stat |= 1 << 17;
+                        if self.sio2.raise_irq() {
+                            self.iop_i_stat |= 1 << 17;
+                        }
                         if self.sio2out_deferred {
                             self.sio2out_deferred = false;
                             self.do_sio2_out();
