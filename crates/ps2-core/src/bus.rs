@@ -1733,7 +1733,13 @@ impl Bus {
                     0
                 }
             }
-            // EE DMAC: GIF (ch2), SIF0 (ch5) / SIF1 (ch6), interrupt status.
+            // EE DMAC: VIF1 (ch1), GIF (ch2), SIF0 (ch5) / SIF1 (ch6),
+            // interrupt status. Transfers run to completion inside the CHCR
+            // write, so a poll of the start bit always sees it clear.
+            0x1000_9000 => self.dma_vif1.chcr as u64,
+            0x1000_9010 => self.dma_vif1.madr as u64,
+            0x1000_9020 => self.dma_vif1.qwc as u64,
+            0x1000_9030 => self.dma_vif1.tadr as u64,
             0x1000_A000 => self.dma_gif.chcr as u64,
             0x1000_A010 => self.dma_gif.madr as u64,
             0x1000_A020 => self.dma_gif.qwc as u64,
