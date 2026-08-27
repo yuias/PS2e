@@ -10,7 +10,7 @@
 //! drain the queue first.
 
 use super::Gs;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// One composited display frame: width, height, RGBA8.
 pub type Frame = (u32, u32, Vec<u8>);
@@ -358,6 +358,13 @@ impl GsFront {
 
     pub fn priv_write(&mut self, addr: u32, v: u64) {
         trace!(target: "ps2_core::gs", addr = format_args!("{addr:#010x}"), value = format_args!("{v:#018x}"), "priv write");
+        // CRTC timing group: SMODE1 plus SRFSH/SYNCH1/SYNCH2/SYNCHV. These
+        // carry the NTSC/PAL distinction but drive nothing here, so a log
+        // target is the only way to check what a kernel programmed.
+        if matches!(addr & 0x1FF0, 0x0010 | 0x0030..=0x0060) {
+            debug!(target: "ps2_core::gs::crtc",
+                addr = format_args!("{:#06x}", addr & 0x1FF0), value = format_args!("{v:#018x}"), "crtc reg");
+        }
         match addr & 0x1FF0 {
             0x0000 => self.pmode = v,
             0x0010 => self.smode1 = v,
@@ -391,6 +398,7 @@ impl GsFront {
     pub fn priv_read(&mut self, addr: u32) -> u64 {
         match addr & 0x1FF0 {
             0x0000 => self.pmode,
+            0x0010 => self.smode1,
             0x0020 => self.smode2,
             0x0070 => self.dispfb1,
             0x0080 => self.display1,
