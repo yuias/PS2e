@@ -171,7 +171,9 @@ impl Gif {
                 let addr = (hi & 0xFF) as u8;
                 gs.write_reg(addr, lo);
             }
-            0xF => {} // NOP
+            // 0xB is reserved and 0xF is NOP; the GS ignores both, and
+            // packets pad themselves out with them.
+            0xB | 0xF => {}
             _ => {
                 warn!(target: "ps2_core::gif", desc, "unhandled packed descriptor");
             }
