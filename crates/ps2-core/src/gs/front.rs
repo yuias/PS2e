@@ -405,7 +405,9 @@ impl GsFront {
             0x0090 => self.dispfb2,
             0x00A0 => self.display2,
             0x00E0 => self.bgcolor,
-            // CSR: flags + FIFO empty + revision/id.
+            // CSR: flags + FIFO empty + revision/id. REV 0x1B is what
+            // retail hardware and PCSX2 both report; kernel paths gated on
+            // REV == 1 are meant to stay unreachable.
             0x1000 => self.csr | 0x4000 | (0x1B << 16) | (0x55 << 24),
             0x1010 => self.imr,
             _ => self.priv_shadow[((addr >> 4) & 31) as usize],
