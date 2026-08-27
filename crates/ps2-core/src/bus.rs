@@ -763,11 +763,35 @@ pub struct Sio2 {
     in_block: (usize, usize),
     /// DualShock command-0x43 config mode.
     pad_config: bool,
-    /// Analog mode (command 0x44); adds four stick bytes to polls.
-    pad_analog: bool,
+    /// The mode the pad reports and polls in: `PAD_DIGITAL`, `PAD_ANALOG`
+    /// (adds four stick bytes) or `PAD_DS2` (also twelve pressure bytes).
+    pad_mode: u8,
+    /// The vibration slots as command 0x4D last left them.
+    motor_map: [u8; 2],
     /// Memory card in slot 1 (SIO2 port 2).
     pub memcard: MemCard,
 }
+
+/// Pad modes, which are also the id byte a poll answers with.
+const PAD_DIGITAL: u8 = 0x41;
+const PAD_ANALOG: u8 = 0x73;
+const PAD_DS2: u8 = 0x79;
+/// Held-button bits in [`Sio2::buttons`], in the order a DualShock 2 reports
+/// their pressure.
+const PAD_PRESSURE_ORDER: [u16; 12] = [
+    1 << 5,  // right
+    1 << 7,  // left
+    1 << 4,  // up
+    1 << 6,  // down
+    1 << 12, // triangle
+    1 << 13, // circle
+    1 << 14, // cross
+    1 << 15, // square
+    1 << 10, // L1
+    1 << 11, // R1
+    1 << 8,  // L2
+    1 << 9,  // R2
+];
 
 /// RECV1 bits SIO2MAN checks after a transfer. The third nibble counts the
 /// ports the packet addressed; the high bits tag a port whose device did not
@@ -994,7 +1018,8 @@ impl Default for Sio2 {
             pending: false,
             in_block: (0, 0),
             pad_config: false,
-            pad_analog: false,
+            pad_mode: PAD_DIGITAL,
+            motor_map: [0xFF; 2],
             memcard: MemCard::default(),
         }
     }
@@ -1101,13 +1126,7 @@ impl Sio2 {
 
     fn pad_respond(&mut self, cmd: &[u8], len: usize) {
         let op = cmd.get(1).copied().unwrap_or(0);
-        let id: u8 = if self.pad_config {
-            0xF3
-        } else if self.pad_analog {
-            0x73
-        } else {
-            0x41
-        };
+        let id: u8 = if self.pad_config { 0xF3 } else { self.pad_mode };
         let b = !self.buttons;
         let mut r = vec![0xFF, id, 0x5A];
         if self.pad_config {
@@ -1117,33 +1136,67 @@ impl Sio2 {
             // 5's DS2U.IRX) then ignore its input entirely.
             let arg = cmd.get(3).copied().unwrap_or(0);
             r.extend(match op {
+                // Set VREF param: a fixed acknowledgement.
+                0x40 => [0x00, 0x00, 0x02, 0x00, 0x00, 0x5A],
+                // Button query: only a pad that has been switched to analog
+                // answers; a digital one returns zeros.
+                0x41 if self.pad_mode != PAD_DIGITAL => [0xFF, 0xFF, 0x03, 0x00, 0x00, 0x5A],
+                // Set response bytes: the mask picks the poll format, and
+                // with it the id the pad answers polls with.
+                0x4F => {
+                    let mask = u32::from(cmd.get(3).copied().unwrap_or(0))
+                        | u32::from(cmd.get(4).copied().unwrap_or(0)) << 8
+                        | u32::from(cmd.get(5).copied().unwrap_or(0)) << 16;
+                    self.pad_mode = match mask {
+                        0x00_003F => PAD_ANALOG,
+                        0x03_FFFF => PAD_DS2,
+                        _ => PAD_DIGITAL,
+                    };
+                    [0x00, 0x00, 0x00, 0x00, 0x00, 0x5A]
+                }
                 // Query model: DS2, current mode, one mode entry.
-                0x45 => [0x03, 0x02, u8::from(self.pad_analog), 0x02, 0x01, 0x00],
+                0x45 => [0x03, 0x02, u8::from(self.pad_mode != PAD_DIGITAL), 0x02, 0x01, 0x00],
                 // Query act: the two actuators' descriptions.
-                0x46 if arg == 0 => [0x00, 0x00, 0x02, 0x00, 0x0A, 0x00],
+                0x46 if arg == 0 => [0x00, 0x00, 0x01, 0x02, 0x00, 0x0A],
                 0x46 => [0x00, 0x00, 0x01, 0x01, 0x01, 0x14],
                 // Query comb: one combination driving two actuators.
                 0x47 => [0x00, 0x00, 0x02, 0x00, 0x01, 0x00],
                 // Query mode: the digital and analog mode ids.
-                0x4C if arg == 0 => [0x00, 0x00, 0x04, 0x00, 0x00, 0x00],
-                0x4C => [0x00, 0x00, 0x07, 0x00, 0x00, 0x00],
-                // Vibration mapping: the slots as they stood before this
-                // write, i.e. unmapped.
-                0x4D => [0xFF; 6],
+                0x4C if arg == 0 => [0x00, 0x00, 0x00, 0x04, 0x00, 0x00],
+                0x4C => [0x00, 0x00, 0x00, 0x07, 0x00, 0x00],
+                // Vibration mapping: each slot answers with what it held
+                // before this write, then takes the new value.
+                0x4D => {
+                    let old = self.motor_map;
+                    self.motor_map = [
+                        cmd.get(3).copied().unwrap_or(0xFF),
+                        cmd.get(4).copied().unwrap_or(0xFF),
+                    ];
+                    [old[0], old[1], 0xFF, 0xFF, 0xFF, 0xFF]
+                }
                 _ => [0; 6],
             });
         } else if op == 0x42 || op == 0x43 {
             r.extend([b as u8, (b >> 8) as u8]);
-            if self.pad_analog {
+            if self.pad_mode != PAD_DIGITAL {
                 // Centered sticks: rx, ry, lx, ly.
                 r.extend([0x7F; 4]);
+            }
+            if self.pad_mode == PAD_DS2 {
+                // Pressure. A key is either fully down or not pressed at
+                // all, and a driver that only reads these sees nothing if
+                // they stay zero while the digital bits say otherwise.
+                r.extend(
+                    PAD_PRESSURE_ORDER
+                        .map(|m| if self.buttons & m != 0 { 0xFF } else { 0x00 }),
+                );
             }
         }
         // Mode changes take effect after the frame that carries them.
         if op == 0x43 {
             self.pad_config = cmd.get(3) == Some(&1);
         } else if self.pad_config && op == 0x44 {
-            self.pad_analog = cmd.get(3) == Some(&1);
+            self.pad_mode = if cmd.get(3) == Some(&1) { PAD_ANALOG } else { PAD_DIGITAL };
         }
         r.resize(len, 0);
         self.fifo_out.extend(r);
