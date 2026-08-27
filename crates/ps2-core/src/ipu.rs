@@ -369,6 +369,35 @@ mod tests {
     }
 
     #[test]
+    fn setiq_survives_being_fed_a_quadword_at_a_time() {
+        // The movie player starves the FIFO constantly, so a table load has
+        // to be resumable at any byte and still land byte-perfect.
+        let mut ipu = Ipu::new();
+        assert!(!ipu.write32(0, 0x5000_0000));
+        let mut done = false;
+        for i in 0..4 {
+            assert!(!done, "finished before the last quadword arrived");
+            done = ipu.push_in(qw(i * 16));
+        }
+        assert!(done);
+        assert!(ipu.iq.iter().enumerate().all(|(i, &b)| b == i as u8));
+    }
+
+    #[test]
+    fn a_read_that_outruns_the_fifo_resumes_without_losing_bits() {
+        let mut ipu = Ipu::new();
+        ipu.push_in(qw(0));
+        // Two maximum skips leave the pointer near the end of the quadword,
+        // so the 32 bits FDEC wants straddle a quadword that has not
+        // arrived: the command parks mid-read and finishes on the feed.
+        assert!(ipu.write32(0, 0x4000_0000 | 63));
+        assert!(!ipu.write32(0, 0x4000_0000 | 63));
+        assert!(ipu.push_in(qw(0x10)));
+        assert_eq!(ipu.read32(0x20) & 0x7F, 126);
+        assert_eq!(ipu.read32(0), 0xC404_4484);
+    }
+
+    #[test]
     fn bclr_drops_the_bitstream_and_sets_the_bit_pointer() {
         let mut ipu = Ipu::new();
         ipu.push_in(qw(0));
