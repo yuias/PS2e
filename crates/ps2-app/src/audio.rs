@@ -35,6 +35,8 @@ impl Audio {
         // hold at a non-integer ratio is audibly rough).
         let base_step = 48_000.0 / sample_rate as f64;
         let mut pos = 0.0f64;
+        // Playback rate, smoothed across callbacks (see below).
+        let mut rate = 1.0f64;
         let mut prev = (0i16, 0i16);
         let mut cur = (0i16, 0i16);
 
@@ -51,14 +53,21 @@ impl Audio {
                     // as the queue nears empty — so even a badly slow stretch
                     // plays lower rather than in pieces.
                     let fill = (q.len() / 2) as f64 / target.max(1) as f64;
-                    let scale = if fill >= 0.75 {
+                    let want = if fill >= 0.75 {
                         1.0
                     } else if fill >= 0.25 {
                         1.0 - (0.75 - fill) * 0.6
                     } else {
                         (0.7 - (0.25 - fill)).max(0.45)
                     };
-                    let step = base_step * scale;
+                    // A machine that runs below real time keeps the queue
+                    // shallow, so `fill` swings with every batch the emulator
+                    // hands over. Following it directly turns that into
+                    // audible warble at the batch rate; easing toward it
+                    // holds a steady pitch and still tracks a real change in
+                    // speed within a few callbacks.
+                    rate += (want - rate) * 0.08;
+                    let step = base_step * rate;
                     for frame in data.chunks_mut(channels) {
                         pos += step;
                         while pos >= 1.0 {
