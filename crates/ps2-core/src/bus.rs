@@ -2628,14 +2628,15 @@ impl Bus {
             if irq && self.dma_vif0.chcr & EE_CHCR_TIE != 0 {
                 self.dma_vif0.tag_end = true;
             }
-            // The tag's upper 64 bits always reach VIF1 on chain transfers:
-            // OSDSYS relies on DIRECT codes riding there even with TTE
-            // clear (its 2D chains kick with CHCR 0x105). A zero upper half
-            // is just two NOPs, so feeding it unconditionally is safe.
-            self.vif0
-                .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[2]);
-            self.vif0
-                .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[3]);
+            // TTE decides whether the tag's upper 64 bits enter the VIF
+            // stream. Feeding them unconditionally would turn them into
+            // data mid-UNPACK; no chain seen so far clears TTE anyway.
+            if self.dma_vif0.chcr & EE_CHCR_TTE != 0 {
+                self.vif0
+                    .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[2]);
+                self.vif0
+                    .push_word(&mut self.gs, &mut self.gif, &mut self.vu0, tag[3]);
+            }
             self.dma_vif0.qwc = qwc;
         }
     }
@@ -2739,14 +2740,15 @@ impl Bus {
             if irq && self.dma_vif1.chcr & EE_CHCR_TIE != 0 {
                 self.dma_vif1.tag_end = true;
             }
-            // The tag's upper 64 bits always reach VIF1 on chain transfers:
-            // OSDSYS relies on DIRECT codes riding there even with TTE
-            // clear (its 2D chains kick with CHCR 0x105). A zero upper half
-            // is just two NOPs, so feeding it unconditionally is safe.
-            self.vif1
-                .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[2]);
-            self.vif1
-                .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[3]);
+            // TTE decides whether the tag's upper 64 bits enter the VIF
+            // stream. Feeding them unconditionally would turn them into
+            // data mid-UNPACK; no chain seen so far clears TTE anyway.
+            if self.dma_vif1.chcr & EE_CHCR_TTE != 0 {
+                self.vif1
+                    .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[2]);
+                self.vif1
+                    .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[3]);
+            }
             self.dma_vif1.qwc = qwc;
         }
     }
