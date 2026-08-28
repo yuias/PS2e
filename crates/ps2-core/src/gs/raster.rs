@@ -1294,6 +1294,7 @@ impl Painter<'_> {
             zf += a.d_z;
             let ta = texel >> 24;
             let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            let (mut write_z, mut keep_dst_alpha) = (true, false);
             if ATE {
                 let pass = match atst {
                     0 => false,
@@ -1305,22 +1306,41 @@ impl Painter<'_> {
                     6 => a8 > aref,
                     _ => a8 != aref,
                 };
-                if !pass && (afail == 0 || afail == 2) {
+                if !pass {
+                    match afail {
+                        0 => continue, // KEEP
+                        2 => {
+                            // ZB_ONLY: the pixel still updates Z.
+                            ztest.pass(canvas, row, px as u32, z);
+                            continue;
+                        }
+                        1 => write_z = false,
+                        _ => {
+                            write_z = false;
+                            keep_dst_alpha = true;
+                        }
+                    }
+                }
+            }
+            if ztest.on {
+                let zok = if write_z {
+                    ztest.pass(canvas, row, px as u32, z)
+                } else {
+                    ztest.test(canvas, row, px as u32, z)
+                };
+                if !zok {
                     continue;
                 }
             }
-            if ztest.on && !ztest.pass(canvas, row, px as u32, z) {
-                continue;
-            }
             let mut out = Modulate::new(cr, cg, cb, ca, tcc).apply(texel);
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & canvas.mask();
-            let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
+            let dst = if ABE || fb24 || keep_dst_alpha { canvas.rd32(fb_off) } else { 0 };
             if ABE {
                 out = blend.apply(out, dst, a8);
             }
-            if fb24 {
-                // PSMCT24 frame: the alpha byte belongs to whatever shares
-                // the word.
+            if fb24 || keep_dst_alpha {
+                // PSMCT24 frame, or RGB_ONLY: the alpha byte belongs to
+                // whatever shares the word.
                 out = (out & 0xFF_FFFF) | (dst & 0xFF00_0000);
             }
             canvas.wr32(fb_off, out);
@@ -1769,6 +1789,7 @@ impl Painter<'_> {
             u += a.du;
             let ta = texel >> 24;
             let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            let (mut write_z, mut keep_dst_alpha) = (true, false);
             if ATE {
                 let pass = match atst {
                     0 => false,
@@ -1780,22 +1801,41 @@ impl Painter<'_> {
                     6 => a8 > aref,
                     _ => a8 != aref,
                 };
-                if !pass && (afail == 0 || afail == 2) {
+                if !pass {
+                    match afail {
+                        0 => continue, // KEEP
+                        2 => {
+                            // ZB_ONLY: the pixel still updates Z.
+                            ztest.pass(canvas, row, px as u32, z);
+                            continue;
+                        }
+                        1 => write_z = false,
+                        _ => {
+                            write_z = false;
+                            keep_dst_alpha = true;
+                        }
+                    }
+                }
+            }
+            if ztest.on {
+                let zok = if write_z {
+                    ztest.pass(canvas, row, px as u32, z)
+                } else {
+                    ztest.test(canvas, row, px as u32, z)
+                };
+                if !zok {
                     continue;
                 }
             }
-            if ztest.on && !ztest.pass(canvas, row, px as u32, z) {
-                continue;
-            }
             let mut out = mod_lanes.apply(texel);
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & canvas.mask();
-            let dst = if ABE || fb24 { canvas.rd32(fb_off) } else { 0 };
+            let dst = if ABE || fb24 || keep_dst_alpha { canvas.rd32(fb_off) } else { 0 };
             if ABE {
                 out = blend.apply(out, dst, a8);
             }
-            if fb24 {
-                // PSMCT24 frame: the alpha byte belongs to whatever shares
-                // the word.
+            if fb24 || keep_dst_alpha {
+                // PSMCT24 frame, or RGB_ONLY: the alpha byte belongs to
+                // whatever shares the word.
                 out = (out & 0xFF_FFFF) | (dst & 0xFF00_0000);
             }
             canvas.wr32(fb_off, out);
@@ -1856,7 +1896,10 @@ impl Painter<'_> {
             }
         }
 
-        // Alpha test.
+        // Alpha test. AFAIL decides what a failing pixel still updates:
+        // FB_ONLY leaves Z alone, ZB_ONLY updates only Z, RGB_ONLY keeps
+        // the destination alpha as well as Z.
+        let (mut write_z, mut write_fb, mut keep_dst_alpha) = (true, true, false);
         if pipe.ate {
             let aref = pipe.aref;
             let pass = match pipe.atst {
@@ -1872,9 +1915,12 @@ impl Painter<'_> {
             if !pass {
                 match pipe.afail {
                     0 => return, // KEEP
-                    1 => {}      // FB_ONLY: continue without z write
-                    2 => return, // ZB_ONLY: no color -> nothing visible
-                    _ => {}      // RGB_ONLY
+                    1 => write_z = false,
+                    2 => write_fb = false,
+                    _ => {
+                        write_z = false;
+                        keep_dst_alpha = true;
+                    }
                 }
             }
         }
@@ -1897,13 +1943,20 @@ impl Painter<'_> {
             if !pass {
                 return;
             }
-            if !pipe.zmsk {
+            if !pipe.zmsk && write_z {
                 self.canvas.wr32(z_off, (zcur & !zmask) | z);
             }
         }
+        if !write_fb {
+            return;
+        }
 
         // Destination pixel, only when something depends on it.
-        let dst = if pipe.abe || pipe.fbmsk != 0 || pipe.fb24 { self.canvas.rd32(fb_off) } else { 0 };
+        let dst = if pipe.abe || pipe.fbmsk != 0 || pipe.fb24 || keep_dst_alpha {
+            self.canvas.rd32(fb_off)
+        } else {
+            0
+        };
 
         if pipe.abe {
             // ALPHA: Cv = ((A - B) * C >> 7) + D, on three 21-bit lanes of a
@@ -1939,6 +1992,9 @@ impl Painter<'_> {
 
         let out = r | (g << 8) | (b << 16) | (a.min(255) << 24);
         let mut merged = (out & !pipe.fbmsk) | (dst & pipe.fbmsk);
+        if keep_dst_alpha {
+            merged = (merged & 0xFF_FFFF) | (dst & 0xFF00_0000);
+        }
         if pipe.fb24 {
             merged = (merged & 0xFF_FFFF) | (dst & 0xFF00_0000);
         }
@@ -2259,6 +2315,20 @@ impl ZTest {
     #[inline(always)]
     fn new(pipe: &PixelPipe) -> Self {
         Self { on: pipe.z_touched, ztst: pipe.ztst, write: pipe.zte && !pipe.zmsk, zmask: pipe.zmask }
+    }
+
+    /// Test `z` without updating the buffer: an alpha test that failed
+    /// with FB_ONLY or RGB_ONLY still gates on Z but must not write it.
+    #[inline(always)]
+    fn test(self, canvas: &Canvas, row: &Row, x: u32, z: u32) -> bool {
+        let z_off = (row.z_base + layout::col_off32(row.y, x, true)) & canvas.mask();
+        let zcur = canvas.rd32(z_off);
+        match self.ztst {
+            0 => false,
+            1 => true,
+            2 => z >= (zcur & self.zmask),
+            _ => z > (zcur & self.zmask),
+        }
     }
 
     /// Test `z` (already masked) against the buffer; writes it when the
