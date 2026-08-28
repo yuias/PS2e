@@ -40,6 +40,8 @@ pub struct EeDmaChannel {
     /// the same as the DMAC's ASR0/ASR1.
     asr: [u32; 2],
     asr_depth: u8,
+    /// Scratchpad-side address, the SPR channels only. 14 bits.
+    sadr: u32,
 }
 
 const EE_CHCR_STR: u32 = 1 << 8;
@@ -1414,6 +1416,9 @@ pub struct Bus {
     pub dma_vif1: EeDmaChannel,
     pub dma_ipu_to: EeDmaChannel,
     pub dma_gif: EeDmaChannel,
+    /// Scratchpad channels: 8 copies out of the SPR, 9 into it.
+    pub dma_spr_from: EeDmaChannel,
+    pub dma_spr_to: EeDmaChannel,
     pub dma_sif0: EeDmaChannel,
     pub dma_sif1: EeDmaChannel,
     pub d_stat: u32,
@@ -1515,6 +1520,8 @@ impl Bus {
             dma_vif0: EeDmaChannel::default(),
             dma_vif1: EeDmaChannel::default(),
             dma_gif: EeDmaChannel::default(),
+            dma_spr_from: EeDmaChannel::default(),
+            dma_spr_to: EeDmaChannel::default(),
             ipu: crate::ipu::Ipu::new(),
             dma_ipu_to: EeDmaChannel::default(),
             dma_sif0: EeDmaChannel::default(),
@@ -1772,6 +1779,10 @@ impl Bus {
             0x1000_8000..=0x1000_803F => chan(&self.dma_vif0, reg)?,
             0x1000_9000..=0x1000_903F => chan(&self.dma_vif1, reg)?,
             0x1000_A000..=0x1000_A03F => chan(&self.dma_gif, reg)?,
+            0x1000_D000..=0x1000_D03F => chan(&self.dma_spr_from, reg)?,
+            0x1000_D080 => self.dma_spr_from.sadr,
+            0x1000_D400..=0x1000_D43F => chan(&self.dma_spr_to, reg)?,
+            0x1000_D480 => self.dma_spr_to.sadr,
             0x1000_B400..=0x1000_B43F => chan(&self.dma_ipu_to, reg)?,
             0x1000_C000..=0x1000_C03F => chan(&self.dma_sif0, reg)?,
             0x1000_C400..=0x1000_C43F => chan(&self.dma_sif1, reg)?,
@@ -2004,6 +2015,16 @@ impl Bus {
             0x1000_A010 => self.dma_gif.madr as u64,
             0x1000_A020 => self.dma_gif.qwc as u64,
             0x1000_A030 => self.dma_gif.tadr as u64,
+            0x1000_D000 => self.dma_spr_from.chcr as u64,
+            0x1000_D010 => self.dma_spr_from.madr as u64,
+            0x1000_D020 => self.dma_spr_from.qwc as u64,
+            0x1000_D030 => self.dma_spr_from.tadr as u64,
+            0x1000_D080 => self.dma_spr_from.sadr as u64,
+            0x1000_D400 => self.dma_spr_to.chcr as u64,
+            0x1000_D410 => self.dma_spr_to.madr as u64,
+            0x1000_D420 => self.dma_spr_to.qwc as u64,
+            0x1000_D430 => self.dma_spr_to.tadr as u64,
+            0x1000_D480 => self.dma_spr_to.sadr as u64,
             0x1000_C000 => self.dma_sif0.chcr as u64,
             0x1000_C010 => self.dma_sif0.madr as u64,
             0x1000_C020 => self.dma_sif0.qwc as u64,
@@ -2100,12 +2121,52 @@ impl Bus {
                 self.ee_dma_stub::<N>(addr, 7, v, "SIF2 channel");
                 return;
             }
+            // Scratchpad channels: like the others, a set start bit runs
+            // the whole transfer inside this write.
             0x1000_D000 => {
-                self.ee_dma_stub::<N>(addr, 8, v, "fromSPR channel");
+                self.dma_spr_from.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_spr_from();
+                }
+                return;
+            }
+            0x1000_D010 => {
+                self.dma_spr_from.madr = v as u32;
+                return;
+            }
+            0x1000_D020 => {
+                self.dma_spr_from.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_D030 => {
+                self.dma_spr_from.tadr = v as u32;
+                return;
+            }
+            0x1000_D080 => {
+                self.dma_spr_from.sadr = v as u32 & 0x3FFF;
                 return;
             }
             0x1000_D400 => {
-                self.ee_dma_stub::<N>(addr, 9, v, "toSPR channel");
+                self.dma_spr_to.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_spr_to();
+                }
+                return;
+            }
+            0x1000_D410 => {
+                self.dma_spr_to.madr = v as u32;
+                return;
+            }
+            0x1000_D420 => {
+                self.dma_spr_to.qwc = v as u32 & 0xFFFF;
+                return;
+            }
+            0x1000_D430 => {
+                self.dma_spr_to.tadr = v as u32;
+                return;
+            }
+            0x1000_D480 => {
+                self.dma_spr_to.sadr = v as u32 & 0x3FFF;
                 return;
             }
             // VIF1 channel: starting a transfer runs it to completion.
@@ -2783,6 +2844,197 @@ impl Bus {
             self.intc_stat |= 1 << 8;
             self.intc_changed();
         }
+    }
+
+    /// Channel 9 (toSPR): quadwords from main memory into the scratchpad.
+    /// MADR walks memory, SADR the 16 KB scratchpad, wrapping inside it.
+    /// The DMAC reads memory here, so chain mode is an ordinary source
+    /// chain with its tags at TADR.
+    fn pump_spr_to(&mut self) {
+        let mut guard = 0u32;
+        while self.dma_spr_to.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "toSPR DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_spr_to.qwc > 0 {
+                let q = self.ee_dma_read128(self.dma_spr_to.madr);
+                self.spad_write128(self.dma_spr_to.sadr, q);
+                self.dma_spr_to.sadr = self.dma_spr_to.sadr.wrapping_add(16) & 0x3FFF;
+                self.dma_spr_to.madr = self.dma_spr_to.madr.wrapping_add(16);
+                self.dma_spr_to.qwc -= 1;
+                continue;
+            }
+            if !self.spr_chain(true) {
+                break;
+            }
+        }
+    }
+
+    /// Channel 8 (fromSPR): the other direction, scratchpad to memory.
+    /// Its chain tags sit in the scratchpad at SADR, ahead of the data
+    /// they describe, since that is the side the DMAC reads.
+    fn pump_spr_from(&mut self) {
+        let mut guard = 0u32;
+        while self.dma_spr_from.chcr & EE_CHCR_STR != 0 {
+            guard += 1;
+            if guard > 1_000_000 {
+                warn!(target: "ps2_core::bus::dma", "fromSPR DMA hit its iteration limit");
+                break;
+            }
+            if self.dma_spr_from.qwc > 0 {
+                let q = self.spad_read128(self.dma_spr_from.sadr);
+                self.ee_dma_write128(self.dma_spr_from.madr, q);
+                self.dma_spr_from.sadr = self.dma_spr_from.sadr.wrapping_add(16) & 0x3FFF;
+                self.dma_spr_from.madr = self.dma_spr_from.madr.wrapping_add(16);
+                self.dma_spr_from.qwc -= 1;
+                continue;
+            }
+            if !self.spr_chain(false) {
+                break;
+            }
+        }
+    }
+
+    /// One chain step for an SPR channel with its data run exhausted:
+    /// finish the transfer, or read the next tag and set up the run it
+    /// describes. Returns whether the channel is still running.
+    ///
+    /// Both are simple two-word chains — a count and an address, no
+    /// call/ret — but they read their tags from opposite sides: `to`
+    /// (channel 9) from memory at TADR, channel 8 from the scratchpad.
+    fn spr_chain(&mut self, to: bool) -> bool {
+        let ch = if to { &self.dma_spr_to } else { &self.dma_spr_from };
+        let (mode, tag_end, tte) = ((ch.chcr >> 2) & 3, ch.tag_end, ch.chcr & EE_CHCR_TTE != 0);
+        let reg = if to { 0x1000_D400 } else { 0x1000_D000 };
+        if tte {
+            // Transferring the tag as well shifts every run by a
+            // quadword, so this is a wrong result, not a missing one.
+            self.warn_stub(reg, "SPR chain with TTE set");
+        }
+        if mode != 1 || tag_end {
+            if mode == 2 {
+                self.warn_stub(reg, "interleaved SPR transfer");
+            }
+            let ch = if to { &mut self.dma_spr_to } else { &mut self.dma_spr_from };
+            ch.chcr &= !EE_CHCR_STR;
+            ch.tag_end = false;
+            self.ee_dma_irq(if to { 9 } else { 8 });
+            return false;
+        }
+        let tag = if to {
+            self.ee_dma_read128(self.dma_spr_to.tadr)
+        } else {
+            self.spad_read128(self.dma_spr_from.sadr)
+        };
+        let qwc = tag[0] & 0xFFFF;
+        let id = (tag[0] >> 28) & 7;
+        let irq = tag[0] & 0x8000_0000 != 0;
+        let addr = tag[1] & 0xFFFF_FFF0;
+        let ch = if to { &mut self.dma_spr_to } else { &mut self.dma_spr_from };
+        if !to {
+            // Destination chain: the tag names where in memory its run
+            // lands, and the data follows it in the scratchpad. Only
+            // cnts, cnt and end are defined on this side.
+            if !matches!(id, 0 | 1 | 7) {
+                warn!(target: "ps2_core::bus::dma", id, "unhandled fromSPR tag");
+                ch.chcr &= !EE_CHCR_STR;
+                return false;
+            }
+            ch.madr = addr;
+            ch.sadr = ch.sadr.wrapping_add(16) & 0x3FFF;
+            ch.tag_end = id == 7;
+        } else {
+            // Source chain, the same ids every memory-reading channel
+            // follows.
+            match id {
+                0 => {
+                    ch.madr = addr;
+                    ch.tadr = ch.tadr.wrapping_add(16);
+                    ch.tag_end = true;
+                }
+                1 => {
+                    ch.madr = ch.tadr.wrapping_add(16);
+                    ch.tadr = ch.madr.wrapping_add(qwc * 16);
+                }
+                2 => {
+                    ch.madr = ch.tadr.wrapping_add(16);
+                    ch.tadr = addr;
+                }
+                3 | 4 => {
+                    ch.madr = addr;
+                    ch.tadr = ch.tadr.wrapping_add(16);
+                }
+                5 => {
+                    ch.madr = ch.tadr.wrapping_add(16);
+                    let back = ch.madr.wrapping_add(qwc * 16);
+                    let d = ch.asr_depth as usize;
+                    if d < 2 {
+                        ch.asr[d] = back;
+                        ch.asr_depth += 1;
+                    } else {
+                        warn!(target: "ps2_core::bus::dma", "chain call stack overflow");
+                    }
+                    ch.tadr = addr;
+                }
+                6 => {
+                    ch.madr = ch.tadr.wrapping_add(16);
+                    if ch.asr_depth > 0 {
+                        ch.asr_depth -= 1;
+                        ch.tadr = ch.asr[ch.asr_depth as usize];
+                    } else {
+                        ch.tag_end = true;
+                    }
+                }
+                _ => {
+                    ch.madr = ch.tadr.wrapping_add(16);
+                    ch.tag_end = true;
+                }
+            }
+        }
+        ch.tag_end |= irq && ch.chcr & EE_CHCR_TIE != 0;
+        ch.qwc = qwc;
+        true
+    }
+
+    /// One quadword of the scratchpad, by byte address; SADR is 14 bits,
+    /// so the address is already inside it.
+    fn spad_read128(&self, sadr: u32) -> [u32; 4] {
+        let a = (sadr & 0x3FF0) as usize;
+        [
+            read_le::<4>(&self.spad, a) as u32,
+            read_le::<4>(&self.spad, a + 4) as u32,
+            read_le::<4>(&self.spad, a + 8) as u32,
+            read_le::<4>(&self.spad, a + 12) as u32,
+        ]
+    }
+
+    fn spad_write128(&mut self, sadr: u32, q: [u32; 4]) {
+        let a = (sadr & 0x3FF0) as usize;
+        for (i, w) in q.iter().enumerate() {
+            write_le::<4>(&mut self.spad, a + i * 4, *w as u64);
+        }
+    }
+
+    /// Write one quadword for EE-side DMA, taking bit 31 of the address
+    /// as the scratchpad the way [`Bus::ee_dma_read128`] does.
+    fn ee_dma_write128(&mut self, addr: u32, q: [u32; 4]) {
+        if addr & 0x8000_0000 != 0 {
+            self.spad_write128(addr, q);
+            return;
+        }
+        let a = (addr & 0x1FFF_FFF0) as usize;
+        if a + 16 > RAM_SIZE {
+            if self.warned_unmapped.insert(addr & !0xFFF) {
+                warn!(target: "ps2_core::bus::dma", addr = format_args!("{addr:#010x}"), "EE DMA write outside RAM (reported once per page)");
+            }
+            return;
+        }
+        for (i, w) in q.iter().enumerate() {
+            write_le::<4>(&mut self.ram, a + i * 4, *w as u64);
+        }
+        self.note_ram_write(a);
     }
 
     fn pump_gif(&mut self) {
@@ -3790,6 +4042,85 @@ mod tests {
         b.write32(0x7000_0000, 0x1234_5678);
         assert_eq!(b.read32(0x7000_0000), 0x1234_5678);
         assert_ne!(b.read32(0x0000_0000), 0x1234_5678);
+    }
+
+    /// Channel 9 moves quadwords from memory into the scratchpad and
+    /// leaves both addresses past the run.
+    #[test]
+    fn to_spr_copies_memory_into_the_scratchpad() {
+        let mut b = bus();
+        for i in 0..8u32 {
+            b.write32(0x0010_0000 + i * 4, 0x1000 + i);
+        }
+        b.write32(0x1000_D410, 0x0010_0000); // MADR
+        b.write32(0x1000_D480, 0x0100); // SADR
+        b.write32(0x1000_D420, 2); // QWC
+        b.write32(0x1000_D400, EE_CHCR_STR);
+        for i in 0..8u32 {
+            assert_eq!(b.read32(0x7000_0100 + i * 4), 0x1000 + i);
+        }
+        assert_eq!(b.read32(0x1000_D400) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_D420), 0);
+        assert_eq!(b.read32(0x1000_D410), 0x0010_0020);
+        assert_eq!(b.read32(0x1000_D480), 0x0120);
+    }
+
+    /// Channel 8 the other way, and its start bit clears the same way.
+    #[test]
+    fn from_spr_copies_the_scratchpad_into_memory() {
+        let mut b = bus();
+        for i in 0..4u32 {
+            b.write32(0x7000_0200 + i * 4, 0x2000 + i);
+        }
+        b.write32(0x1000_D010, 0x0020_0000); // MADR
+        b.write32(0x1000_D080, 0x0200); // SADR
+        b.write32(0x1000_D020, 1); // QWC
+        b.write32(0x1000_D000, EE_CHCR_STR);
+        for i in 0..4u32 {
+            assert_eq!(b.read32(0x0020_0000 + i * 4), 0x2000 + i);
+        }
+        assert_eq!(b.read32(0x1000_D000) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_D080), 0x0210);
+    }
+
+    /// Channel 9's chain reads its tags from memory at TADR: one cnt of
+    /// a quadword, then end.
+    #[test]
+    fn to_spr_follows_a_source_chain() {
+        let mut b = bus();
+        // cnt, qwc 1, then the quadword it covers.
+        b.write32(0x0030_0000, 1 | (1 << 28));
+        for i in 0..4u32 {
+            b.write32(0x0030_0010 + i * 4, 0x3000 + i);
+        }
+        b.write32(0x0030_0020, 7 << 28); // end, qwc 0
+        b.write32(0x1000_D430, 0x0030_0000); // TADR
+        b.write32(0x1000_D480, 0); // SADR
+        b.write32(0x1000_D400, EE_CHCR_STR | (1 << 2)); // chain mode
+        for i in 0..4u32 {
+            assert_eq!(b.read32(0x7000_0000 + i * 4), 0x3000 + i);
+        }
+        assert_eq!(b.read32(0x1000_D400) & EE_CHCR_STR, 0);
+    }
+
+    /// Channel 8's chain reads its tags from the scratchpad instead, each
+    /// naming where in memory the quadwords behind it land.
+    #[test]
+    fn from_spr_follows_a_chain_out_of_the_scratchpad() {
+        let mut b = bus();
+        // end tag: one quadword, destination 0x0040_0000.
+        b.write32(0x7000_0000, 1 | (7 << 28));
+        b.write32(0x7000_0004, 0x0040_0000);
+        for i in 0..4u32 {
+            b.write32(0x7000_0010 + i * 4, 0x4000 + i);
+        }
+        b.write32(0x1000_D080, 0); // SADR
+        b.write32(0x1000_D000, EE_CHCR_STR | (1 << 2)); // chain mode
+        for i in 0..4u32 {
+            assert_eq!(b.read32(0x0040_0000 + i * 4), 0x4000 + i);
+        }
+        assert_eq!(b.read32(0x1000_D000) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_D080), 0x0020);
     }
 
     #[test]
