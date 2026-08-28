@@ -18,7 +18,7 @@ mod layout;
 
 pub use canvas::Canvas;
 
-pub use front::{Frame, GsFront, Stats};
+pub use front::{Frame, GsFront, SharedFrame, Stats};
 
 pub const VRAM_SIZE: usize = 4 * 1024 * 1024;
 

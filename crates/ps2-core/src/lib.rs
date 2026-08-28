@@ -575,6 +575,11 @@ impl Ps2System {
     pub fn latest_frame(&self) -> Option<gs::Frame> {
         self.bus.gs.latest_frame()
     }
+
+    /// The composited frame without copying its pixels.
+    pub fn latest_frame_shared(&self) -> Option<gs::SharedFrame> {
+        self.bus.gs.latest_frame_shared()
+    }
 }
 
 #[cfg(test)]

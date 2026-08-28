@@ -15,6 +15,10 @@ use tracing::{debug, trace};
 /// One composited display frame: width, height, RGBA8.
 pub type Frame = (u32, u32, Vec<u8>);
 
+/// The composited frame as the front end hands it out: the pixels sit
+/// behind an `Arc` so a reader takes a pointer, not a megabyte.
+pub type SharedFrame = (u32, u32, std::sync::Arc<Vec<u8>>);
+
 /// Renderer statistics, mirrored for the run summary.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
@@ -149,7 +153,7 @@ pub struct GsFront {
     /// Rising edge into the EE INTC GS line (bit 0).
     pub intc_pending: bool,
     /// Latest frame composited at a vblank (worker mode, when enabled).
-    latest_frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    latest_frame: std::sync::Arc<std::sync::Mutex<Option<SharedFrame>>>,
     /// Composite at every vblank so [`GsFront::latest_frame`] stays fresh.
     publish_frames: bool,
     /// How the published frame treats interlaced field buffers.
@@ -247,14 +251,14 @@ impl GsFront {
     }
 
     /// Execute one command against the renderer (either side).
-    fn run_cmd(gs: &mut Gs, cmd: Cmd, latest: &std::sync::Mutex<Option<Frame>>) {
+    fn run_cmd(gs: &mut Gs, cmd: Cmd, latest: &std::sync::Mutex<Option<SharedFrame>>) {
         match cmd {
             Cmd::Reg(reg, v) => gs.write_reg(reg, v),
             Cmd::Image(data) => gs.image(&data),
             Cmd::Priv(addr, v) => gs.priv_write(addr, v),
             Cmd::Vblank(field, mode) => {
-                let frame = gs.framebuffer_woven(field, mode);
-                *latest.lock().unwrap() = Some(frame);
+                let (w, h, rgba) = gs.framebuffer_woven(field, mode);
+                *latest.lock().unwrap() = Some((w, h, std::sync::Arc::new(rgba)));
             }
             Cmd::Frame(reply) => {
                 let _ = reply.send(gs.framebuffer());
@@ -330,6 +334,15 @@ impl GsFront {
 
     /// Newest vblank-composited frame, if publishing is on and one exists.
     pub fn latest_frame(&self) -> Option<Frame> {
+        self.latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(w, h, rgba)| (*w, *h, rgba.as_ref().clone()))
+    }
+
+    /// The same frame without copying its pixels.
+    pub fn latest_frame_shared(&self) -> Option<SharedFrame> {
         self.latest_frame.lock().unwrap().clone()
     }
 
