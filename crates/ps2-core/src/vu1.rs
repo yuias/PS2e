@@ -193,14 +193,14 @@ impl Vu1 {
     }
 
     fn data_qword(&mut self, qw: u32) -> [u32; 4] {
-        self.note_wrapped_data(qw);
+        self.note_vu1_register_window(qw);
         let a = ((qw & self.data_qw_mask) as usize) * 16;
         let w = |o: usize| u32::from_le_bytes(self.data[a + o..a + o + 4].try_into().unwrap());
         [w(0), w(4), w(8), w(12)]
     }
 
     fn set_data_qword(&mut self, qw: u32, dest: u32, vals: [u32; 4]) {
-        self.note_wrapped_data(qw);
+        self.note_vu1_register_window(qw);
         let a = ((qw & self.data_qw_mask) as usize) * 16;
         for f in 0..4 {
             if dest & (8 >> f) != 0 {
@@ -209,16 +209,23 @@ impl Vu1 {
         }
     }
 
-    /// Past the end of this VU's data memory, VU0 sees VU1's register file
-    /// rather than a wrap. Nothing needs it yet, so say so instead of
-    /// quietly handing back the wrong quadword.
-    fn note_wrapped_data(&mut self, qw: u32) {
-        if qw > self.data_qw_mask && self.warned_ops.insert((0xFF, 0)) {
+    /// A data address past the end of a VU's own memory is not a fault:
+    /// the decode keeps only as many address bits as the SRAM has — 14 for
+    /// VU1's 16 KB, 12 for VU0's 4 KB — so it wraps, and microprograms do
+    /// lean on that. `data_qw_mask` already reproduces it.
+    ///
+    /// VU0 is the one exception. Byte address bit 0x4000, quadword 0x400,
+    /// selects VU1's register file instead of VU0's memory, the low bits
+    /// picking a register. That needs the other unit in hand, which this
+    /// one does not have, so it says so once rather than wrapping silently
+    /// into VU0's own memory.
+    fn note_vu1_register_window(&mut self, qw: u32) {
+        let is_vu0 = self.data.len() == VU0_MEM_SIZE;
+        if is_vu0 && qw & 0x400 != 0 && self.warned_ops.insert((0xFF, 0)) {
             warn!(
                 target: "ps2_core::vu1",
                 qw = format_args!("{qw:#x}"),
-                bytes = self.data.len(),
-                "data access past this VU's memory, wrapping (reported once)"
+                "VU0 reached VU1's register file window, reading its own memory instead (reported once)"
             );
         }
     }
@@ -896,6 +903,19 @@ mod tests {
         let mut vu1 = Vu1::new();
         vu1.set_data_qword(0, 0xF, [1, 2, 3, 4]);
         assert_eq!(vu1.data_qword(0x100), [0, 0, 0, 0]);
+    }
+
+    /// VU1 keeps 14 address bits, so quadword 0x5EE — which Ace Combat 5's
+    /// microprograms reach — is 0x1EE of its own memory, not a fault and
+    /// not VU0's register window.
+    #[test]
+    fn vu1_data_wraps_inside_its_sixteen_kilobytes() {
+        let mut vu = Vu1::new();
+        vu.set_data_qword(0x1EE, 0xF, [5, 6, 7, 8]);
+        assert_eq!(vu.data_qword(0x5EE), [5, 6, 7, 8]);
+        // 0x400 is VU0's register window; for VU1 it is just memory.
+        vu.set_data_qword(0x400, 0xF, [9, 10, 11, 12]);
+        assert_eq!(vu.data_qword(0x400), [9, 10, 11, 12]);
     }
 
     fn run_prog(vu: &mut Vu1, pairs: &[(u32, u32)]) {
