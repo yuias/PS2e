@@ -1638,4 +1638,30 @@ mod tests {
         assert_eq!(gs.prims_drawn, 2);
         assert_eq!(gs.read_psmct32(8960, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
     }
+
+    /// An S so large that S/Q * TW overflows f32 saturates the texel
+    /// coordinate to i32's end. The row cache must still be able to hold
+    /// that texel rather than decoding an empty row.
+    #[test]
+    fn a_saturating_texture_coordinate_still_samples() {
+        let mut gs = Gs::new();
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 210 | (10 << 16)); // FRAME_1: 6720, fbw 10, PSMCT32
+        gs.write_reg(0x47, 0x30000); // TEST_1: ZTE, ALWAYS
+        gs.write_reg(0x40, 639 << 16 | 223 << 48); // SCISSOR_1
+        gs.write_reg(0x18, 0); // XYOFFSET_1
+        gs.write_reg(0x06, 0x6_2812_88c0); // TEX0_1: 2240, tbw 10, PSMCT24, 1024x256
+        gs.write_reg(0x14, 0x60); // TEX1_1: MMAG/MMIN LINEAR
+        gs.write_reg(0x00, 0x13); // triangle, TME, STQ
+        gs.write_reg(0x01, 0x8080_8080 | ((f32::to_bits(1.0) as u64) << 32));
+        let st = |s: f32, t: f32| f32::to_bits(s) as u64 | ((f32::to_bits(t) as u64) << 32);
+        let xyz = |x: u64, y: u64| (x * 16) | ((y * 16) << 16);
+        gs.write_reg(0x02, st(1e30, 0.0));
+        gs.write_reg(0x05, xyz(0, 0));
+        gs.write_reg(0x02, st(2e30, 1.0));
+        gs.write_reg(0x05, xyz(600, 0));
+        gs.write_reg(0x02, st(3e30, 2.0));
+        gs.write_reg(0x05, xyz(0, 400));
+        assert_eq!(gs.prims_drawn, 1);
+    }
 }

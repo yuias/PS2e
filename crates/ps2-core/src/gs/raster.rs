@@ -1244,11 +1244,11 @@ impl Painter<'_> {
         let tf = TexFetch::new(&pipe.tex);
         let uv_at = |stqu: &[f32; 4], v: f32| -> (f32, f32) {
             if fst {
-                (stqu[3] / 16.0, v / 16.0)
+                clamp_uv(stqu[3] / 16.0, v / 16.0)
             } else {
                 let q = if stqu[2].abs() < 1e-9 { 1.0 } else { stqu[2] };
                 let inv_q = 1.0 / q;
-                (stqu[0] * inv_q * tw, stqu[1] * inv_q * th)
+                clamp_uv(stqu[0] * inv_q * tw, stqu[1] * inv_q * th)
             }
         };
         // The decoded-row cache pays off when the span stays on one or two
@@ -1464,11 +1464,11 @@ impl Painter<'_> {
         let pipe = self.pipe;
         let ti = &pipe.tex;
         let (fu, fv) = if pipe.fst {
-            (frag.u, frag.v)
+            clamp_uv(frag.u, frag.v)
         } else {
             let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
             let inv_q = 1.0 / q;
-            (frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
+            clamp_uv(frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
         };
         if !pipe.bilinear {
             return self.cached_texel(0, floor_i32(fu), floor_i32(fv));
@@ -1944,11 +1944,11 @@ impl Painter<'_> {
 
         // FST: UV addressing vs STQ. Texel-space coordinates, fractional.
         let (fu, fv) = if pipe.fst {
-            (frag.u, frag.v)
+            clamp_uv(frag.u, frag.v)
         } else {
             let q = if frag.q.abs() < 1e-9 { 1.0 } else { frag.q };
             let inv_q = 1.0 / q;
-            (frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
+            clamp_uv(frag.s * inv_q * ti.tw as f32, frag.t * inv_q * ti.th as f32)
         };
 
         // TEX1 MMAG selects the magnification filter; minification and
@@ -2592,6 +2592,24 @@ fn interp3(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4], l0: f32, l1: f32, l2: f32) 
 #[inline(always)]
 fn spread21(c: u32) -> u64 {
     (c & 0xFF) as u64 | (((c >> 8) & 0xFF) as u64) << 21 | (((c >> 16) & 0xFF) as u64) << 42
+}
+
+/// Texel coordinates are clamped to this before anything integer touches
+/// them. A near-zero Q or a runaway ST sends S/Q * TW past what f32 can
+/// floor into an i32, and the tap and cache-window arithmetic downstream
+/// then wraps around i32 and reads an empty row. The limit is a power of
+/// two well above any texture, so REPEAT masks and CLAMP saturate to the
+/// same texel they would have without it.
+const TEX_COORD_LIMIT: f32 = (1 << 24) as f32;
+
+/// Both texel coordinates through [`TEX_COORD_LIMIT`]. NaN survives as
+/// NaN, which `floor_i32` turns into 0 rather than an out-of-range index.
+#[inline(always)]
+fn clamp_uv(fu: f32, fv: f32) -> (f32, f32) {
+    (
+        fu.clamp(-TEX_COORD_LIMIT, TEX_COORD_LIMIT),
+        fv.clamp(-TEX_COORD_LIMIT, TEX_COORD_LIMIT),
+    )
 }
 
 /// `f32::floor` as an integer, without the libm call the SSE2 baseline
