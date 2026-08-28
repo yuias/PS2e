@@ -130,23 +130,13 @@ impl Vif {
         while *writes_left > 0 {
             let cycle = (*block_pos).min(3) as usize;
             let row_filled = wl > cl && *block_pos >= cl;
-            // Input bytes this write needs.
+            // Input bytes this write needs. The format alone decides this:
+            // the mask redirects where a field is written, never whether
+            // its element is read (an S format reads one and broadcasts).
             let need = if row_filled {
                 0
             } else if vl == 3 {
                 2
-            } else if masked {
-                // Only unmasked fields read the stream — except an S
-                // format, which always reads its one element and then
-                // broadcasts it to whichever fields are left.
-                let mut n = 0usize;
-                for f in 0..4 {
-                    let code = (mask >> ((cycle * 4 + f) * 2)) & 3;
-                    if code == 0 && (f as u32) <= vn {
-                        n += 1;
-                    }
-                }
-                (if vn == 0 { 1 } else { n }) * esize
             } else if vn == 0 {
                 esize
             } else {
@@ -190,6 +180,13 @@ impl Vif {
                 // S formats broadcast one element to every written field.
                 let broadcast = if vn == 0 { Some(take(&mut pos)) } else { None };
                 for f in 0..4 {
+                    // Every field the format supplies takes its element off
+                    // the stream, even when the mask discards it.
+                    let elem = match broadcast {
+                        Some(v) => Some(v),
+                        None if (f as u32) <= vn => Some(take(&mut pos)),
+                        None => None,
+                    };
                     let code = if masked {
                         (mask >> ((cycle * 4 + f) * 2)) & 3
                     } else {
@@ -197,10 +194,7 @@ impl Vif {
                     };
                     match code {
                         0 => {
-                            if let Some(v) = broadcast {
-                                write_field(&mut vu1.data, f, v);
-                            } else if (f as u32) <= vn {
-                                let v = take(&mut pos);
+                            if let Some(v) = elem {
                                 write_field(&mut vu1.data, f, v);
                             }
                         }
@@ -486,26 +480,29 @@ mod tests {
     }
 
     #[test]
-    fn masked_unpack_reads_less_input() {
+    fn masked_unpack_reads_the_whole_vector() {
         let mut r = Rig::new();
-        // STMASK with field w of every cycle taking col (code 2): V4-32
-        // with m set then reads 3 fields per write -> 2 writes = 6 words.
-        r.feed(&[0x2000_0000, 0x8080_8080, 0x7C02_0000]);
-        for _ in 0..6 {
-            r.feed(&[0]);
+        // STMASK with field w of every cycle taking col (code 2): a masked
+        // V4-32 still reads four fields per write, and w's element is
+        // dropped rather than skipped over.
+        r.feed(&[0x2000_0000, 0x8080_8080]);
+        r.feed(&[0x3100_0000, 0xC0, 0xC1, 0xC2, 0xC3]); // STCOL
+        r.feed(&[0x7C02_0000]);
+        for i in 0..8u32 {
+            r.feed(&[0xA0 + i]);
         }
+        // A NOP after exactly 8 data words must not be eaten as data.
+        r.feed(&[0]);
         assert!(r.in_cmd_state());
-        // Without the m flag the same unpack reads all 8 words.
-        r.feed(&[0x6C02_0000]);
-        for _ in 0..8 {
-            r.feed(&[0]);
-        }
-        assert!(r.in_cmd_state());
+        assert_eq!(&r.vu1.data[0..4], &0xA0u32.to_le_bytes());
+        assert_eq!(&r.vu1.data[8..12], &0xA2u32.to_le_bytes());
+        assert_eq!(&r.vu1.data[12..16], &0xC0u32.to_le_bytes()); // col, not 0xA3
+        assert_eq!(&r.vu1.data[16..20], &0xA4u32.to_le_bytes()); // second write
     }
 
     /// A masked S format still reads its element even when the mask hides
-    /// field 0. Sizing the read from the mask alone made the write need
-    /// nothing, and the broadcast then read past the buffered stream.
+    /// field 0 — the special case of the general rule that consumption
+    /// follows the format, not the mask.
     #[test]
     fn masked_s_unpack_still_consumes_its_element() {
         let mut r = Rig::new();

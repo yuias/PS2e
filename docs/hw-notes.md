@@ -135,9 +135,11 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
   buffer (FBP 0x46), PMODE=0x66 (read circuit 2 only, DISPFB2 -> FBP
   0). ~2000 textured prims/frame keep flowing even while the boot sits
   on its first interactive screen (no pad input, zeroed NVRAM).
-- UNPACK input length depends on STCYCL (wl > cl row-fills whole
-  writes) and, with the m flag, on STMASK (codes != 0 take no input) —
-  getting either wrong desyncs the whole command stream.
+- UNPACK input length depends on the format and on STCYCL (wl > cl
+  row-fills whole writes, which read nothing). STMASK does *not* shorten
+  it: a masked field still takes its element off the stream, the mask
+  only decides whether that element or ROW/COL reaches VU memory.
+  Getting the length wrong desyncs the whole command stream.
 
 ## CDVD osdconfig (what makes the OSD skip first-boot setup)
 
