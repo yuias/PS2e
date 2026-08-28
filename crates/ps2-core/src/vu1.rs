@@ -814,8 +814,65 @@ impl Vu1 {
             0x68 => self.vi_write(it, self.top),  // XTOP
             0x69 => self.vi_write(it, self.itop), // XITOP
             0x6C => self.xgkick(gs, gif, self.vi[is & 0xF]),
-            0x7B => {} // WAITP
+            0x70..=0x7A | 0x7C..=0x7E => {
+                let v = self.vf_read(is);
+                self.p = Self::efu(id2, v, v[fsf]);
+            }
+            0x7B => {} // WAITP: P has no latency here
             _ => self.unimplemented("lower", pc, instr),
+        }
+    }
+
+    /// The elementary function unit, VU1 only: one input, one result in P.
+    /// `v` is VF[fs] and `f` its fsf field, already selected.
+    ///
+    /// The three transcendentals evaluate the polynomials the VU User's
+    /// Manual publishes for them rather than the host's `sin`/`exp`/`atan`,
+    /// so a microprogram sees the coefficients it was tuned against. Each
+    /// is only valid over the range the manual gives; outside it the
+    /// hardware returns the polynomial's answer too, so nothing is
+    /// clamped here.
+    fn efu(op: u32, v: [f32; 4], f: f32) -> f32 {
+        // sin(x) over -pi/2..pi/2.
+        const S: [u32; 5] = [0x3F80_0000, 0xBE2A_AAA4, 0x3C08_873E, 0xB94F_B21F, 0x362E_9C14];
+        // exp(-x) over 0..MAX, as the reciprocal of a sextic raised to 4.
+        const E: [u32; 6] =
+            [0x3E7F_FFA8, 0x3D00_07F4, 0x3B29_D3FF, 0x3933_E553, 0x36B6_3510, 0x3539_61AC];
+        // arctan over 0..1, in t = (x-1)/(x+1), plus pi/4.
+        const T: [u32; 8] = [
+            0x3F7F_FFF5, 0xBEAA_A61C, 0x3E4C_40A6, 0xBE0E_6C63, 0x3DC5_77DF, 0xBD65_01C4,
+            0x3CB3_1652, 0xBB84_D7E7,
+        ];
+        let poly = |c: &[u32], t: f32, step: u32| {
+            let (mut acc, mut x) = (0.0f32, t);
+            for &k in c {
+                acc += f32::from_bits(k) * x;
+                for _ in 0..step {
+                    x *= t;
+                }
+            }
+            acc
+        };
+        // Reciprocals saturate rather than produce an infinity, the way
+        // DIV does: VU floats have no representation for one.
+        let recip = |d: f32| if d == 0.0 { f32::MAX } else { 1.0 / d };
+        let sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        let atan = |t: f32| poly(&T, t, 2) + std::f32::consts::FRAC_PI_4;
+        match op {
+            0x70 => sq,                                    // ESADD
+            0x71 => recip(sq),                             // ERSADD
+            0x72 => sq.sqrt(),                             // ELENG
+            0x73 => recip(sq.sqrt()),                      // ERLENG
+            0x74 => atan((v[1] - v[0]) / (v[1] + v[0])),   // EATANxy
+            0x75 => atan((v[2] - v[0]) / (v[2] + v[0])),   // EATANxz
+            0x76 => v[0] + v[1] + v[2] + v[3],             // ESUM
+            0x78 => f.abs().sqrt(),                        // ESQRT
+            0x79 => recip(f.abs().sqrt()),                 // ERSQRT
+            0x7A => recip(f),                              // ERCPR
+            0x7C => poly(&S, f, 2),                        // ESIN
+            0x7D => atan((f - 1.0) / (f + 1.0)),           // EATAN
+            // EEXP: the manual's formula is 1 / (1 + E1 x + ... )^4.
+            _ => recip((1.0 + poly(&E, f, 1)).powi(4)),
         }
     }
 
@@ -916,6 +973,51 @@ mod tests {
         // 0x400 is VU0's register window; for VU1 it is just memory.
         vu.set_data_qword(0x400, 0xF, [9, 10, 11, 12]);
         assert_eq!(vu.data_qword(0x400), [9, 10, 11, 12]);
+    }
+
+    /// The EFU's algebraic results are exact, and its three polynomials
+    /// track the functions they approximate across the ranges the VU
+    /// User's Manual declares them valid over.
+    #[test]
+    fn efu_matches_the_functions_it_approximates() {
+        let v = [3.0f32, 4.0, 12.0, 1.0];
+        assert_eq!(Vu1::efu(0x70, v, 0.0), 169.0); // ESADD
+        assert_eq!(Vu1::efu(0x72, v, 0.0), 13.0); // ELENG
+        assert!((Vu1::efu(0x73, v, 0.0) - 1.0 / 13.0).abs() < 1e-6); // ERLENG
+        assert_eq!(Vu1::efu(0x76, v, 0.0), 20.0); // ESUM
+        assert_eq!(Vu1::efu(0x78, v, 9.0), 3.0); // ESQRT
+        assert_eq!(Vu1::efu(0x7A, v, 4.0), 0.25); // ERCPR
+        // A reciprocal of zero saturates instead of reaching infinity.
+        assert_eq!(Vu1::efu(0x7A, v, 0.0), f32::MAX);
+
+        for i in 0..=20 {
+            let x = i as f32 / 20.0;
+            // ESIN over -pi/2..pi/2, EATAN over 0..1, EEXP over 0..MAX.
+            let a = x * std::f32::consts::FRAC_PI_2;
+            assert!((Vu1::efu(0x7C, v, a) - a.sin()).abs() < 1e-4, "sin {a}");
+            assert!((Vu1::efu(0x7C, v, -a) + a.sin()).abs() < 1e-4, "sin {}", -a);
+            assert!((Vu1::efu(0x7D, v, x) - x.atan()).abs() < 1e-4, "atan {x}");
+            let e = x * 8.0;
+            assert!((Vu1::efu(0x7E, v, e) - (-e).exp()).abs() < 1e-4, "exp {e}");
+        }
+        // EATANxy takes the ratio of two fields, over 0 <= y <= x.
+        let q = [2.0f32, 1.0, 0.5, 0.0];
+        assert!((Vu1::efu(0x74, q, 0.0) - 0.5f32.atan()).abs() < 1e-4);
+        assert!((Vu1::efu(0x75, q, 0.0) - 0.25f32.atan()).abs() < 1e-4);
+    }
+
+    /// ELENG as Ace Combat 5 encodes it, then MFP to read P back. Pins
+    /// the LowerOP field-type-3 decode as much as the arithmetic.
+    #[test]
+    fn eleng_then_mfp_moves_a_length_into_a_register() {
+        let mut vu = Vu1::new();
+        vu.vf[25] = [f32::to_bits(3.0), f32::to_bits(4.0), f32::to_bits(12.0), 0];
+        // 0x81c0cf3e: ELENG P, VF25 — dest xyz, bits 10:6 = 0x1c, funct 0x3e.
+        let eleng = 0x8000_0000 | (0xE << 21) | (25 << 11) | (0x1C << 6) | 0x3E;
+        assert_eq!(eleng, 0x81c0_cf3e);
+        let mfp = 0x8000_0000 | (0xF << 21) | (2 << 16) | (0x19 << 6) | 0x3C;
+        run_prog(&mut vu, &[(0, eleng), (1 << 30, mfp), (0, 0)]);
+        assert_eq!(vu.vf[2], [f32::to_bits(13.0); 4]);
     }
 
     fn run_prog(vu: &mut Vu1, pairs: &[(u32, u32)]) {
