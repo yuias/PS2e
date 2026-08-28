@@ -43,8 +43,23 @@ pub struct Vu1 {
     pub(crate) r: u32,
     /// P register (EFU result, VU1 only). Stub: whatever was last set.
     p: f32,
+    /// MAC/status as an FMAC just computed them. Readers see the copy the
+    /// pipeline has aged for four cycles, not this one.
     pub(crate) mac: u16,
     pub(crate) status: u16,
+    /// Four cycles of flag history: what the pipeline hands to FMAND and
+    /// friends, oldest first from `flag_cycle`. Not saved — it is in
+    /// flight for four pairs at most, and keeping it out of the state
+    /// leaves old saves loadable.
+    #[serde(skip)]
+    flag_pipe: [(u16, u16); 4],
+    #[serde(skip)]
+    flag_cycle: u32,
+    /// The aged values the flag-reading instructions actually see.
+    #[serde(skip)]
+    mac_seen: u16,
+    #[serde(skip)]
+    status_seen: u16,
     pub(crate) clip: u32,
     /// TOP/ITOP as latched by VIF at MSCAL/MSCNT (XTOP/XITOP).
     pub top: u16,
@@ -79,6 +94,10 @@ impl Vu1 {
             p: 0.0,
             mac: 0,
             status: 0,
+            flag_pipe: [(0, 0); 4],
+            flag_cycle: 0,
+            mac_seen: 0,
+            status_seen: 0,
             clip: 0,
             top: 0,
             itop: 0,
@@ -146,13 +165,40 @@ impl Vu1 {
 
     /// Write masked fields and update MAC/status flags for them.
     fn vf_write(&mut self, r: usize, dest: u32, vals: [f32; 4]) {
+        if r != 0 {
+            for f in 0..4 {
+                if dest & (8 >> f) != 0 {
+                    self.vf[r][f] = vals[f].to_bits();
+                }
+            }
+        }
+        self.update_flags(dest, vals);
+    }
+
+    /// MAX/MINI, ABS and the integer conversions write a float result
+    /// without touching the flags.
+    fn vf_write_noflag(&mut self, r: usize, dest: u32, vals: [f32; 4]) {
+        self.vf_write_raw(r, dest, vals.map(f32::to_bits));
+    }
+
+    /// The ACC-writing FMAC ops set the flags the same way their
+    /// register-writing counterparts do.
+    fn acc_write(&mut self, dest: u32, vals: [f32; 4]) {
+        for f in 0..4 {
+            if dest & (8 >> f) != 0 {
+                self.acc[f] = vals[f].to_bits();
+            }
+        }
+        self.update_flags(dest, vals);
+    }
+
+    /// MAC holds one nibble per flag with x in the high bit; status keeps
+    /// the aggregates in bits 0..5 and their sticky copies above.
+    fn update_flags(&mut self, dest: u32, vals: [f32; 4]) {
         let mut mac = 0u16;
         for f in 0..4 {
             if dest & (8 >> f) != 0 {
                 let v = vals[f];
-                if r != 0 {
-                    self.vf[r][f] = v.to_bits();
-                }
                 if v == 0.0 {
                     mac |= 8 >> f; // zero flags, x at bit 3
                 }
@@ -258,6 +304,10 @@ impl Vu1 {
         let mut end_after: i32 = -1; // pairs still to run after E bit
         let mut branch: Option<u16> = None;
         for _ in 0..1_000_000 {
+            // Flags reach the readers four cycles after the FMAC that set
+            // them, so a program may put unrelated FMACs in between.
+            let slot = (self.flag_cycle & 3) as usize;
+            (self.mac_seen, self.status_seen) = self.flag_pipe[slot];
             let a = (pc & self.pc_mask) as usize * 8;
             let lower = u32::from_le_bytes(self.micro[a..a + 4].try_into().unwrap());
             let upper = u32::from_le_bytes(self.micro[a + 4..a + 8].try_into().unwrap());
@@ -271,6 +321,8 @@ impl Vu1 {
             if upper & (1 << 31) == 0 {
                 self.exec_lower(gs, gif, pc, lower, &mut branch);
             }
+            self.flag_pipe[slot] = (self.mac, self.status);
+            self.flag_cycle = self.flag_cycle.wrapping_add(1);
             pc = match next {
                 Some(t) => t & self.pc_mask,
                 None => (pc + 1) & self.pc_mask,
@@ -322,8 +374,8 @@ impl Vu1 {
                 let a = acc(self);
                 self.vf_write(fd, dest, map(&|f| a[f] - s[f] * bc));
             }
-            0x10..=0x13 => self.vf_write(fd, dest, map(&|f| s[f].max(bc))),
-            0x14..=0x17 => self.vf_write(fd, dest, map(&|f| s[f].min(bc))),
+            0x10..=0x13 => self.vf_write_noflag(fd, dest, map(&|f| s[f].max(bc))),
+            0x14..=0x17 => self.vf_write_noflag(fd, dest, map(&|f| s[f].min(bc))),
             0x18..=0x1B => self.vf_write(fd, dest, map(&|f| s[f] * bc)),
             0x1C => {
                 let q = self.q;
@@ -331,7 +383,7 @@ impl Vu1 {
             }
             0x1D => {
                 let i = self.i;
-                self.vf_write(fd, dest, map(&|f| s[f].max(i)));
+                self.vf_write_noflag(fd, dest, map(&|f| s[f].max(i)));
             }
             0x1E => {
                 let i = self.i;
@@ -339,7 +391,7 @@ impl Vu1 {
             }
             0x1F => {
                 let i = self.i;
-                self.vf_write(fd, dest, map(&|f| s[f].min(i)));
+                self.vf_write_noflag(fd, dest, map(&|f| s[f].min(i)));
             }
             0x20 => {
                 let q = self.q;
@@ -379,7 +431,7 @@ impl Vu1 {
                 self.vf_write(fd, dest, map(&|f| a[f] + s[f] * t[f]));
             }
             0x2A => self.vf_write(fd, dest, map(&|f| s[f] * t[f])),
-            0x2B => self.vf_write(fd, dest, map(&|f| s[f].max(t[f]))),
+            0x2B => self.vf_write_noflag(fd, dest, map(&|f| s[f].max(t[f]))),
             0x2C => self.vf_write(fd, dest, map(&|f| s[f] - t[f])),
             0x2D => {
                 let a = acc(self);
@@ -396,7 +448,7 @@ impl Vu1 {
                 ];
                 self.vf_write(fd, dest & 0xE, v);
             }
-            0x2F => self.vf_write(fd, dest, map(&|f| s[f].min(t[f]))),
+            0x2F => self.vf_write_noflag(fd, dest, map(&|f| s[f].min(t[f]))),
             0x3C..=0x3F => {
                 let op2 = (instr & 3) | ((instr >> 4) & 0x7C);
                 self.exec_upper2(pc, instr, op2, dest, ft, fs, s, t, bc);
@@ -428,13 +480,7 @@ impl Vu1 {
                 f32::from_bits(me.acc[3]),
             ]
         };
-        let set_acc = |me: &mut Self, dest: u32, vals: [f32; 4]| {
-            for f in 0..4 {
-                if dest & (8 >> f) != 0 {
-                    me.acc[f] = vals[f].to_bits();
-                }
-            }
-        };
+        let set_acc = |me: &mut Self, dest: u32, vals: [f32; 4]| me.acc_write(dest, vals);
         match op2 {
             0x00..=0x03 => set_acc(self, dest, map(&|f| s[f] + bc)), // ADDAbc
             0x04..=0x07 => set_acc(self, dest, map(&|f| s[f] - bc)), // SUBAbc
@@ -490,7 +536,7 @@ impl Vu1 {
             }
             0x1D => {
                 // ABS
-                self.vf_write(ft, dest, s.map(|v| v.abs()));
+                self.vf_write_noflag(ft, dest, s.map(|v| v.abs()));
             }
             0x1E => {
                 let i = self.i;
@@ -509,22 +555,34 @@ impl Vu1 {
                 self.clip = ((self.clip << 6) | j) & 0xFF_FFFF;
             }
             0x20 => {
-                let i = self.i;
-                set_acc(self, dest, map(&|f| s[f] + i)); // ADDAi
+                let q = self.q;
+                set_acc(self, dest, map(&|f| s[f] + q)); // ADDAq
             }
             0x21 => {
                 let (a, q) = (acc(self), self.q);
                 set_acc(self, dest, map(&|f| a[f] + s[f] * q)); // MADDAq
             }
             0x22 => {
+                let i = self.i;
+                set_acc(self, dest, map(&|f| s[f] + i)); // ADDAi
+            }
+            0x23 => {
                 let (a, i) = (acc(self), self.i);
                 set_acc(self, dest, map(&|f| a[f] + s[f] * i)); // MADDAi
+            }
+            0x24 => {
+                let q = self.q;
+                set_acc(self, dest, map(&|f| s[f] - q)); // SUBAq
             }
             0x25 => {
                 let (a, q) = (acc(self), self.q);
                 set_acc(self, dest, map(&|f| a[f] - s[f] * q)); // MSUBAq
             }
             0x26 => {
+                let i = self.i;
+                set_acc(self, dest, map(&|f| s[f] - i)); // SUBAi
+            }
+            0x27 => {
                 let (a, i) = (acc(self), self.i);
                 set_acc(self, dest, map(&|f| a[f] - s[f] * i)); // MSUBAi
             }
@@ -621,11 +679,13 @@ impl Vu1 {
             }
             0x16 => {
                 // FSAND
-                self.vi_write(it, self.status & (instr & 0xFFF) as u16);
+                // FSAND's 12-bit immediate keeps its top bit in bit 21.
+                let imm12 = (instr & 0x7FF) | ((instr >> 10) & 0x800);
+                self.vi_write(it, self.status_seen & imm12 as u16);
             }
             0x1A => {
                 // FMAND
-                self.vi_write(it, self.mac & self.vi[is & 0xF]);
+                self.vi_write(it, self.mac_seen & self.vi[is & 0xF]);
             }
             0x1C => {
                 // FCGET
