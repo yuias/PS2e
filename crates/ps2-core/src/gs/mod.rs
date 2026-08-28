@@ -127,6 +127,10 @@ pub struct Gs {
     pub tex_psm_hist: [u64; 64],
     /// IMAGE transfer formats already reported as unhandled (bit per PSM).
     warned_trx_psm: u64,
+    /// Destination formats of a local copy already reported as converting
+    /// (bit per PSM). Bookkeeping only, so it is not part of a save state.
+    #[serde(skip)]
+    warned_local_psm: u64,
     /// Distinct TEX0 values already logged (bring-up aid; capped).
     #[serde(skip)]
     seen_tex0: std::collections::HashSet<u64>,
@@ -242,6 +246,7 @@ impl Gs {
             prims_split: 0,
             tex_psm_hist: [0; 64],
             warned_trx_psm: 0,
+            warned_local_psm: 0,
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
@@ -774,7 +779,18 @@ impl Gs {
         let rrw = (self.trxreg & 0xFFF) as u32;
         let rrh = ((self.trxreg >> 32) & 0xFFF) as u32;
         if spsm != dpsm {
-            warn!(target: "ps2_core::gs", spsm, dpsm, "local copy with format conversion (unhandled)");
+            // Reported once per destination format: Ace Combat 5's mission
+            // load asks for this millions of times, and one formatted line
+            // each is on its own enough to stall the load.
+            if self.warned_local_psm & (1 << dpsm) == 0 {
+                self.warned_local_psm |= 1 << dpsm;
+                warn!(
+                    target: "ps2_core::gs",
+                    spsm = format_args!("{spsm:#x}"),
+                    dpsm = format_args!("{dpsm:#x}"),
+                    "local copy with format conversion (unhandled, reported once)"
+                );
+            }
             return;
         }
         debug!(target: "ps2_core::gs", rrw, rrh, "local->local copy");
