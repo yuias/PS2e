@@ -136,6 +136,9 @@ impl Vif {
             } else if vl == 3 {
                 2
             } else if masked {
+                // Only unmasked fields read the stream — except an S
+                // format, which always reads its one element and then
+                // broadcasts it to whichever fields are left.
                 let mut n = 0usize;
                 for f in 0..4 {
                     let code = (mask >> ((cycle * 4 + f) * 2)) & 3;
@@ -143,7 +146,7 @@ impl Vif {
                         n += 1;
                     }
                 }
-                (if vn == 0 { n.min(1) } else { n }) * esize
+                (if vn == 0 { 1 } else { n }) * esize
             } else if vn == 0 {
                 esize
             } else {
@@ -498,6 +501,22 @@ mod tests {
             r.feed(&[0]);
         }
         assert!(r.in_cmd_state());
+    }
+
+    /// A masked S format still reads its element even when the mask hides
+    /// field 0. Sizing the read from the mask alone made the write need
+    /// nothing, and the broadcast then read past the buffered stream.
+    #[test]
+    fn masked_s_unpack_still_consumes_its_element() {
+        let mut r = Rig::new();
+        // STMASK: field x of every cycle takes row, the rest the stream.
+        r.feed(&[0x2000_0000, 0x0101_0101]);
+        // UNPACK S-32 with m, 2 writes -> one word each.
+        r.feed(&[0x7002_0000, 0x1111_1111, 0x2222_2222]);
+        assert!(r.in_cmd_state());
+        assert_eq!(&r.vu1.data[0..4], &[0; 4]); // row, still zero
+        assert_eq!(&r.vu1.data[4..8], &0x1111_1111u32.to_le_bytes());
+        assert_eq!(&r.vu1.data[20..24], &0x2222_2222u32.to_le_bytes());
     }
 
     #[test]
