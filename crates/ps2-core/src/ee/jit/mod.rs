@@ -17,7 +17,6 @@
 //! Self-modifying code is caught by the bus: it flags RAM pages that hold
 //! translated code on write and the dispatcher drops their blocks.
 
-mod arena;
 mod emit;
 mod helpers;
 
@@ -28,7 +27,7 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, x64::X64Relocation};
 
 use super::Cpu;
 use crate::bus::{Bus, RAM_SIZE};
-use arena::Arena;
+use crate::jit_arena::Arena;
 
 /// Native block entry: (cpu, bus, cycle budget) -> cycles retired by the
 /// chain of linked blocks that ran.

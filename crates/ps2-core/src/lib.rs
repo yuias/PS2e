@@ -10,6 +10,9 @@ pub mod gif;
 pub mod gs;
 pub mod iop;
 pub mod ipu;
+/// Executable memory for the recompilers (x86-64 native builds only).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod jit_arena;
 pub mod prof;
 pub mod sif;
 pub mod spu2;
