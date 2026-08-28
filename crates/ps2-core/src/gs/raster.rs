@@ -1099,7 +1099,16 @@ impl Painter<'_> {
                 w1 += g.dx[1];
                 w2 += g.dx[2];
                 let rgba = interp3(&g.ca, &g.cb, &g.cc, l0, l1, l2);
-                let stqu = interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2);
+                // Texture coordinates cost four lanes and two divides per
+                // pixel; an untextured span never looks at them.
+                let (stqu, tv) = if pipe.tme {
+                    (
+                        interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2),
+                        (a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2) / 16.0,
+                    )
+                } else {
+                    ([0.0; 4], 0.0)
+                };
                 let frag = Frag {
                     r: rgba[0],
                     g: rgba[1],
@@ -1111,7 +1120,7 @@ impl Painter<'_> {
                     t: stqu[1],
                     q: stqu[2],
                     u: stqu[3] / 16.0,
-                    v: (a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2) / 16.0,
+                    v: tv,
                 };
                 let texel = if pipe.tme { self.sample_cached(&frag) } else { 0 };
                 self.shade_row_px(&row, px as u32, frag, texel);
