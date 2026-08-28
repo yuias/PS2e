@@ -163,8 +163,23 @@ impl Vu1 {
         ]
     }
 
+    /// Round an FMAC result into the range a VU register can hold: the
+    /// PS2 has no NaN or infinity, so an overflow saturates, and a
+    /// denormal result is truncated to zero. Without this the host's
+    /// infinities propagate into later arithmetic as NaNs, which the
+    /// hardware never produces.
+    fn vu_num(v: f32) -> f32 {
+        let b = v.to_bits();
+        match b & 0x7F80_0000 {
+            0x7F80_0000 => f32::from_bits((b & 0x8000_0000) | 0x7F7F_FFFF),
+            0 => f32::from_bits(b & 0x8000_0000),
+            _ => v,
+        }
+    }
+
     /// Write masked fields and update MAC/status flags for them.
     fn vf_write(&mut self, r: usize, dest: u32, vals: [f32; 4]) {
+        let vals = vals.map(Self::vu_num);
         if r != 0 {
             for f in 0..4 {
                 if dest & (8 >> f) != 0 {
@@ -184,6 +199,7 @@ impl Vu1 {
     /// The ACC-writing FMAC ops set the flags the same way their
     /// register-writing counterparts do.
     fn acc_write(&mut self, dest: u32, vals: [f32; 4]) {
+        let vals = vals.map(Self::vu_num);
         for f in 0..4 {
             if dest & (8 >> f) != 0 {
                 self.acc[f] = vals[f].to_bits();
@@ -806,7 +822,7 @@ impl Vu1 {
                 // DIV: division by zero saturates instead of producing inf.
                 let n = f32::from_bits(self.vf[is & 0x1F][fsf]);
                 let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
-                self.q = if d == 0.0 {
+                self.q = Self::vu_num(if d == 0.0 {
                     if n.is_sign_negative() != d.is_sign_negative() {
                         -f32::MAX
                     } else {
@@ -814,19 +830,19 @@ impl Vu1 {
                     }
                 } else {
                     n / d
-                };
+                });
             }
             0x39 => {
                 // SQRT
                 let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
-                self.q = d.abs().sqrt();
+                self.q = Self::vu_num(d.abs().sqrt());
             }
             0x3A => {
                 // RSQRT
                 let n = f32::from_bits(self.vf[is & 0x1F][fsf]);
                 let d = f32::from_bits(self.vf[it & 0x1F][ftf]);
                 let r = d.abs().sqrt();
-                self.q = if r == 0.0 { f32::MAX.copysign(n) } else { n / r };
+                self.q = Self::vu_num(if r == 0.0 { f32::MAX.copysign(n) } else { n / r });
             }
             0x3B => {} // WAITQ: Q has no latency here
             0x3C => {
@@ -877,7 +893,7 @@ impl Vu1 {
             0x6C => self.xgkick(gs, gif, self.vi[is & 0xF]),
             0x70..=0x7A | 0x7C..=0x7E => {
                 let v = self.vf_read(is);
-                self.p = Self::efu(id2, v, v[fsf]);
+                self.p = Self::vu_num(Self::efu(id2, v, v[fsf]));
             }
             0x7B => {} // WAITP: P has no latency here
             _ => self.unimplemented("lower", pc, instr),
