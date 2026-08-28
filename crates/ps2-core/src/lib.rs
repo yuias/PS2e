@@ -19,6 +19,9 @@ pub mod spu2;
 pub mod timers;
 pub mod vif;
 pub mod vu1;
+/// VU1 dynamic recompiler (x86-64 native builds only).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub mod vu1_jit;
 
 use bus::Bus;
 
@@ -163,7 +166,9 @@ impl Ps2System {
                 bios.len()
             ));
         }
-        Ok(Self {
+        // `mut` only for the recompiler hand-off just below it.
+        #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_mut))]
+        let mut sys = Self {
             ee: ee::Cpu::new(),
             iop: iop::Cpu::new(),
             bus: Bus::new(bios, gs_threaded, region),
@@ -171,12 +176,15 @@ impl Ps2System {
             frame_pos: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: Some(ee::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?),
-        })
+        };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        sys.bus.vu1.set_jit(true)?;
+        Ok(sys)
     }
 
-    /// Enable or disable the EE recompiler (a no-op without the `jit`
-    /// feature). The interpreter and the recompiler are interchangeable
-    /// at any instruction boundary.
+    /// Enable or disable the EE and VU1 recompilers (a no-op without the
+    /// `jit` feature). The interpreters and the recompilers are
+    /// interchangeable at any instruction boundary.
     pub fn set_jit(&mut self, on: bool) -> Result<(), String> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
@@ -186,6 +194,7 @@ impl Ps2System {
             } else if !on {
                 self.jit = None;
             }
+            self.bus.vu1.set_jit(on)?;
             Ok(())
         }
         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -240,6 +249,11 @@ impl Ps2System {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             sys.jit = self.jit.take();
+            // Micro memory came from the file, so nothing translated
+            // against the running machine's copy is still valid, and the
+            // generation counters on either side say nothing about it.
+            sys.bus.vu1.jit = self.bus.vu1.jit.take();
+            sys.bus.vu1.flush_jit();
         }
         sys.bus.after_load();
         sys.bus.gs.restore(gs)?;
@@ -253,6 +267,16 @@ impl Ps2System {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if let Some(j) = &self.jit {
             return (j.blocks_compiled, j.blocks_invalidated, j.blocks_run, j.interp_steps);
+        }
+        (0, 0, 0, 0)
+    }
+
+    /// VU1 recompiler counters: (blocks compiled, run, cache flushes,
+    /// programs handed back to the interpreter); zeros without one.
+    pub fn vu1_jit_stats(&self) -> (u64, u64, u64, u64) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(j) = &self.bus.vu1.jit {
+            return (j.blocks_compiled, j.blocks_run, j.flushes, j.bails);
         }
         (0, 0, 0, 0)
     }

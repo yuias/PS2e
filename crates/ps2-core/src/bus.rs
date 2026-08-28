@@ -1902,14 +1902,14 @@ impl Bus {
             0x7000_0000..=0x7000_3FFF => write_le::<N>(&mut self.spad, (addr & 0x3FFF) as usize, v),
             0x1000_0000..=0x1000_FFFF => self.write_mmio::<N>(addr, v),
             0x1100_8000..=0x1100_BFFF => {
-                write_le::<N>(&mut self.vu1.micro, (addr & 0x3FFF) as usize, v)
+                self.vu1.write_micro((addr & 0x3FFF) as usize, &v.to_le_bytes()[..N])
             }
             0x1100_C000..=0x1100_FFFF => {
                 write_le::<N>(&mut self.vu1.data, (addr & 0x3FFF) as usize, v)
             }
             0x1100_0000..=0x1100_3FFF => {
                 let m = self.vu0.micro_mask;
-                write_le::<N>(&mut self.vu0.micro, addr as usize & m, v)
+                self.vu0.write_micro(addr as usize & m, &v.to_le_bytes()[..N])
             }
             0x1100_4000..=0x1100_7FFF => {
                 let m = self.vu0.data.len() - 1;

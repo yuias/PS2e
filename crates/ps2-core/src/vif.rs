@@ -262,7 +262,7 @@ impl Vif {
             }
             State::Mpg { addr, words } => {
                 let a = *addr & vu1.micro_mask;
-                vu1.micro[a..a + 4].copy_from_slice(&w.to_le_bytes());
+                vu1.write_micro(a, &w.to_le_bytes());
                 *addr = (*addr + 4) & vu1.micro_mask;
                 *words -= 1;
                 if *words == 0 {

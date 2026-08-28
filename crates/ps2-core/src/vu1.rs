@@ -13,6 +13,10 @@ use crate::gs::GsFront;
 use tracing::{trace, warn};
 use serde::{Deserialize, Serialize};
 
+/// Safety net for a microprogram that never reaches its E bit: stop after
+/// this many instruction pairs rather than hang the machine.
+pub(crate) const PAIR_LIMIT: u32 = 1_000_000;
+
 const MICRO_SIZE: usize = 16 * 1024;
 const DATA_SIZE: usize = 16 * 1024;
 /// VU0's memories are a quarter the size of VU1's.
@@ -28,13 +32,13 @@ pub struct Vu1 {
     pub(crate) vf: [[u32; 4]; 32],
     /// 16-bit integer registers; vi00 = 0.
     pub(crate) vi: [u16; 16],
-    acc: [u32; 4],
+    pub(crate) acc: [u32; 4],
     /// Address masks. VU1 has 16 KB of each memory, VU0 a quarter of that:
     /// `micro_mask` is in bytes, `data_qw_mask` in quadwords, `pc_mask` in
     /// instruction pairs.
     pub(crate) micro_mask: usize,
     pub(crate) data_qw_mask: u32,
-    pc_mask: u16,
+    pub(crate) pc_mask: u16,
     /// Opcodes already reported as unimplemented, to keep the log readable.
     #[serde(skip)]
     warned_ops: std::collections::HashSet<(u8, u8)>,
@@ -42,7 +46,7 @@ pub struct Vu1 {
     pub(crate) i: f32,
     pub(crate) r: u32,
     /// P register (EFU result, VU1 only). Stub: whatever was last set.
-    p: f32,
+    pub(crate) p: f32,
     /// MAC/status as an FMAC just computed them. Readers see the copy the
     /// pipeline has aged for four cycles, not this one.
     pub(crate) mac: u16,
@@ -52,20 +56,38 @@ pub struct Vu1 {
     /// flight for four pairs at most, and keeping it out of the state
     /// leaves old saves loadable.
     #[serde(skip)]
-    flag_pipe: [(u16, u16); 4],
+    pub(crate) flag_pipe: [[u16; 2]; 4],
     #[serde(skip)]
-    flag_cycle: u32,
+    pub(crate) flag_cycle: u32,
     /// The aged values the flag-reading instructions actually see.
     #[serde(skip)]
-    mac_seen: u16,
+    pub(crate) mac_seen: u16,
     #[serde(skip)]
-    status_seen: u16,
+    pub(crate) status_seen: u16,
     pub(crate) clip: u32,
     /// TOP/ITOP as latched by VIF at MSCAL/MSCNT (XTOP/XITOP).
     pub top: u16,
     pub itop: u16,
     /// Resume address for MSCNT, in instruction pairs.
-    next_pc: u16,
+    pub(crate) next_pc: u16,
+    /// Bumped whenever micro memory actually changes. The recompiler keys
+    /// its whole cache on this: microcode is uploaded wholesale, so there
+    /// is nothing to gain from finer-grained invalidation.
+    #[serde(skip)]
+    pub(crate) micro_gen: u32,
+    /// Target a compiled JR/JALR left for the exit after its delay pair.
+    #[serde(skip)]
+    pub(crate) jit_target: u32,
+    /// Data memory's base address, so translated loads and stores reach it
+    /// without unpacking a slice. Refreshed at every program entry, since
+    /// deserializing moves the allocation.
+    #[serde(skip)]
+    pub(crate) data_ptr: usize,
+    /// VU1's recompiler; `None` runs the interpreter. Translated code is
+    /// not state, so a load starts from an empty cache.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[serde(skip)]
+    pub(crate) jit: Option<Box<crate::vu1_jit::Vu1Jit>>,
 }
 
 impl Default for Vu1 {
@@ -94,7 +116,7 @@ impl Vu1 {
             p: 0.0,
             mac: 0,
             status: 0,
-            flag_pipe: [(0, 0); 4],
+            flag_pipe: [[0; 2]; 4],
             flag_cycle: 0,
             mac_seen: 0,
             status_seen: 0,
@@ -102,6 +124,11 @@ impl Vu1 {
             top: 0,
             itop: 0,
             next_pc: 0,
+            micro_gen: 0,
+            jit_target: 0,
+            data_ptr: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: None,
         }
     }
 
@@ -115,6 +142,46 @@ impl Vu1 {
             data_qw_mask: (VU0_MEM_SIZE / 16 - 1) as u32,
             pc_mask: (VU0_MEM_SIZE / 8 - 1) as u16,
             ..Self::new()
+        }
+    }
+
+    /// Write `bytes` into micro memory at byte offset `off`, masked into
+    /// range the way the SRAM decode is; a write running off the end is
+    /// clipped rather than wrapped, which no aligned caller can produce.
+    ///
+    /// Identical content is not a change. Games re-upload the same
+    /// microprogram every frame, and counting that as a write would throw
+    /// the recompiler's cache away each time.
+    pub(crate) fn write_micro(&mut self, off: usize, bytes: &[u8]) {
+        let a = off & self.micro_mask;
+        let n = bytes.len().min(self.micro.len() - a);
+        if self.micro[a..a + n] != bytes[..n] {
+            self.micro[a..a + n].copy_from_slice(&bytes[..n]);
+            self.micro_gen = self.micro_gen.wrapping_add(1);
+        }
+    }
+
+    /// Turn the recompiler on or off. VU0 keeps the interpreter: it runs
+    /// far less code, and COP2 macro mode never enters a microprogram.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn set_jit(&mut self, on: bool) -> Result<(), String> {
+        if on && self.jit.is_none() {
+            let jit = crate::vu1_jit::Vu1Jit::new()
+                .map_err(|e| format!("cannot allocate VU1 JIT arena: {e}"))?;
+            self.jit = Some(Box::new(jit));
+        } else if !on {
+            self.jit = None;
+        }
+        Ok(())
+    }
+
+    /// Drop everything the recompiler translated. Micro memory has been
+    /// replaced wholesale from outside the normal write paths.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn flush_jit(&mut self) {
+        let generation = self.micro_gen;
+        if let Some(j) = &mut self.jit {
+            j.flush_for(generation);
         }
     }
 
@@ -316,14 +383,32 @@ impl Vu1 {
         // vf00/vi00 are architectural constants.
         self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
         self.vi[0] = 0;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.jit.is_some() {
+            crate::vu1_jit::run(self, gs, gif, start);
+            return;
+        }
+        self.run_interp(gs, gif, start, PAIR_LIMIT);
+    }
+
+    /// The interpreter loop: at most `budget` instruction pairs from
+    /// `start`. A program that never reaches its E bit stops at the budget
+    /// with a warning rather than hanging the machine.
+    pub(crate) fn run_interp(
+        &mut self,
+        gs: &mut GsFront,
+        gif: &mut Gif,
+        start: u16,
+        budget: u32,
+    ) {
         let mut pc = start & self.pc_mask;
         let mut end_after: i32 = -1; // pairs still to run after E bit
         let mut branch: Option<u16> = None;
-        for _ in 0..1_000_000 {
+        for _ in 0..budget {
             // Flags reach the readers four cycles after the FMAC that set
             // them, so a program may put unrelated FMACs in between.
             let slot = (self.flag_cycle & 3) as usize;
-            (self.mac_seen, self.status_seen) = self.flag_pipe[slot];
+            [self.mac_seen, self.status_seen] = self.flag_pipe[slot];
             let a = (pc & self.pc_mask) as usize * 8;
             let lower = u32::from_le_bytes(self.micro[a..a + 4].try_into().unwrap());
             let upper = u32::from_le_bytes(self.micro[a + 4..a + 8].try_into().unwrap());
@@ -337,7 +422,7 @@ impl Vu1 {
             if upper & (1 << 31) == 0 {
                 self.exec_lower(gs, gif, pc, lower, &mut branch);
             }
-            self.flag_pipe[slot] = (self.mac, self.status);
+            self.flag_pipe[slot] = [self.mac, self.status];
             self.flag_cycle = self.flag_cycle.wrapping_add(1);
             pc = match next {
                 Some(t) => t & self.pc_mask,
@@ -360,7 +445,7 @@ impl Vu1 {
 
     // --- upper pipeline --------------------------------------------------
 
-    fn exec_upper(&mut self, pc: u16, instr: u32) {
+    pub(crate) fn exec_upper(&mut self, pc: u16, instr: u32) {
         let dest = (instr >> 21) & 0xF;
         let ft = ((instr >> 16) & 0x1F) as usize;
         let fs = ((instr >> 11) & 0x1F) as usize;
@@ -625,7 +710,7 @@ impl Vu1 {
 
     // --- lower pipeline --------------------------------------------------
 
-    fn exec_lower(
+    pub(crate) fn exec_lower(
         &mut self,
         gs: &mut GsFront,
         gif: &mut Gif,
