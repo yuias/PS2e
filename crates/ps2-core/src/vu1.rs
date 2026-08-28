@@ -592,11 +592,12 @@ impl Vu1 {
                 self.vi_write(it, v[f] as u16);
             }
             0x05 => {
-                // ISW
-                let qw = (vi_t as i32 + imm11) as u32;
+                // ISW: like ILW, the address comes from `is` and the
+                // integer register named by `it` is the value stored.
+                let qw = (vi_s as i32 + imm11) as u32;
                 let f = field_index(dest);
                 let mut v = [0u32; 4];
-                v[f] = self.vi[is & 0xF] as u32;
+                v[f] = self.vi[it & 0xF] as u32;
                 self.set_data_qword(qw, 8 >> f, v);
             }
             0x08 => {
@@ -1018,6 +1019,28 @@ mod tests {
         let mfp = 0x8000_0000 | (0xF << 21) | (2 << 16) | (0x19 << 6) | 0x3C;
         run_prog(&mut vu, &[(0, eleng), (1 << 30, mfp), (0, 0)]);
         assert_eq!(vu.vf[2], [f32::to_bits(13.0); 4]);
+    }
+
+    /// ISW names the stored register in `it` and the address base in
+    /// `is`, the same way ILW and ISWR do. Swapping them silently
+    /// scribbles over the wrong quadword and never saves the value the
+    /// program reloads later.
+    #[test]
+    fn isw_stores_it_at_the_is_address() {
+        let mut vu = Vu1::new();
+        vu.vi[3] = 40; // address base
+        vu.vi[5] = 0x1234; // value
+        // ISW.y vi05, 2(vi03): opcode 0x05, dest y, it = 5, is = 3.
+        let isw = (0x05 << 25) | (4 << 21) | (5 << 16) | (3 << 11) | 2;
+        run_prog(&mut vu, &[(1 << 30, isw), (0, 0x8000_033C)]);
+        let qw = &vu.data[42 * 16..42 * 16 + 16];
+        assert_eq!(&qw[4..8], &0x1234u32.to_le_bytes());
+        assert_eq!(&qw[0..4], &[0; 4]); // only the named field is written
+
+        // ILW.y vi06, 2(vi03) reads the same slot back.
+        let ilw = (0x04 << 25) | (4 << 21) | (6 << 16) | (3 << 11) | 2;
+        run_prog(&mut vu, &[(1 << 30, ilw), (0, 0x8000_033C)]);
+        assert_eq!(vu.vi[6], 0x1234);
     }
 
     fn run_prog(vu: &mut Vu1, pairs: &[(u32, u32)]) {
