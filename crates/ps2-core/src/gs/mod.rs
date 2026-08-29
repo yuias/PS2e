@@ -1,11 +1,13 @@
 //! GS (Graphics Synthesizer): software rasterizer.
 //!
-//! VRAM addressing is LINEAR for every pixel format, not the real page/
-//! block/column swizzle. Draws, IMAGE transfers, texture sampling, CLUT
-//! reads and scanout all share the same mapping, so rendering is self-
-//! consistent; it only breaks if software aliases the same memory through
-//! two formats. Revisit with real swizzle tables when that bites
-//! (docs/ARCHITECTURE.md).
+//! VRAM is addressed the way the hardware organizes it — pages of blocks of
+//! columns, per pixel format — so that software aliasing one region through
+//! two formats sees what the console would. Draws, IMAGE transfers, texture
+//! sampling, CLUT reads and scanout all go through [`layout`].
+//!
+//! A transfer wants [`Gs::image`], which walks a run of HWREG words one
+//! destination row at a time. [`Gs::hwreg`] is the per-word form it falls
+//! back to, and costs far more for the same pixels.
 
 pub(crate) mod raster;
 
@@ -203,6 +205,62 @@ impl Default for Gs {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Walk `data` as a stream of `ppw` pixels of `bits` bits per 64-bit word,
+/// filling the transfer rectangle one destination row at a time, and return
+/// where the cursor ended up.
+///
+/// Rows are the unit because everything expensive about a GS address is
+/// constant along one: `row_setup` hands back the row's base and its column
+/// table once, and the end-of-row wrap sits outside the inner loop instead
+/// of being tested per pixel.
+#[allow(clippy::too_many_arguments)]
+fn image_rows<const PPW: u32, const BITS: u32, T>(
+    canvas: &Canvas,
+    data: &[u64],
+    (mut x, mut y): (u32, u32),
+    (rrw, rrh): (u32, u32),
+    (dsax, dsay): (u32, u32),
+    row_setup: impl Fn(u32) -> (usize, T),
+    put: impl Fn(&Canvas, usize, &T, u32, u32),
+) -> (u32, u32) {
+    let px_mask = ((1u64 << BITS) - 1) as u32;
+    let mut wi = 0usize;
+    let mut sub = 0u32;
+    while y < rrh && wi < data.len() {
+        let ay = dsay + y;
+        let (base, row) = row_setup(ay);
+        while x < rrw && wi < data.len() {
+            let w = data[wi];
+            // A whole word inside the row is the overwhelmingly common case
+            // and the only one with a count the compiler can unroll; the
+            // other arm picks up the row's last few pixels.
+            if sub == 0 && rrw - x >= PPW {
+                for k in 0..PPW {
+                    put(canvas, base, &row, dsax + x + k, (w >> (k * BITS)) as u32 & px_mask);
+                }
+                x += PPW;
+                wi += 1;
+            } else {
+                let n = (PPW - sub).min(rrw - x);
+                for k in 0..n {
+                    put(canvas, base, &row, dsax + x + k, (w >> ((sub + k) * BITS)) as u32 & px_mask);
+                }
+                sub += n;
+                x += n;
+                if sub == PPW {
+                    sub = 0;
+                    wi += 1;
+                }
+            }
+        }
+        if x >= rrw {
+            x = 0;
+            y += 1;
+        }
+    }
+    (x, y)
 }
 
 impl Gs {
@@ -519,15 +577,39 @@ impl Gs {
 
     // --- transfers -------------------------------------------------------
 
-    /// A run of HWREG words. PSMT8 and PSMCT32 destinations (textures and
-    /// frame-sized uploads) keep a per-row base address and step through
-    /// the column table, the rest go word by word through [`Gs::hwreg`].
+    /// A run of HWREG words, walked one destination row at a time.
+    ///
+    /// This is where a transfer wants to arrive. Going through
+    /// [`Gs::hwreg`] instead costs a profiler scope, a batch flush and two
+    /// full decodes of BITBLTBUF/TRXPOS/TRXREG for every 64 bits, and then
+    /// resolves each pixel's address from scratch; here all of that happens
+    /// once per run, and the address is a row base plus one table lookup.
     pub fn image(&mut self, data: &[u64]) {
         if self.trxdir != 0 {
             return;
         }
         let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
-        if dpsm != PSMT8 && dpsm != PSMCT32 {
+        // PSMCT24 packs three bytes per pixel, so its pixels straddle the
+        // 64-bit words and it needs `hwreg`'s carry. The H formats share a
+        // 32-bit pixel with a colour format and `mirror_upload_rect` cannot
+        // duplicate them, so with an overlay in play they keep the per-word
+        // path, which writes the overlay as it goes.
+        let mirrorable = !matches!(dpsm, PSMT8H | PSMT4HL | PSMT4HH) || self.overlay.is_none();
+        let handled = matches!(
+            dpsm,
+            PSMCT32
+                | PSMZ32
+                | PSMCT16
+                | PSMCT16S
+                | PSMZ16
+                | PSMZ16S
+                | PSMT8
+                | PSMT4
+                | PSMT8H
+                | PSMT4HL
+                | PSMT4HH
+        );
+        if !handled || !mirrorable {
             for &v in data {
                 self.hwreg(v);
             }
@@ -546,50 +628,122 @@ impl Gs {
         if rrw == 0 {
             return;
         }
-        let (mut x, mut y) = (self.trx_x, self.trx_y);
-        let y_first = y;
+        let y_first = self.trx_y;
         let canvas = &self.canvas;
-        match dpsm {
-            PSMT8 => {
-                let mut base = layout::row_base8(dbp, dbw, dsay + y);
-                'words: for &w in data {
-                    for i in 0..8 {
-                        if y >= rrh {
-                            break 'words;
-                        }
-                        let ay = dsay + y;
-                        canvas.wr8((base + layout::col_off8(ay, dsax + x)) & (VRAM_SIZE - 1), (w >> (i * 8)) as u8);
-                        x += 1;
-                        if x >= rrw {
-                            x = 0;
-                            y += 1;
-                            base = layout::row_base8(dbp, dbw, dsay + y);
-                        }
-                    }
-                }
+        let mask = canvas.mask();
+        let cur = (self.trx_x, self.trx_y);
+        let dims = (rrw, rrh);
+        let org = (dsax, dsay);
+        let (x, y) = match dpsm {
+            PSMCT32 | PSMZ32 => {
+                let z = dpsm == PSMZ32;
+                image_rows::<2, 32, _>(
+                    canvas,
+                    data,
+                    cur,
+                    dims,
+                    org,
+                    |ay| (layout::row_base32(dbp, dbw, ay, z), layout::col_row32(ay, z)),
+                    |cv, base, row, xx, px| {
+                        let o = base + (xx >> 6) as usize * 8192 + row[(xx & 63) as usize] as usize;
+                        cv.wr32(o & mask, px);
+                    },
+                )
             }
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                let s = dpsm == PSMCT16S || dpsm == PSMZ16S;
+                let z = dpsm == PSMZ16 || dpsm == PSMZ16S;
+                image_rows::<4, 16, _>(
+                    canvas,
+                    data,
+                    cur,
+                    dims,
+                    org,
+                    |ay| (layout::row_base16(dbp, dbw, ay), layout::col_row16(ay, s, z)),
+                    |cv, base, row, xx, px| {
+                        let o = base + (xx >> 6) as usize * 8192 + row[(xx & 63) as usize] as usize;
+                        cv.wr16(o & mask, px as u16);
+                    },
+                )
+            }
+            PSMT8 => image_rows::<8, 8, _>(
+                canvas,
+                data,
+                cur,
+                dims,
+                org,
+                |ay| (layout::row_base8(dbp, dbw, ay), layout::col_row8(ay)),
+                |cv, base, row, xx, px| {
+                    let o = base + (xx >> 7) as usize * 8192 + row[(xx & 127) as usize] as usize;
+                    cv.wr8(o & mask, px as u8);
+                },
+            ),
+            PSMT4 => image_rows::<16, 4, _>(
+                canvas,
+                data,
+                cur,
+                dims,
+                org,
+                |ay| (layout::row_base4(dbp, dbw, ay), layout::col_row4(ay)),
+                |cv, base, row, xx, px| {
+                    // Nibble index, so the byte is half of it.
+                    let idx = base + (xx >> 7) as usize * 16384 + row[(xx & 127) as usize] as usize;
+                    let o = (idx >> 1) & mask;
+                    let old = cv.rd8(o);
+                    cv.wr8(
+                        o,
+                        if idx & 1 == 0 {
+                            (old & 0xF0) | (px as u8 & 0xF)
+                        } else {
+                            (old & 0x0F) | ((px as u8) << 4)
+                        },
+                    );
+                },
+            ),
+            // The index-in-upper-bits formats live in a 32-bit pixel and
+            // leave its colour bits alone.
             _ => {
-                let mut base = layout::row_base32(dbp, dbw, dsay + y, false);
-                'words: for &w in data {
-                    for i in 0..2 {
-                        if y >= rrh {
-                            break 'words;
-                        }
-                        let ay = dsay + y;
-                        canvas.wr32(
-                            (base + layout::col_off32(ay, dsax + x, false)) & (VRAM_SIZE - 1),
-                            (w >> (i * 32)) as u32,
-                        );
-                        x += 1;
-                        if x >= rrw {
-                            x = 0;
-                            y += 1;
-                            base = layout::row_base32(dbp, dbw, dsay + y, false);
-                        }
+                let row32 =
+                    |ay| (layout::row_base32(dbp, dbw, ay, false), layout::col_row32(ay, false));
+                let put = |shift: u32, bits_mask: u32| {
+                    move |cv: &Canvas, base: usize, row: &&[u16; 64], xx: u32, px: u32| {
+                        let o = (base + (xx >> 6) as usize * 8192 + row[(xx & 63) as usize] as usize)
+                            & mask;
+                        let old = cv.rd32(o);
+                        cv.wr32(o, (old & !bits_mask) | ((px << shift) & bits_mask));
                     }
+                };
+                match dpsm {
+                    PSMT8H => image_rows::<8, 8, _>(
+                        canvas,
+                        data,
+                        cur,
+                        dims,
+                        org,
+                        row32,
+                        put(24, 0xFF00_0000),
+                    ),
+                    PSMT4HL => image_rows::<16, 4, _>(
+                        canvas,
+                        data,
+                        cur,
+                        dims,
+                        org,
+                        row32,
+                        put(24, 0x0F00_0000),
+                    ),
+                    _ => image_rows::<16, 4, _>(
+                        canvas,
+                        data,
+                        cur,
+                        dims,
+                        org,
+                        row32,
+                        put(28, 0xF000_0000),
+                    ),
                 }
             }
-        }
+        };
         self.trx_x = x;
         self.trx_y = y;
         // Mirror the rows this run touched into the overlay (full width:
@@ -1680,4 +1834,117 @@ mod tests {
         gs.write_reg(0x05, xyz(0, 400));
         assert_eq!(gs.prims_drawn, 1);
     }
+
+    /// The run path and the per-word path must land every pixel of a
+    /// transfer in the same place. `Gs::image` is a rewrite of what
+    /// `Gs::hwreg` does one 64-bit word at a time, so the two are compared
+    /// directly rather than against a table of expected addresses.
+    #[test]
+    fn a_run_transfer_lands_where_the_per_word_path_does() {
+        // Formats, and how many pixels one 64-bit word carries.
+        const CASES: [(u32, u32); 11] = [
+            (PSMCT32, 2),
+            (PSMZ32, 2),
+            (PSMCT16, 4),
+            (PSMCT16S, 4),
+            (PSMZ16, 4),
+            (PSMZ16S, 4),
+            (PSMT8, 8),
+            (PSMT4, 16),
+            (PSMT8H, 8),
+            (PSMT4HL, 16),
+            (PSMT4HH, 16),
+        ];
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Rectangles that exercise partial rows, page crossings, odd
+        // origins and a height the data overruns.
+        let rects = [
+            (0u32, 0u32, 64u32, 8u32),
+            (3, 5, 61, 7),
+            (0, 0, 128, 4),
+            (17, 1, 100, 9),
+            (1, 0, 3, 40),
+        ];
+        for (psm, ppw) in CASES {
+            for (dsax, dsay, rrw, rrh) in rects {
+                let setup = |gs: &mut Gs| {
+                    // The H formats share a 32-bit pixel, so start from a
+                    // known pattern rather than zeroes: only their own bits
+                    // may move.
+                    for o in (0..1 << 16).step_by(4) {
+                        gs.canvas.wr32(o, 0xA5A5_5A5A);
+                    }
+                    gs.write_reg(0x50, (7u64 << 32) | (2u64 << 48) | ((psm as u64) << 56));
+                    gs.write_reg(0x51, ((dsax as u64) << 32) | ((dsay as u64) << 48));
+                    gs.write_reg(0x52, (rrw as u64) | ((rrh as u64) << 32));
+                    gs.write_reg(0x53, 0);
+                };
+                let words = (rrw * rrh).div_ceil(ppw) as usize + 2;
+                let data: Vec<u64> = (0..words).map(|_| next()).collect();
+
+                let mut run = Gs::new();
+                setup(&mut run);
+                run.image(&data);
+
+                let mut word = Gs::new();
+                setup(&mut word);
+                for &v in &data {
+                    word.hwreg(v);
+                }
+
+                assert_eq!(run.trx_x, word.trx_x, "{psm:#x} {dsax},{dsay} {rrw}x{rrh} trx_x");
+                assert_eq!(run.trx_y, word.trx_y, "{psm:#x} {dsax},{dsay} {rrw}x{rrh} trx_y");
+                let (a, b) = (&run.canvas, &word.canvas);
+                for o in 0..1usize << 16 {
+                    assert_eq!(
+                        a.rd8(o),
+                        b.rd8(o),
+                        "{psm:#x} rect {dsax},{dsay} {rrw}x{rrh} differs at {o:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A transfer split across several runs must land the same as one run:
+    /// the cursor carries the position between them.
+    #[test]
+    fn a_transfer_split_into_runs_lands_the_same() {
+        let mut seed = 0xB7E1_5162_8AED_2A6Bu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for psm in [PSMCT32, PSMCT16, PSMT8, PSMT4] {
+            let (rrw, rrh) = (37u32, 11u32);
+            let data: Vec<u64> = (0..64).map(|_| next()).collect();
+            let setup = |gs: &mut Gs| {
+                gs.write_reg(0x50, (9u64 << 32) | (1u64 << 48) | ((psm as u64) << 56));
+                gs.write_reg(0x51, (2u64 << 32) | (3u64 << 48));
+                gs.write_reg(0x52, (rrw as u64) | ((rrh as u64) << 32));
+                gs.write_reg(0x53, 0);
+            };
+            let mut whole = Gs::new();
+            setup(&mut whole);
+            whole.image(&data);
+
+            let mut split = Gs::new();
+            setup(&mut split);
+            for chunk in data.chunks(7) {
+                split.image(chunk);
+            }
+            for o in 0..1usize << 16 {
+                assert_eq!(whole.canvas.rd8(o), split.canvas.rd8(o), "{psm:#x} at {o:#x}");
+            }
+        }
+    }
+
 }
