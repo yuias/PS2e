@@ -225,6 +225,71 @@ const COL_OFF8: [[u16; 128]; 64] = {
     t
 };
 
+// --- per-row column tables ------------------------------------------------
+//
+// `col_off*` indexes its table by y and x together. A transfer or a scanline
+// walks x with y fixed, so it wants the row once and an index per pixel;
+// these hand out that row.
+
+/// The `col_off32` row for destination row `y`; index it by `x & 63` and add
+/// `(x >> 6) * 8192` for the horizontal page step.
+#[inline(always)]
+pub(super) fn col_row32(y: u32, z: bool) -> &'static [u16; 64] {
+    &COL_OFF32[z as usize][((y >> 3) & 3) as usize]
+}
+
+/// The `col_off16` row for destination row `y`; index it by `x & 63`.
+#[inline(always)]
+pub(super) fn col_row16(y: u32, s: bool, z: bool) -> &'static [u16; 64] {
+    &COL_OFF16[((s as usize) << 1) | z as usize][((y >> 3) & 7) as usize]
+}
+
+/// The `col_off8` row for destination row `y`; index it by `x & 127` and add
+/// `(x >> 7) * 8192`.
+#[inline(always)]
+pub(super) fn col_row8(y: u32) -> &'static [u16; 128] {
+    &COL_OFF8[(y & 63) as usize]
+}
+
+/// Row-based 4-bit addressing, in *nibbles*: a row's nibble index is
+/// `row_base4(bp, bw, y) + col_row4(y)[x & 127] + (x >> 7) * 16384`.
+#[inline(always)]
+pub(super) fn row_base4(bp: u32, bw: u32, y: u32) -> usize {
+    let bw = bw.max(1);
+    let block = bp.wrapping_add((y >> 7) * (bw >> 1) * 32);
+    let c = (y & 15) >> 2;
+    let ry = y & 3;
+    let col = c * 128 + (ry & 1) * 16 + (ry >> 1);
+    (block as usize) * 512 + col as usize
+}
+
+/// The nibble-offset row for destination row `y`; index it by `x & 127`.
+#[inline(always)]
+pub(super) fn col_row4(y: u32) -> &'static [u16; 128] {
+    // The 32x16 column's half-swap depends on y, so it selects the row
+    // alongside the block row rather than being folded into x.
+    let swap = (((y >> 1) ^ (y >> 2)) & 1) as usize;
+    &COL_OFF4[(((y >> 4) & 7) as usize) << 1 | swap]
+}
+
+/// `col_row4` per (block row, half-swap): block entry times 512 nibbles plus
+/// the x-dependent part of the 32x16 column swizzle.
+const COL_OFF4: [[u16; 128]; 16] = {
+    let mut t = [[0u16; 128]; 16];
+    let mut k = 0;
+    while k < 16 {
+        let mut x = 0;
+        while x < 128 {
+            let xs = (x as u32 & 31) ^ (((k & 1) as u32) << 2);
+            let col = ((xs >> 1) & 3) * 32 + (xs & 1) * 8 + ((xs >> 3) & 3) * 2;
+            t[k][x] = (BLOCK4[k >> 1][(x >> 5) & 3] * 512 + col) as u16;
+            x += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,4 +440,50 @@ mod tests {
         assert_eq!(addr8(0, 10, 0, 64) / 256, 160);
         assert_eq!(addr4(0, 10, 0, 128) / 512, 160);
     }
+
+    /// The row-based decompositions must reproduce the flat address for
+    /// every pixel of a page. A transfer walks x with y fixed and uses the
+    /// split form; the rasterizer's texture lookups use the flat one.
+    #[test]
+    fn row_and_column_split_matches_the_flat_address() {
+        for bp in [0u32, 1, 37, 0x2A00] {
+            for bw in [1u32, 2, 4, 10] {
+                for y in 0..128u32 {
+                    let (b32, r32) = (row_base32(bp, bw, y, false), col_row32(y, false));
+                    let (b32z, r32z) = (row_base32(bp, bw, y, true), col_row32(y, true));
+                    let (b16, r16) = (row_base16(bp, bw, y), col_row16(y, false, false));
+                    let (b8, r8) = (row_base8(bp, bw, y), col_row8(y));
+                    let (b4, r4) = (row_base4(bp, bw, y), col_row4(y));
+                    for x in 0..128u32 {
+                        assert_eq!(
+                            b32 + (x >> 6) as usize * 8192 + r32[(x & 63) as usize] as usize,
+                            addr32(bp, bw, x, y, false),
+                            "32 bp={bp} bw={bw} ({x},{y})"
+                        );
+                        assert_eq!(
+                            b32z + (x >> 6) as usize * 8192 + r32z[(x & 63) as usize] as usize,
+                            addr32(bp, bw, x, y, true),
+                            "32z bp={bp} bw={bw} ({x},{y})"
+                        );
+                        assert_eq!(
+                            b16 + (x >> 6) as usize * 8192 + r16[(x & 63) as usize] as usize,
+                            addr16(bp, bw, x, y, false, false),
+                            "16 bp={bp} bw={bw} ({x},{y})"
+                        );
+                        assert_eq!(
+                            b8 + (x >> 7) as usize * 8192 + r8[(x & 127) as usize] as usize,
+                            addr8(bp, bw, x, y),
+                            "8 bp={bp} bw={bw} ({x},{y})"
+                        );
+                        assert_eq!(
+                            b4 + (x >> 7) as usize * 16384 + r4[(x & 127) as usize] as usize,
+                            addr4(bp, bw, x, y),
+                            "4 bp={bp} bw={bw} ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
 }
