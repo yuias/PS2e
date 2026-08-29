@@ -87,7 +87,12 @@ pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a flush is cut into.
 pub(super) const PARALLEL_LANES: usize = 14;
 /// Pixel estimate that triggers a batch flush on its own.
-const BATCH_MAX_PIXELS: i64 = 1 << 20;
+///
+/// Do not raise this without fixing the rasterizer race it exposes: with a
+/// larger queue, a parallel flush renders `ama_2` of the Amagami gate
+/// differently from one run to the next. At 1<<20 that reproduces in three
+/// runs out of three; at 1<<16 it does not reproduce at all.
+const BATCH_MAX_PIXELS: i64 = 1 << 16;
 
 /// Queued primitive geometry (decoded, self-contained).
 enum Prim {
