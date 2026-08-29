@@ -794,11 +794,13 @@ impl Gs {
             blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
             z_touched: false,
             fast: false,
+            fast_decal: false,
             flat_fill: false,
         };
         let z_touched = pipe.zte && !(pipe.ztst == 1 && pipe.zmsk);
         pipe.z_touched = z_touched;
         pipe.fast = pipe.tme && pipe.tfx == 0 && pipe.fbmsk == 0;
+        pipe.fast_decal = pipe.tme && pipe.tfx == 1 && pipe.fbmsk == 0;
         // Z may be written (ALWAYS) but never tested; the alpha test on a
         // flat colour is decided once per row by the loop itself.
         pipe.flat_fill = !pipe.tme && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0;
@@ -916,7 +918,7 @@ impl Painter<'_> {
                         self.fill_tex_row(1, y_row + 1, u_lo, u_hi);
                     }
                     let [row0, row1] = std::mem::take(&mut self.scratch.tex_rows);
-                    if pipe.fast && pxb - pxa >= 2 {
+                    if (pipe.fast || pipe.fast_decal) && pxb - pxa >= 2 {
                         // Fixed-point u (32.32 texels) stepped across the row
                         // between the same endpoints the float path uses.
                         let fa = f64::from(fu_at(pxa));
@@ -924,15 +926,23 @@ impl Painter<'_> {
                         let du = ((fb - fa) / f64::from(pxb - 1 - pxa) * 4294967296.0) as i64;
                         let ua = (fa * 4294967296.0).floor() as i64;
                         let args = FastRow { row: &row, pxa, pxb, frag: &frag, row0: &row0.data, row1: &row1.data, u_lo, wy, ua, du, z: frag.z };
-                        match (pipe.bilinear, pipe.abe, pipe.ate) {
-                            (false, false, false) => self.fast_sprite_row::<false, false, false>(&args),
-                            (false, false, true) => self.fast_sprite_row::<false, false, true>(&args),
-                            (false, true, false) => self.fast_sprite_row::<false, true, false>(&args),
-                            (false, true, true) => self.fast_sprite_row::<false, true, true>(&args),
-                            (true, false, false) => self.fast_sprite_row::<true, false, false>(&args),
-                            (true, false, true) => self.fast_sprite_row::<true, false, true>(&args),
-                            (true, true, false) => self.fast_sprite_row::<true, true, false>(&args),
-                            (true, true, true) => self.fast_sprite_row::<true, true, true>(&args),
+                        match (pipe.fast_decal, pipe.bilinear, pipe.abe, pipe.ate) {
+                            (false, false, false, false) => self.fast_sprite_row::<false, false, false, false>(&args),
+                            (false, false, false, true) => self.fast_sprite_row::<false, false, false, true>(&args),
+                            (false, false, true, false) => self.fast_sprite_row::<false, false, true, false>(&args),
+                            (false, false, true, true) => self.fast_sprite_row::<false, false, true, true>(&args),
+                            (false, true, false, false) => self.fast_sprite_row::<false, true, false, false>(&args),
+                            (false, true, false, true) => self.fast_sprite_row::<false, true, false, true>(&args),
+                            (false, true, true, false) => self.fast_sprite_row::<false, true, true, false>(&args),
+                            (false, true, true, true) => self.fast_sprite_row::<false, true, true, true>(&args),
+                            (true, false, false, false) => self.fast_sprite_row::<true, false, false, false>(&args),
+                            (true, false, false, true) => self.fast_sprite_row::<true, false, false, true>(&args),
+                            (true, false, true, false) => self.fast_sprite_row::<true, false, true, false>(&args),
+                            (true, false, true, true) => self.fast_sprite_row::<true, false, true, true>(&args),
+                            (true, true, false, false) => self.fast_sprite_row::<true, true, false, false>(&args),
+                            (true, true, false, true) => self.fast_sprite_row::<true, true, false, true>(&args),
+                            (true, true, true, false) => self.fast_sprite_row::<true, true, true, false>(&args),
+                            (true, true, true, true) => self.fast_sprite_row::<true, true, true, true>(&args),
                         }
                         self.scratch.tex_rows = [row0, row1];
                         continue;
@@ -1207,14 +1217,14 @@ impl Painter<'_> {
             z: frag.z,
         };
         match (pipe.bilinear, pipe.abe, pipe.ate) {
-            (false, false, false) => self.fast_sprite_row::<false, false, false>(&args),
-            (false, false, true) => self.fast_sprite_row::<false, false, true>(&args),
-            (false, true, false) => self.fast_sprite_row::<false, true, false>(&args),
-            (false, true, true) => self.fast_sprite_row::<false, true, true>(&args),
-            (true, false, false) => self.fast_sprite_row::<true, false, false>(&args),
-            (true, false, true) => self.fast_sprite_row::<true, false, true>(&args),
-            (true, true, false) => self.fast_sprite_row::<true, true, false>(&args),
-            (true, true, true) => self.fast_sprite_row::<true, true, true>(&args),
+            (false, false, false) => self.fast_sprite_row::<false, false, false, false>(&args),
+            (false, false, true) => self.fast_sprite_row::<false, false, false, true>(&args),
+            (false, true, false) => self.fast_sprite_row::<false, false, true, false>(&args),
+            (false, true, true) => self.fast_sprite_row::<false, false, true, true>(&args),
+            (true, false, false) => self.fast_sprite_row::<false, true, false, false>(&args),
+            (true, false, true) => self.fast_sprite_row::<false, true, false, true>(&args),
+            (true, true, false) => self.fast_sprite_row::<false, true, true, false>(&args),
+            (true, true, true) => self.fast_sprite_row::<false, true, true, true>(&args),
         }
         self.scratch.tex_rows = [row0, row1];
         true
@@ -1632,7 +1642,7 @@ impl Painter<'_> {
     /// [`Painter::shade_row_px`] apart from the u rounding at the 2^-32
     /// level.
     #[inline(never)]
-    fn fast_sprite_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
+    fn fast_sprite_row<const DEC: bool, const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
         let _p = crate::prof::scope(crate::prof::Slot::GsFastSprite);
         let pipe = self.pipe;
         let n = (a.pxb - a.pxa) as u64;
@@ -1670,11 +1680,11 @@ impl Painter<'_> {
             let mut filtered = core::mem::take(&mut self.scratch.filtered);
             Self::prefilter_const(&mut filtered, a, wx);
             let fa = FastRow { row0: &filtered, row1: &filtered, u_lo: 0, ua: 0, du: 1i64 << 32, wy: 0, ..*a };
-            self.sprite_row_px::<false, ABE, ATE>(&fa);
+            self.sprite_row_px::<DEC, false, ABE, ATE>(&fa);
             self.scratch.filtered = filtered;
             return;
         }
-        self.sprite_row_px::<BIL, ABE, ATE>(a);
+        self.sprite_row_px::<DEC, BIL, ABE, ATE>(a);
     }
 
     /// Fill `dst` with the row's filtered texels for a constant-weight
@@ -1756,7 +1766,7 @@ impl Painter<'_> {
     /// The pixel half of [`Painter::fast_sprite_row`], after the row's
     /// texel addressing has been decided.
     #[inline(never)]
-    fn sprite_row_px<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
+    fn sprite_row_px<const DEC: bool, const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
         let pipe = self.pipe;
         let (row, frag) = (a.row, a.frag);
         let y = row.y;
@@ -1772,6 +1782,7 @@ impl Painter<'_> {
         let last0 = row0.len().saturating_sub(if BIL { 2 } else { 1 });
         let mut u = a.ua - if BIL { 1i64 << 31 } else { 0 };
         let mod_lanes = Modulate::new(cr, cg, cb, ca, tcc);
+        let _ = &mod_lanes;
         for px in a.pxa..a.pxb {
             // Texel: floor(u) (nearest) or the four taps around u - 0.5.
             let ix = (u >> 32) as i32;
@@ -1788,7 +1799,15 @@ impl Painter<'_> {
             };
             u += a.du;
             let ta = texel >> 24;
-            let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            // DECAL takes the texel's alpha as it stands; MODULATE scales
+            // the vertex alpha by it.
+            let a8 = if DEC {
+                if tcc { ta } else { ca }
+            } else if tcc {
+                (ta * ca) >> 7
+            } else {
+                ca
+            };
             let (mut write_z, mut keep_dst_alpha) = (true, false);
             if ATE {
                 let pass = match atst {
@@ -1827,7 +1846,11 @@ impl Painter<'_> {
                     continue;
                 }
             }
-            let mut out = mod_lanes.apply(texel);
+            let mut out = if DEC {
+                (texel & 0x00FF_FFFF) | (a8 << 24)
+            } else {
+                mod_lanes.apply(texel)
+            };
             let fb_off = (row.fb_base + layout::col_off32(y, px as u32, false)) & canvas.mask();
             let dst = if ABE || fb24 || keep_dst_alpha { canvas.rd32(fb_off) } else { 0 };
             if ABE {
@@ -2456,6 +2479,10 @@ struct PixelPipe {
     /// specialised row loops (`Painter::fast_sprite_row`,
     /// `Painter::fast_tri_row`).
     fast: bool,
+    /// As `fast`, but the texture function is DECAL: the texel replaces the
+    /// vertex colour instead of scaling it. Sprites only — the triangle
+    /// loops still take MODULATE alone.
+    fast_decal: bool,
     /// Untextured sprite with a constant colour per row (blended or not)
     /// and no Z test: `Painter::flat_sprite_row`.
     flat_fill: bool,
