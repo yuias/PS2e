@@ -167,16 +167,14 @@ pub struct Gs {
     /// [`Deinterlace::Bwdif`]'s temporal taps.
     history: [Vec<u8>; 2],
     woven_dims: (u32, u32),
-    /// Decoded CLUT (RGBA8 per entry) for the last palette setup; entries
-    /// beyond 256 serve 4-bit textures with a CSA offset into a 16-bit CLUT.
-    /// Decoded on demand, so a state load starts with an empty cache and
-    /// a key that cannot match.
-    #[serde(skip, default = "empty_clut")]
-    clut: Box<[u32; 512]>,
-    /// Palette setup (`TexInfo::clut_key`) the cache was decoded from.
-    #[serde(skip, default = "no_clut_key")]
-    clut_key: u64,
-    /// VRAM changed by a transfer since the CLUT was decoded.
+    /// Decoded palettes, one block per setup the queue still needs. A
+    /// single block would have to be rewritten whenever the palette
+    /// changed, and every rewrite would have to flush the queue that
+    /// references it — which a mission second asks for a million times.
+    /// Not state: a load starts with it empty.
+    #[serde(skip, default = "raster::ClutPool::default")]
+    clut: raster::ClutPool,
+    /// VRAM changed by a transfer since the palettes were decoded.
     #[serde(skip, default = "yes")]
     clut_dirty: bool,
 }
@@ -191,12 +189,6 @@ fn raster_pool() -> Vec<raster::Scratch> {
     }
 }
 
-fn empty_clut() -> Box<[u32; 512]> {
-    Box::new([0; 512])
-}
-fn no_clut_key() -> u64 {
-    u64::MAX
-}
 fn yes() -> bool {
     true
 }
@@ -320,8 +312,7 @@ impl Gs {
             motion: Vec::new(),
             history: [Vec::new(), Vec::new()],
             woven_dims: (0, 0),
-            clut: Box::new([0; 512]),
-            clut_key: u64::MAX,
+            clut: raster::ClutPool::default(),
             clut_dirty: true,
         }
     }

@@ -82,6 +82,71 @@ impl Rows {
     }
 }
 
+/// Decoded palettes for the primitives a batch holds.
+///
+/// A queued primitive names a block here rather than carrying its own copy,
+/// so switching palette mid-batch costs a block instead of a flush. Blocks
+/// stay live until the batch is drawn; `reset` then frees them all at once.
+pub(super) struct ClutPool {
+    /// `SLOTS` blocks of 512 entries. 512 because a 4-bit texture's CSA
+    /// selects a 16-entry window anywhere in the CLUT.
+    data: Vec<u32>,
+    /// Lookup key per block, or `u64::MAX` for one that may not be reused
+    /// (its palette's memory has changed since it was decoded).
+    keys: Vec<u64>,
+    used: usize,
+}
+
+/// Blocks a single batch may use before it has to be drawn. A mission frame
+/// alternates a few dozen palettes; this is well clear of that at 512 KiB.
+const CLUT_SLOTS: usize = 128;
+const CLUT_ENTRIES: usize = 512;
+
+impl Default for ClutPool {
+    fn default() -> Self {
+        Self {
+            data: vec![0; CLUT_SLOTS * CLUT_ENTRIES],
+            keys: vec![u64::MAX; CLUT_SLOTS],
+            used: 0,
+        }
+    }
+}
+
+impl ClutPool {
+    /// The block starting at `off`, as the pixel paths index it.
+    #[inline(always)]
+    fn block(&self, off: usize) -> &[u32] {
+        &self.data[off..off + CLUT_ENTRIES]
+    }
+
+    /// Forget every block. Called once the batch referencing them is drawn.
+    fn reset(&mut self) {
+        self.used = 0;
+        self.keys.fill(u64::MAX);
+    }
+
+    /// Stop handing out matches without disturbing blocks in use: their
+    /// palettes' memory has changed, so a later primitive wanting the same
+    /// setup has to decode it again into a block of its own.
+    fn forget_keys(&mut self) {
+        self.keys[..self.used].fill(u64::MAX);
+    }
+
+    fn find(&self, key: u64) -> Option<usize> {
+        self.keys[..self.used].iter().position(|&k| k == key).map(|i| i * CLUT_ENTRIES)
+    }
+
+    fn alloc(&mut self, key: u64) -> Option<usize> {
+        if self.used == CLUT_SLOTS {
+            return None;
+        }
+        let slot = self.used;
+        self.used += 1;
+        self.keys[slot] = key;
+        Some(slot * CLUT_ENTRIES)
+    }
+}
+
 /// Pixels a batch must cover before its flush is split across threads.
 pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a flush is cut into.
@@ -221,7 +286,7 @@ impl Gs {
             let mut p = Painter {
                 canvas: &self.canvas,
                 tex: &self.canvas,
-                clut: &self.clut,
+                clut: self.clut.block(pipe.clut_off as usize),
                 pipe: &pipe,
                 scratch: &mut self.scratch,
             };
@@ -597,7 +662,7 @@ impl Gs {
                 let mut p = Painter {
                     canvas: &self.canvas,
                     tex: &self.canvas,
-                    clut: &self.clut,
+                    clut: self.clut.block(pipe.clut_off as usize),
                     pipe: &pipe,
                     scratch: &mut self.scratch,
                 };
@@ -707,7 +772,7 @@ impl Gs {
                     s.spawn(move |_| {
                         for item in q {
                             let fb = if item.hi { overlay.unwrap_or(canvas) } else { canvas };
-                            let mut p = Painter { canvas: fb, tex: canvas, clut, pipe: &item.pipe, scratch };
+                            let mut p = Painter { canvas: fb, tex: canvas, clut: clut.block(item.pipe.clut_off as usize), pipe: &item.pipe, scratch };
                             let rows = Rows { start: item.start, end: item.end, lane, lanes: PARALLEL_LANES };
                             Self::run_prim(&mut p, &item.prim, rows);
                         }
@@ -720,6 +785,7 @@ impl Gs {
                     *h += std::mem::take(n);
                 }
             }
+            self.clut.reset();
             self.batch.queued = {
                 let mut v = queued;
                 v.clear();
@@ -733,13 +799,14 @@ impl Gs {
             let mut p = Painter {
                 canvas: fb,
                 tex: &self.canvas,
-                clut: &self.clut,
+                clut: self.clut.block(item.pipe.clut_off as usize),
                 pipe: &item.pipe,
                 scratch: &mut self.scratch,
             };
             Self::run_prim(&mut p, &item.prim, Rows::all(item.start, item.end));
         }
         self.merge_scratch();
+        self.clut.reset();
         self.batch.queued = {
             let mut v = queued;
             v.clear();
@@ -754,9 +821,8 @@ impl Gs {
         let ctx = self.ctx[((attrs >> 9) & 1) as usize];
         let test = ctx.test;
         let tex = TexInfo::new(&ctx, self.texa);
-        if attrs & (1 << 4) != 0 && tex.clut_bits != 0 {
-            self.refresh_clut(&tex);
-        }
+        let clut_off =
+            if attrs & (1 << 4) != 0 && tex.clut_bits != 0 { self.refresh_clut(&tex) } else { 0 };
 
         let mut pipe = PixelPipe {
             kind: (self.prim & 7) as u8,
@@ -798,6 +864,7 @@ impl Gs {
             blend_d: ((ctx.alpha >> 6) & 3) as u8,
             blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
             z_touched: false,
+            clut_off,
             fast: false,
             fast_decal: false,
             flat_fill: false,
@@ -816,20 +883,39 @@ impl Gs {
     /// transfer touched VRAM. Real hardware only reloads on TEX0 writes
     /// with CLD set; keying on the setup instead is a superset of that
     /// (drawing primitives into CLUT memory is not tracked).
-    fn refresh_clut(&mut self, ti: &TexInfo) {
-        let key = ti.clut_key();
-        if key == self.clut_key && !self.clut_dirty {
-            return;
+    /// Make sure a decoded block exists for this palette setup and return
+    /// its offset. The CSA window is part of the key, so a block only ever
+    /// holds entries one texture actually reads.
+    fn refresh_clut(&mut self, ti: &TexInfo) -> u32 {
+        let key = ti.clut_key() | ((ti.clut_base as u64) << 49);
+        if self.clut_dirty {
+            // A transfer has been through VRAM; nothing decoded before it
+            // may be matched again, though blocks already queued stay.
+            self.clut.forget_keys();
+            self.clut_dirty = false;
         }
-        // Queued primitives reference this CLUT and may have written the
-        // VRAM it decodes from.
-        self.flush_batch();
+        if let Some(off) = self.clut.find(key) {
+            return off as u32;
+        }
+        // Decoding reads local memory, so a queue that writes this palette's
+        // own memory has to be drawn first.
+        let cbp = ((ti.tex0 >> 37) & 0x3FFF) as u32;
+        if self.batch.reads(&(cbp..cbp + 4)) {
+            self.flush_batch();
+        }
+        let off = match self.clut.alloc(key) {
+            Some(off) => off,
+            None => {
+                // Out of blocks: drawing the batch frees every one of them.
+                self.flush_batch();
+                self.clut.alloc(key).expect("a drawn batch frees the pool")
+            }
+        };
         let entries = if ti.clut_bits == 8 { 256 } else { 16 };
         for e in ti.clut_base..ti.clut_base + entries {
-            self.clut[e] = self.clut_lookup(ti.tex0, e as u32);
+            self.clut.data[off + e] = self.clut_lookup(ti.tex0, e as u32);
         }
-        self.clut_key = key;
-        self.clut_dirty = false;
+        off as u32
     }
 
     /// Read palette entry `e` (index plus CSA offset) from VRAM.
@@ -861,7 +947,7 @@ struct Painter<'a> {
     canvas: &'a Canvas,
     /// Texture source: always the real local memory.
     tex: &'a Canvas,
-    clut: &'a [u32; 512],
+    clut: &'a [u32],
     pipe: &'a PixelPipe,
     scratch: &'a mut Scratch,
 }
@@ -2483,6 +2569,8 @@ struct PixelPipe {
     /// Textured MODULATE drawing without a frame mask: eligible for the
     /// specialised row loops (`Painter::fast_sprite_row`,
     /// `Painter::fast_tri_row`).
+    /// Offset of this primitive's palette block in [`ClutPool`].
+    clut_off: u32,
     fast: bool,
     /// As `fast`, but the texture function is DECAL: the texel replaces the
     /// vertex colour instead of scaling it. Sprites only — the triangle
