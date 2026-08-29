@@ -981,6 +981,13 @@ impl Gs {
     // --- VRAM accessors (see `Canvas`) -----------------------------------
 
     /// A copy of local memory with all queued drawing applied (for dumps).
+    /// Draw everything still queued. Every reader inside the renderer
+    /// already does this; a caller reading local memory straight out of
+    /// [`Gs`] has to ask, because queueing is invisible to it.
+    pub fn flush_pending(&mut self) {
+        self.flush_batch();
+    }
+
     pub fn vram_snapshot(&mut self) -> Box<[u8]> {
         self.flush_batch();
         self.canvas.to_vec()
@@ -1788,6 +1795,7 @@ mod tests {
         gs.write_reg(0x05, (1728 * 16) | ((1936 * 16) << 16));
         gs.write_reg(0x03, (639 * 16 + 8) | ((223 * 16 + 8) << 16));
         gs.write_reg(0x05, ((1728 + 639) * 16 + 8) | (((1936 + 223) * 16 + 8) << 16));
+        gs.flush_pending();
         assert_eq!(gs.prims_drawn, 1);
         assert_eq!(gs.read_psmct32(6720, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
         assert_eq!(gs.read_psmct32(6720, 10, 0, 0) & 0xFF_FFFF, 0x60_7080);
@@ -1805,6 +1813,7 @@ mod tests {
         gs.write_reg(0x05, (1728 * 16) | ((1936 * 16) << 16) | (0xFF_FFFF << 32));
         gs.write_reg(0x03, (639 * 16 + 8) | ((223 * 16 + 8) << 16));
         gs.write_reg(0x05, ((1728 + 639) * 16 + 8) | (((1936 + 223) * 16 + 8) << 16) | (0xFF_FFFF << 32));
+        gs.flush_pending();
         assert_eq!(gs.prims_drawn, 2);
         assert_eq!(gs.read_psmct32(8960, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
     }
