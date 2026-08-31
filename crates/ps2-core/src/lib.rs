@@ -391,17 +391,26 @@ impl Ps2System {
         let target = self.cycles + cycles;
         while self.cycles < target {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            if !self.ee.idle
-                && let Some(jit) = &mut self.jit
-            {
+            if !self.ee.idle && self.jit.is_some() {
                 self.bus.now = self.cycles;
                 // Linked blocks run until about this many cycles retired;
-                // the IOP, timers and vblank then catch up. Longer chains
-                // amortise the dispatcher, shorter ones keep the cores
-                // closer in step. 512 is faster again but moves the
-                // disc-less BIOS OSD, so the gate puts the line here.
-                const CHAIN_BUDGET: u64 = 256;
-                let budget = (target - self.cycles).min(CHAIN_BUDGET) as u32;
+                // the IOP, timers and vblank then catch up. Running to the
+                // next scheduled event rather than to a fixed slice is
+                // worth 4.5% on a menu and 1.6% in-game, and costs the
+                // rest of the machine nothing it could have observed.
+                //
+                // `CHAIN_MIN` is a floor, not a target: the EE running
+                // further ahead of the IOP than this moves the disc-less
+                // BIOS OSD by a few shades, and it does so at any larger
+                // value — 320 as much as 8192 — so the floor is where
+                // that boundary sits and not a tuned number. The cap
+                // measured flat from 2048 up; `Bus::timers_due` never
+                // looks further than 8192 ahead anyway.
+                const CHAIN_MIN: u64 = 256;
+                const CHAIN_MAX: u64 = 4096;
+                let span = self.next_event_in(CHAIN_MAX).max(CHAIN_MIN);
+                let budget = (target - self.cycles).min(span) as u32;
+                let jit = self.jit.as_mut().expect("checked above");
                 let n = jit.run(&mut self.ee, &mut self.bus, budget);
                 // The chain left `now` at its own end; the replay below
                 // starts at the beginning of the same span.
@@ -412,7 +421,7 @@ impl Ps2System {
             // Both cores idle: jump to the next timer tick or vblank edge,
             // the only things that can wake either of them.
             if self.ee.idle && self.iop.idle && !self.iop.interrupt_pending(&self.bus) {
-                let k = self.idle_skip(target - self.cycles - 1);
+                let k = self.next_event_in(target - self.cycles - 1);
                 self.jump(k);
                 self.step();
                 continue;
@@ -451,14 +460,18 @@ impl Ps2System {
         }
     }
 
-    /// With the IOP idle (and no interrupt for it pending) nothing can
-    /// change its state until the next timer tick or vblank edge: every
-    /// other IOP interrupt source is an IOP or EE access, and neither core
-    /// runs during a skip. Returns how many cycles can be jumped before the
-    /// next `machine_cycle` must run (0 = it must run now); `limit` bounds
-    /// the jump.
+    /// Cycles until the next scheduled event: a timer tick (the bus's own
+    /// due time, rounded up to the tick grid) or a vblank edge. 0 = one is
+    /// due now; `limit` bounds the answer.
+    ///
+    /// Two callers, with two readings of the same number. With the IOP idle
+    /// and no interrupt pending for it, nothing can change its state until
+    /// then — every other IOP interrupt source is an IOP or EE access, and
+    /// neither core runs during a skip — so the whole span can be jumped.
+    /// With the EE running it is instead how far a linked chain may retire
+    /// before the rest of the machine has anything to say.
     #[inline]
-    fn idle_skip(&self, limit: u64) -> u64 {
+    fn next_event_in(&self, limit: u64) -> u64 {
         // First tick-aligned cycle at or after the bus's next due time.
         let due = self.bus.timers_due.max(self.cycles);
         let to_timer = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
@@ -488,7 +501,7 @@ impl Ps2System {
     fn advance(&mut self, mut n: u64) {
         while n > 0 {
             if self.iop.idle && !self.iop.interrupt_pending(&self.bus) {
-                let k = self.idle_skip(n - 1);
+                let k = self.next_event_in(n - 1);
                 self.jump(k);
                 self.machine_cycle();
                 n -= k + 1;
