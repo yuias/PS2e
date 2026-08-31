@@ -152,11 +152,6 @@ pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a flush is cut into.
 pub(super) const PARALLEL_LANES: usize = 14;
 /// Pixel estimate that triggers a batch flush on its own.
-///
-/// Do not raise this without fixing the rasterizer race it exposes: with a
-/// larger queue, a parallel flush renders `ama_2` of the Amagami gate
-/// differently from one run to the next. At 1<<20 that reproduces in three
-/// runs out of three; at 1<<16 it does not reproduce at all.
 const BATCH_MAX_PIXELS: i64 = 1 << 16;
 
 /// Queued primitive geometry (decoded, self-contained).
@@ -182,24 +177,68 @@ pub(super) struct Batch {
     /// Bounding-box pixel estimate of the queue.
     px: i64,
     /// Merged block ranges the queue writes (frame and Z), for the
-    /// read-after-write flush test.
-    writes: Vec<(u32, u32)>,
+    /// read-after-write flush test, each tagged with the buffer that wrote
+    /// it (see [`Write`]).
+    writes: Vec<Write>,
+    /// Merged block ranges the queue samples as texture, for the
+    /// write-after-read flush test.
+    reads: Vec<(u32, u32)>,
+}
+
+/// A block range the queue writes, and the buffer whose addressing produced
+/// it. A parallel flush bands rows by `py` alone, so two buffers that share
+/// memory at different bases put one pixel in two different bands: the
+/// lanes then write it in an order nobody controls. Ranges that overlap
+/// under different `(base, bw)` therefore cannot share a batch.
+struct Write {
+    start: u32,
+    end: u32,
+    base: u32,
+    bw: u32,
 }
 
 impl Batch {
-    fn note_write(&mut self, r: std::ops::Range<u32>) {
+    fn note_write(&mut self, r: std::ops::Range<u32>, base: u32, bw: u32) {
         for w in self.writes.iter_mut() {
-            if r.start <= w.1 && w.0 <= r.end {
-                w.0 = w.0.min(r.start);
-                w.1 = w.1.max(r.end);
+            if w.base == base && w.bw == bw && r.start <= w.end && w.start <= r.end {
+                w.start = w.start.min(r.start);
+                w.end = w.end.max(r.end);
                 return;
             }
         }
-        self.writes.push((r.start, r.end));
+        self.writes.push(Write { start: r.start, end: r.end, base, bw });
     }
 
-    fn reads(&self, r: &std::ops::Range<u32>) -> bool {
-        self.writes.iter().any(|w| r.start < w.1 && w.0 < r.end)
+    fn note_read(&mut self, r: std::ops::Range<u32>) {
+        for t in self.reads.iter_mut() {
+            if r.start <= t.1 && t.0 <= r.end {
+                t.0 = t.0.min(r.start);
+                t.1 = t.1.max(r.end);
+                return;
+            }
+        }
+        self.reads.push((r.start, r.end));
+    }
+
+    /// Would this read see memory the queue already wrote?
+    fn after_write(&self, r: &std::ops::Range<u32>) -> bool {
+        self.writes.iter().any(|w| r.start < w.end && w.start < r.end)
+    }
+
+    /// Would this write disturb memory the queue already sampled? A lane
+    /// replays the whole queue for its own rows, so a later primitive's
+    /// write reaches an earlier primitive's read as soon as the two land in
+    /// different bands — the batch has to be split between them.
+    fn before_read(&self, r: &std::ops::Range<u32>) -> bool {
+        self.reads.iter().any(|t| r.start < t.1 && t.0 < r.end)
+    }
+
+    /// Would this write land on memory the queue already writes through a
+    /// different row mapping?
+    fn aliases(&self, r: &std::ops::Range<u32>, base: u32, bw: u32) -> bool {
+        self.writes
+            .iter()
+            .any(|w| (w.base != base || w.bw != bw) && r.start < w.end && w.start < r.end)
     }
 }
 
@@ -666,15 +705,26 @@ impl Gs {
     }
 
     /// Queue a decoded primitive, flushing first when it would read what
-    /// the queue wrote. A primitive sampling its own target runs inline —
-    /// its result depends on draw order within itself — and `false` is
-    /// returned so the caller mirrors the 1x result into the overlay
-    /// instead of queueing a 2x twin.
+    /// the queue wrote, when it would write what the queue read, or when it
+    /// would write memory the queue already writes through a different
+    /// buffer base. The lanes of a parallel flush are cut by row, so each
+    /// of the three would otherwise resolve in whatever order the lanes
+    /// happened to run.
+    ///
+    /// A primitive sampling its own target runs inline — its result depends
+    /// on draw order within itself — and `false` is returned so the caller
+    /// mirrors the 1x result into the overlay instead of queueing a 2x twin.
     fn enqueue(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) -> bool {
         let tex = Self::tex_blocks(&pipe, tex_v);
         let (fb, zb) = Self::written_blocks(&pipe, end);
+        let targets = [(&fb, pipe.fbp), (&zb, pipe.zbp)];
+        if targets.iter().any(|(w, base)| {
+            w.as_ref().is_some_and(|w| self.batch.aliases(w, *base, pipe.fbw))
+        }) {
+            self.flush_batch();
+        }
         if let Some(t) = &tex {
-            if self.batch.reads(t) {
+            if self.batch.after_write(t) {
                 self.flush_batch();
             }
             let overlaps = |w: &Option<std::ops::Range<u32>>| {
@@ -694,8 +744,16 @@ impl Gs {
                 return false;
             }
         }
-        for r in [fb, zb].into_iter().flatten() {
-            self.batch.note_write(r);
+        if targets.iter().any(|(w, _)| w.as_ref().is_some_and(|w| self.batch.before_read(w))) {
+            self.flush_batch();
+        }
+        if let Some(t) = tex {
+            self.batch.note_read(t);
+        }
+        for (r, base) in [(fb, pipe.fbp), (zb, pipe.zbp)] {
+            if let Some(r) = r {
+                self.batch.note_write(r, base, pipe.fbw);
+            }
         }
         self.batch.px += px;
         self.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
@@ -773,8 +831,11 @@ impl Gs {
 
     /// Rasterize the queued primitives: across the worker pool in two-row
     /// bands when there is enough work, else serially. Each lane replays
-    /// the whole queue in order restricted to its own rows, so the result
-    /// is identical either way.
+    /// the whole queue in order restricted to its own rows. That matches
+    /// the serial answer only because `enqueue` refuses to queue a
+    /// primitive whose reads or writes cross another queued primitive's: a
+    /// lane reaches a later primitive's write long before another lane
+    /// reaches an earlier primitive's read of the same memory.
     pub(super) fn flush_batch(&mut self) {
         if self.batch.queued.is_empty() {
             return;
@@ -782,6 +843,7 @@ impl Gs {
         let queued = std::mem::take(&mut self.batch.queued);
         let px = std::mem::take(&mut self.batch.px);
         self.batch.writes.clear();
+        self.batch.reads.clear();
         #[cfg(feature = "threads")]
         if px >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES {
             self.prims_split += queued.len() as u64;
@@ -923,7 +985,7 @@ impl Gs {
         // Decoding reads local memory, so a queue that writes this palette's
         // own memory has to be drawn first.
         let cbp = ((ti.tex0 >> 37) & 0x3FFF) as u32;
-        if self.batch.reads(&(cbp..cbp + 4)) {
+        if self.batch.after_write(&(cbp..cbp + 4)) {
             self.flush_batch();
         }
         let off = match self.clut.alloc(key) {
