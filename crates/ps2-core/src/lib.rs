@@ -398,8 +398,9 @@ impl Ps2System {
                 // Linked blocks run until about this many cycles retired;
                 // the IOP, timers and vblank then catch up. Longer chains
                 // amortise the dispatcher, shorter ones keep the cores
-                // closer in step.
-                const CHAIN_BUDGET: u64 = 128;
+                // closer in step. 512 is faster again but moves the
+                // disc-less BIOS OSD, so the gate puts the line here.
+                const CHAIN_BUDGET: u64 = 256;
                 let budget = (target - self.cycles).min(CHAIN_BUDGET) as u32;
                 let n = jit.run(&mut self.ee, &mut self.bus, budget);
                 self.advance(n as u64);
