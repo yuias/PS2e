@@ -7,7 +7,11 @@
 //!
 //! Micro memory is uploaded wholesale by VIF MPG, so there is no
 //! fine-grained invalidation: `Vu1::write_micro` bumps a generation counter
-//! only when the bytes actually change, and a change drops the whole cache.
+//! only when the bytes actually change. A game that alternates a handful of
+//! programs would then retranslate all of them on every switch, so the
+//! cache is kept per *image* — keyed on the contents of micro memory rather
+//! than on the generation — and a switch back to one still held costs
+//! nothing.
 //!
 //! The recompiler and the interpreter are interchangeable at any pair
 //! boundary, which is what `Vu1::run_interp` is for — a block that meets a
@@ -35,21 +39,52 @@ const ST_END: u32 = 1 << 31;
 /// Hand the rest of the program to the interpreter, from `next_pc`.
 const ST_BAIL: u32 = 1 << 30;
 
-/// Code arena; when it fills, every block is dropped and it starts over.
-/// Micro memory is 16 KB, and a generation of it compiles to a few hundred
-/// KB, so this is roomy — it is committed up front, hence not the EE's 64.
-const ARENA_BYTES: usize = 8 << 20;
+/// Code arena per cached image; when one fills, that image's blocks are
+/// dropped and it starts over. Micro memory is 16 KB and a generation of it
+/// compiles to a few hundred KB, so this is roomy — it is committed up
+/// front, hence not the EE's 64.
+const ARENA_BYTES: usize = 2 << 20;
+/// Images kept translated at once. Ace Combat 5's mission alternates seven.
+const IMAGES: usize = 8;
 /// Micro memory holds this many instruction pairs.
 const PC_SLOTS: usize = 16 * 1024 / 8;
 /// Longest straight-line run translated into one block.
 const MAX_PAIRS: u32 = 64;
 
-pub struct Vu1Jit {
+/// The translation of one micro memory image.
+struct Image {
     arena: Arena,
     /// pc (pair index) -> entry point; `None` is "not compiled yet".
     lookup: Box<[Option<Entry>]>,
-    /// The `micro_gen` this cache was translated against.
+    /// Hash of the micro memory this was translated from.
+    hash: u64,
+    /// When this image was last selected, for choosing what to evict.
+    used: u64,
+}
+
+impl Image {
+    fn new(hash: u64, used: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            arena: Arena::new(ARENA_BYTES)?,
+            lookup: vec![None; PC_SLOTS].into_boxed_slice(),
+            hash,
+            used,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.arena.reset();
+        self.lookup.fill(None);
+    }
+}
+
+pub struct Vu1Jit {
+    images: Vec<Image>,
+    /// Index into `images` of the one micro memory currently holds.
+    cur: usize,
+    /// The `micro_gen` `cur` was chosen for; a change re-hashes.
     micro_gen: u32,
+    clock: u64,
     pub blocks_compiled: u64,
     pub blocks_run: u64,
     pub flushes: u64,
@@ -59,9 +94,10 @@ pub struct Vu1Jit {
 impl Vu1Jit {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
-            arena: Arena::new(ARENA_BYTES)?,
-            lookup: vec![None; PC_SLOTS].into_boxed_slice(),
+            images: vec![Image::new(0, 0)?],
+            cur: 0,
             micro_gen: 0,
+            clock: 0,
             blocks_compiled: 0,
             blocks_run: 0,
             flushes: 0,
@@ -69,20 +105,57 @@ impl Vu1Jit {
         })
     }
 
-    /// Drop every block and re-key the cache on `gen`. A state load has to
-    /// do this unconditionally: micro memory came from the file, so no
-    /// generation comparison can be trusted across it.
+    /// Drop every image and re-key on `gen`. A state load has to do this
+    /// unconditionally: micro memory came from the file, so neither the
+    /// generation nor a remembered hash can be trusted across it.
     pub(crate) fn flush_for(&mut self, generation: u32) {
-        self.flush();
+        self.images.truncate(1);
+        self.images[0].reset();
+        self.images[0].hash = 0;
+        self.cur = 0;
         self.micro_gen = generation;
-    }
-
-    /// Drop every block (micro memory changed, or the arena filled).
-    fn flush(&mut self) {
-        self.arena.reset();
-        self.lookup.fill(None);
         self.flushes += 1;
     }
+
+    /// Point `cur` at the translation of the image micro memory now holds,
+    /// translating into a fresh slot when it is one we have not seen.
+    fn select(&mut self, micro: &[u8]) -> std::io::Result<()> {
+        let hash = image_hash(micro);
+        self.clock += 1;
+        if let Some(i) = self.images.iter().position(|im| im.hash == hash) {
+            self.cur = i;
+            self.images[i].used = self.clock;
+            return Ok(());
+        }
+        self.flushes += 1;
+        if self.images.len() < IMAGES {
+            self.images.push(Image::new(hash, self.clock)?);
+            self.cur = self.images.len() - 1;
+            return Ok(());
+        }
+        // Full: reuse the slot selected longest ago.
+        let i = (0..self.images.len()).min_by_key(|&i| self.images[i].used).unwrap();
+        self.images[i].reset();
+        self.images[i].hash = hash;
+        self.images[i].used = self.clock;
+        self.cur = i;
+        Ok(())
+    }
+
+    /// Drop the current image's blocks: its arena filled.
+    fn spill(&mut self) {
+        self.images[self.cur].reset();
+        self.flushes += 1;
+    }
+}
+
+/// Hash all of micro memory, a `u64` at a time.
+fn image_hash(micro: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for w in micro.chunks_exact(8) {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// Run a microprogram from `start`, in pairs, until its E bit or the safety
@@ -92,7 +165,7 @@ impl Vu1Jit {
 pub fn run(vu: &mut Vu1, gs: &mut GsFront, gif: &mut Gif, start: u16) {
     let mut jit = vu.jit.take().expect("VU1 dispatcher entered without a recompiler");
     if jit.micro_gen != vu.micro_gen {
-        jit.flush();
+        jit.select(&vu.micro).expect("VU1 code arena");
         jit.micro_gen = vu.micro_gen;
     }
     debug_assert_eq!(vu.data_qw_mask as i32, emit::DATA_QW_MASK, "the recompiler only runs VU1");
@@ -109,7 +182,7 @@ pub fn run(vu: &mut Vu1, gs: &mut GsFront, gif: &mut Gif, start: u16) {
             vu.run_interp(gs, gif, pc, budget);
             break;
         }
-        let entry = match jit.lookup[pc as usize] {
+        let entry = match jit.images[jit.cur].lookup[pc as usize] {
             Some(e) => e,
             None => compile(&mut jit, vu, pc),
         };
@@ -135,10 +208,10 @@ pub fn run(vu: &mut Vu1, gs: &mut GsFront, gif: &mut Gif, start: u16) {
 /// Translate the block starting at `pc` and record it.
 fn compile(jit: &mut Vu1Jit, vu: &Vu1, pc: u16) -> Entry {
     // Generous upper bound per block; reset rather than fail.
-    if jit.arena.remaining() < 64 * 1024 {
-        jit.flush();
+    if jit.images[jit.cur].arena.remaining() < 64 * 1024 {
+        jit.spill();
     }
-    let base = jit.arena.next_addr();
+    let base = jit.images[jit.cur].arena.next_addr();
     let mut ops = VecAssembler::<X64Relocation>::new(base);
     prologue(&mut ops);
 
@@ -184,11 +257,11 @@ fn compile(jit: &mut Vu1Jit, vu: &Vu1, pc: u16) -> Entry {
 
     epilogue(&mut ops);
     let code = ops.finalize().expect("dynasm assembly failed");
-    let ptr = jit.arena.place(&code);
+    let ptr = jit.images[jit.cur].arena.place(&code);
     debug_assert_eq!(ptr as usize, base);
     // SAFETY: the arena is executable and now holds a complete block.
     let entry: Entry = unsafe { std::mem::transmute::<*const u8, Entry>(ptr) };
-    jit.lookup[pc as usize] = Some(entry);
+    jit.images[jit.cur].lookup[pc as usize] = Some(entry);
     jit.blocks_compiled += 1;
     entry
 }
