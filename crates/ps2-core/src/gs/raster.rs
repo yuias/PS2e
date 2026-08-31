@@ -152,7 +152,7 @@ pub(super) const PARALLEL_MIN_PIXELS: i64 = 4096;
 /// Bands (tasks) a flush is cut into.
 pub(super) const PARALLEL_LANES: usize = 14;
 /// Pixel estimate that triggers a batch flush on its own.
-const BATCH_MAX_PIXELS: i64 = 1 << 16;
+const BATCH_MAX_PIXELS: i64 = 1 << 20;
 
 /// Queued primitive geometry (decoded, self-contained).
 enum Prim {
