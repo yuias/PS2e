@@ -1293,6 +1293,27 @@ pub fn emit_branch_end(ops: &mut Ops, kind: BranchKind, fallthrough: u32, count:
     }
 }
 
+/// Offset of the running chain's remaining-cycle budget, which the block
+/// entry test re-reads so a mid-chain reschedule can shorten it.
+pub fn chain_budget_off() -> i32 {
+    offset_of!(Bus, chain_budget) as i32
+}
+
+/// Refresh [`Bus::now`] from the chain start plus the cycles retired so
+/// far. Emitted at every block entry, so a bus access deep inside a linked
+/// chain reads a time within one block of the truth instead of the time
+/// the whole chain began at. Timer reads and `base_cycle` latches take
+/// that time at face value, which is what bounds how long a chain may run.
+pub fn emit_now_refresh(ops: &mut Ops) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, QWORD [r12 + (offset_of!(Bus, chain_start) as i32)]
+        ; mov ecx, r15d
+        ; add rax, rcx
+        ; mov QWORD [r12 + (offset_of!(Bus, now) as i32)], rax
+    );
+}
+
 /// Likely branch not taken: skip the delay slot, continue after it.
 pub fn emit_likely_skip(ops: &mut Ops, fallthrough: u32, count: u32, exits: &mut Exits) {
     let taken = ops.new_dynamic_label();

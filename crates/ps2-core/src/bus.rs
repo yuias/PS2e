@@ -1444,6 +1444,18 @@ pub struct Bus {
     pub sio2: Sio2,
     /// Current EE cycle count, updated by the system before each step.
     pub now: u64,
+    /// EE cycle the running recompiler chain started at. Blocks add their
+    /// own retired count to it and refresh `now`, so a bus access made
+    /// deep inside a chain still sees a plausible time. Scratch: not part
+    /// of the machine state.
+    #[serde(skip)]
+    pub chain_start: u64,
+    /// Cycles the running recompiler chain may retire. The generated code
+    /// re-reads it between blocks, so anything that schedules an event can
+    /// cut the chain short and let the rest of the machine catch up
+    /// before the EE runs past it. Scratch: not part of the machine state.
+    #[serde(skip)]
+    pub chain_budget: u32,
     /// Video timing region; software moves it by programming SMODE1 (see
     /// [`Bus::set_region_from_smode1`]).
     pub region: Region,
@@ -1496,6 +1508,8 @@ impl Bus {
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; 2 * 1024 * 1024].into_boxed_slice(),
             timers_due: 0,
+            chain_start: 0,
+            chain_budget: 0,
             mmio,
             gs: if gs_threaded { GsFront::new() } else { GsFront::inline() },
             gif: Gif::new(),
@@ -1587,7 +1601,7 @@ impl Bus {
 
     fn ee_dma_irq(&mut self, ch: u32) {
         self.dma_irq_queue.push((1 << ch, self.now + 1024));
-        self.timers_due = 0;
+        self.reschedule();
     }
 
     /// Record a TLB entry (from tlbwi) and flush the translation cache.
@@ -2052,7 +2066,7 @@ impl Bus {
         match addr & !0x3 {
             0x1000_0000..=0x1000_1FFF => {
                 self.timers.write(addr, v as u32, self.now);
-                self.timers_due = 0;
+                self.reschedule();
                 return;
             }
             // EE SIO TXFIFO: the kernel's debug output channel. Pure
@@ -2306,6 +2320,9 @@ impl Bus {
             0x1000_E010 => {
                 self.d_stat &= !(v as u32 & 0xFFFF);
                 self.d_mask ^= (v as u32 >> 16) & 0xFFFF;
+                if self.ee_int1_pending() {
+                    self.arm_ee_interrupt(self.now);
+                }
                 return;
             }
             // INTC: STAT is write-1-to-clear, MASK is write-1-to-toggle.
@@ -2412,6 +2429,15 @@ impl Bus {
     }
 
     // --- periodic events -------------------------------------------------
+
+    /// Something was scheduled: run the periodic tick at the next
+    /// opportunity, and end the recompiler chain that is running so the
+    /// EE does not retire past the event it just armed.
+    #[inline]
+    fn reschedule(&mut self) {
+        self.timers_due = 0;
+        self.chain_budget = 0;
+    }
 
     /// Edge-detect timer interrupts on both sides. Called periodically.
     pub fn tick_timers(&mut self) {
@@ -3155,7 +3181,19 @@ impl Bus {
             self.intc_ready_at = u64::MAX;
         } else if self.intc_ready_at == u64::MAX {
             self.intc_ready_at = self.now + INTC_LATENCY;
+            self.arm_ee_interrupt(self.intc_ready_at);
         }
+    }
+
+    /// An EE interrupt becomes deliverable at `at`. The recompiler only
+    /// tests for one between chains, so cut the running chain there: the
+    /// EE must not retire past the point where it would have taken the
+    /// exception. A no-op outside a chain, where the next chain's entry
+    /// sets the budget anyway.
+    #[inline]
+    fn arm_ee_interrupt(&mut self, at: u64) {
+        let cut = at.saturating_sub(self.chain_start).min(u32::MAX as u64) as u32;
+        self.chain_budget = self.chain_budget.min(cut);
     }
 
     pub fn ee_int1_pending(&self) -> bool {
@@ -3214,7 +3252,7 @@ impl Bus {
             }
         }
         self.spu2.dma(core, to_spu, &mut buf, self.now);
-        self.timers_due = 0;
+        self.reschedule();
         if !to_spu {
             for (i, b) in buf.into_iter().enumerate() {
                 self.iop_ram[(start + i) % len] = b;
@@ -3705,12 +3743,12 @@ impl Bus {
                     // The N command completes (and interrupts the IOP)
                     // after the drive latency, from tick_timers.
                     self.cdvd_done_at = Some(self.now + latency);
-                    self.timers_due = 0;
+                    self.reschedule();
                 }
             }
             0x1F90_0000..=0x1F90_0FFF => {
                 self.spu2.write::<N>((addr & 0xFFF) as usize, v);
-                self.timers_due = 0;
+                self.reschedule();
                 if self.spu2.take_irq() {
                     self.iop_i_stat |= 1 << 9;
                 }
@@ -3824,7 +3862,7 @@ impl Bus {
 
     fn iop_write_mmio<const N: usize>(&mut self, addr: u32, v: u32) {
         if let Some(t) = Self::iop_timer_index(addr) {
-            self.timers_due = 0;
+            self.reschedule();
             let timer = &mut self.iop_timers[t];
             match addr & 0xF {
                 0x0 => {

@@ -125,6 +125,7 @@ impl Jit {
         // SAFETY: `entry` is a complete block in our arena; the pointers are
         // exclusively ours for the call and the block only touches the CPU
         // and bus through the helpers below.
+        bus.chain_start = bus.now;
         let mut n = unsafe { entry(cpu as *mut Cpu, bus as *mut Bus, budget.max(1)) };
         // A diverting instruction (branch, exception, idle loop) leaves the
         // interpreter's delay-slot state behind; let it finish the branch.
@@ -222,9 +223,10 @@ impl Jit {
         let budget_exit = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch x64
-            ; cmp r15d, ebp
+            ; cmp r15d, DWORD [r12 + emit::chain_budget_off()]
             ; jae =>budget_exit
         );
+        emit::emit_now_refresh(&mut ops);
         let mut exits = emit::Exits { jit: self, links: Vec::new() };
 
         // (label, cycles retired) for interpreter calls that diverted.
@@ -500,7 +502,8 @@ fn emit_call4(ops: &mut VecAssembler<X64Relocation>, f: usize, a2: u32, a3: u32)
 
 /// Save callee-saved registers, keep the stack 16-aligned with 32 bytes of
 /// shadow space (Windows needs it, SysV does not mind); rbx = cpu, r12 =
-/// bus, ebp = cycle budget, r15 = cycles retired so far.
+/// bus, r15 = cycles retired so far. The cycle budget goes to
+/// `Bus::chain_budget`, where a mid-chain reschedule can shorten it.
 fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
     dynasm!(ops
         ; .arch x64
@@ -517,14 +520,14 @@ fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
         ; .arch x64
         ; mov rbx, rcx
         ; mov r12, rdx
-        ; mov ebp, r8d
+        ; mov DWORD [r12 + emit::chain_budget_off()], r8d
     );
     #[cfg(not(windows))]
     dynasm!(ops
         ; .arch x64
         ; mov rbx, rdi
         ; mov r12, rsi
-        ; mov ebp, edx
+        ; mov DWORD [r12 + emit::chain_budget_off()], edx
     );
     dynasm!(ops ; .arch x64 ; xor r15d, r15d);
 }

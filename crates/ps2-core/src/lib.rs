@@ -403,6 +403,9 @@ impl Ps2System {
                 const CHAIN_BUDGET: u64 = 256;
                 let budget = (target - self.cycles).min(CHAIN_BUDGET) as u32;
                 let n = jit.run(&mut self.ee, &mut self.bus, budget);
+                // The chain left `now` at its own end; the replay below
+                // starts at the beginning of the same span.
+                self.bus.now = self.cycles;
                 self.advance(n as u64);
                 continue;
             }
