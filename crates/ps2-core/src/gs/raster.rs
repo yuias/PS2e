@@ -413,6 +413,23 @@ impl Gs {
         }
     }
 
+    /// Texel rows one page of `psm` holds, and the block distance between
+    /// consecutive rows of pages. Mirrors the arithmetic in `layout`'s
+    /// `addr*`: getting this wrong under-states where a texture lives and
+    /// lets a read-after-write hazard through.
+    fn tex_page_geom(psm: u32, tbw: u32) -> (u32, u32) {
+        let bw = tbw.max(1);
+        match psm {
+            // 128x64 texel pages, addressed with half the declared width.
+            PSMT8 => (64, (bw >> 1) * 32),
+            // 128x128 texel pages, likewise.
+            PSMT4 => (128, (bw >> 1) * 32),
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => (64, bw * 32),
+            // 32-bit pages, including the ones packed into their alpha.
+            _ => (32, bw * 32),
+        }
+    }
+
     /// Block range the texture may be sampled from (conservative): `tex_v`
     /// is the texel row range the primitive samples (`None` = unknown,
     /// assume the whole declared height). `None` result = untextured.
@@ -421,16 +438,22 @@ impl Gs {
             return None;
         }
         let ti = &pipe.tex;
-        // Texel rows the primitive can touch: the sampled range (plus one
-        // for the bilinear tap) unless it wraps around the texture.
-        let (v_lo, v_hi) = match tex_v {
-            Some((lo, hi)) if lo >= 0.0 && hi + 1.0 < ti.th as f32 => (lo as u32, hi as u32 + 1),
+        // REGION_CLAMP and REGION_REPEAT map a sample to a row `wrap` picks
+        // from MINV/MAXV, which can sit past the declared height — so they
+        // neither trust the sampled range nor stop at `th`.
+        let (v_lo, v_hi) = match (ti.wmt, tex_v) {
+            // Sampled range plus one for the bilinear tap, when it cannot wrap.
+            (0 | 1, Some((lo, hi))) if lo >= 0.0 && hi + 1.0 < ti.th as f32 => {
+                (lo as u32, hi as u32 + 1)
+            }
+            (2, _) => (0, ti.th.max(ti.maxv.max(ti.minv).max(0) as u32 + 1)),
+            (3, _) => (0, ti.th.max((ti.minv | ti.maxv).max(0) as u32 + 1)),
             _ => (0, ti.th),
         };
-        // 32-bit pages are 32 rows tall; the other formats' pages are taller,
-        // so this over-estimates their span (safe side).
-        let tbw = ti.tbw.max(1);
-        Some(ti.tbp + (v_lo / 32) * tbw * 32..ti.tbp + (v_hi / 32 + 1) * tbw * 32)
+        let (page_rows, stride) = Self::tex_page_geom(ti.psm, ti.tbw);
+        // A single-page-wide buffer has a zero stride; it still spans a page.
+        let span = stride.max(32);
+        Some(ti.tbp + (v_lo / page_rows) * stride..ti.tbp + (v_hi / page_rows) * stride + span)
     }
 
     /// Block ranges a primitive covering rows `0..rows` writes: frame and Z
