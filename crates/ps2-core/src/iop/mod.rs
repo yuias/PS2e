@@ -201,6 +201,15 @@ impl Cpu {
     }
 
     fn execute(&mut self, instr: u32, bus: &mut Bus) {
+        // 13% of what this interpreter runs is `nop`, and the cost of an
+        // IOP instruction is almost all fixed overhead rather than its own
+        // work: returning here, before the call's callee-saved spills pay
+        // for a body that does nothing, is worth 9% of the mission run.
+        // Handling the other hot opcodes the same way measured *slower* —
+        // see `.claude/session-2026-09-01.md`.
+        if instr == 0 {
+            return;
+        }
         let op = instr >> 26;
         let rs = ((instr >> 21) & 31) as usize;
         let rt = ((instr >> 16) & 31) as usize;
