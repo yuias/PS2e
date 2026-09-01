@@ -390,8 +390,13 @@ impl Ps2System {
         let _g = prof::scope(prof::Slot::Ee);
         let target = self.cycles + cycles;
         while self.cycles < target {
+            // A recognised INTC_STAT spin lasts exactly as long as the
+            // register holds still; see `Bus::note_intc_poll`.
+            if self.bus.ee_spinning && self.bus.intc_stat != self.bus.intc_poll_stat {
+                self.bus.ee_spinning = false;
+            }
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            if !self.ee.idle && self.jit.is_some() {
+            if !self.ee.idle && !self.bus.ee_spinning && self.jit.is_some() {
                 self.bus.now = self.cycles;
                 // Linked blocks run until about this many cycles retired;
                 // the IOP, timers and vblank then catch up. Running to the
@@ -434,7 +439,7 @@ impl Ps2System {
             // groups that carry only their IOP slot run as one loop rather
             // than one iteration of this one each. The mission benchmark
             // spends 88% of its cycles here.
-            if self.ee.idle {
+            if self.ee.idle || self.bus.ee_spinning {
                 let g = self.quiet_iop_groups((target - self.cycles) / EE_PER_IOP);
                 if g > 0 {
                     self.run_idle_ee_groups(g);
@@ -623,6 +628,16 @@ impl Ps2System {
             // did, so the test cannot be left to the bound alone.
             if self.cycles.is_multiple_of(TIMER_TICK_CYCLES) && self.cycles >= self.bus.timers_due {
                 self.bus.tick_timers();
+            }
+            // A spinning EE is not idle: it wakes on the register it
+            // reads, which no interrupt has to accompany.
+            if self.bus.ee_spinning && self.bus.intc_stat != self.bus.intc_poll_stat {
+                self.bus.ee_spinning = false;
+                self.cycles += 1;
+                self.frame_pos += 1;
+                self.wrap_frame_pos();
+                self.ee_group_tail();
+                return;
             }
             if self.ee.interrupt_pending(&self.bus) {
                 self.ee.idle = false;

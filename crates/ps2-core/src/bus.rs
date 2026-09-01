@@ -1450,6 +1450,21 @@ pub struct Bus {
     /// of the machine state.
     #[serde(skip)]
     pub chain_start: u64,
+    /// INTC_STAT reads the EE has made in a row without the register
+    /// changing, the cycle of the last one, and the value it kept seeing.
+    /// A game waiting for vblank spins on this register; recognising that
+    /// lets the machine run to the next event instead of re-reading it
+    /// every few cycles. Scratch: not part of the machine state.
+    #[serde(skip)]
+    intc_polls: u32,
+    #[serde(skip)]
+    intc_poll_at: u64,
+    #[serde(skip)]
+    pub intc_poll_stat: u32,
+    /// Set once the run above is long enough to call it a spin. Cleared by
+    /// [`Ps2System::run`] as soon as INTC_STAT moves.
+    #[serde(skip)]
+    pub ee_spinning: bool,
     /// Cycles the running recompiler chain may retire. The generated code
     /// re-reads it between blocks, so anything that schedules an event can
     /// cut the chain short and let the rest of the machine catch up
@@ -1510,6 +1525,10 @@ impl Bus {
             timers_due: 0,
             chain_start: 0,
             chain_budget: 0,
+            intc_polls: 0,
+            intc_poll_at: 0,
+            intc_poll_stat: 0,
+            ee_spinning: false,
             mmio,
             gs: if gs_threaded { GsFront::new() } else { GsFront::inline() },
             gif: Gif::new(),
@@ -2048,7 +2067,10 @@ impl Bus {
             0x1000_C430 => self.dma_sif1.tadr as u64,
             0x1000_E010 => (self.d_stat | (self.d_mask << 16)) as u64,
             // EE INTC.
-            0x1000_F000 => self.intc_stat as u64,
+            0x1000_F000 => {
+                self.note_intc_poll();
+                self.intc_stat as u64
+            }
             0x1000_F010 => self.intc_mask as u64,
             // SIF registers (mailboxes, flags, control handshake).
             0x1000_F200..=0x1000_F26F => self.sif.ee_read(addr) as u64,
@@ -2429,6 +2451,33 @@ impl Bus {
     }
 
     // --- periodic events -------------------------------------------------
+
+    /// EE cycles a gap longer than this ends a run of INTC_STAT polls: a
+    /// program reading the register once in passing is not spinning on it.
+    const INTC_POLL_GAP: u64 = 64;
+    /// Reads in a row, with the register unchanged, that make it a spin.
+    const INTC_SPIN_POLLS: u32 = 32;
+
+    /// The EE read INTC_STAT. A game waiting for vertical blank does this
+    /// in a five-instruction loop — `lw`, `andi`, `beq` — and on the menu
+    /// benchmark it accounts for 1.1 billion of the run's reads, about one
+    /// per five EE cycles. Once a run of them is long enough to be that
+    /// loop, end the recompiler chain and let [`Ps2System::run`] carry the
+    /// machine to the next scheduled event instead: nothing the loop can
+    /// observe changes until INTC_STAT does.
+    fn note_intc_poll(&mut self) {
+        if self.intc_stat != self.intc_poll_stat || self.now - self.intc_poll_at > Self::INTC_POLL_GAP
+        {
+            self.intc_polls = 0;
+            self.intc_poll_stat = self.intc_stat;
+        }
+        self.intc_poll_at = self.now;
+        self.intc_polls += 1;
+        if self.intc_polls >= Self::INTC_SPIN_POLLS && !self.ee_spinning {
+            self.ee_spinning = true;
+            self.chain_budget = 0;
+        }
+    }
 
     /// Something was scheduled: run the periodic tick at the next
     /// opportunity, and end the recompiler chain that is running so the
