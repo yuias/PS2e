@@ -430,6 +430,17 @@ impl Ps2System {
                 self.step();
                 continue;
             }
+            // An idle EE contributes nothing but its wake-up test, so the
+            // groups that carry only their IOP slot run as one loop rather
+            // than one iteration of this one each. The mission benchmark
+            // spends 88% of its cycles here.
+            if self.ee.idle {
+                let g = self.quiet_iop_groups((target - self.cycles) / EE_PER_IOP);
+                if g > 0 {
+                    self.run_idle_ee_groups(g);
+                    continue;
+                }
+            }
             // Cycle 0 of the group carries the IOP slot and timers.
             self.step();
             // Cycles 1..7: EE only, plus a vblank edge if one lands here.
@@ -441,22 +452,29 @@ impl Ps2System {
                 self.cycles += EE_PER_IOP - 1;
                 continue;
             }
-            for _ in 1..EE_PER_IOP {
-                self.bus.now = self.cycles;
-                if !self.ee.idle {
-                    self.ee.step(&mut self.bus);
-                }
-                if self.frame_pos == self.vblank_start() {
-                    self.bus.vblank(true);
-                    self.wake_idle_ee();
-                } else if self.frame_pos == 0 && self.cycles != 0 {
-                    self.bus.vblank(false);
-                    self.wake_idle_ee();
-                }
-                self.frame_pos += 1;
-                self.wrap_frame_pos();
-                self.cycles += 1;
+            self.ee_group_tail();
+        }
+    }
+
+    /// Cycles 1..7 of an IOP group: the EE only, plus a vblank edge if one
+    /// lands inside. The IOP and the timers cannot be due here, their
+    /// cadences both being multiples of [`EE_PER_IOP`].
+    fn ee_group_tail(&mut self) {
+        for _ in 1..EE_PER_IOP {
+            self.bus.now = self.cycles;
+            if !self.ee.idle {
+                self.ee.step(&mut self.bus);
             }
+            if self.frame_pos == self.vblank_start() {
+                self.bus.vblank(true);
+                self.wake_idle_ee();
+            } else if self.frame_pos == 0 && self.cycles != 0 {
+                self.bus.vblank(false);
+                self.wake_idle_ee();
+            }
+            self.frame_pos += 1;
+            self.wrap_frame_pos();
+            self.cycles += 1;
         }
     }
 
@@ -579,6 +597,46 @@ impl Ps2System {
         // The batch may end exactly on the frame edge; `machine_cycle`
         // recognises the vblank-end edge by a wrapped position, not by the
         // frame length.
+        self.wrap_frame_pos();
+    }
+
+    /// `g` IOP slots with an idle EE and nothing else due. The per-cycle
+    /// vblank and timer tests [`Ps2System::machine_cycle`] would run are
+    /// all answered by [`Ps2System::quiet_iop_groups`] before the loop,
+    /// which leaves the EE's wake-up as the only thing left to check.
+    ///
+    /// A wake ends the batch where `machine_cycle` would have noticed it,
+    /// one cycle into its group, and the woken EE then runs out that
+    /// group through [`Ps2System::ee_group_tail`] exactly as the
+    /// cycle-at-a-time path would have.
+    fn run_idle_ee_groups(&mut self, g: u64) {
+        let _guard = prof::scope(prof::Slot::Iop);
+        for _ in 0..g {
+            self.bus.now = self.cycles;
+            // Same idle-loop skip as `machine_cycle`.
+            if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
+                self.iop.idle = false;
+                self.iop.step(&mut self.bus);
+            }
+            // The IOP can arm an event from inside this batch, and
+            // `machine_cycle` would have run the tick in the same cycle it
+            // did, so the test cannot be left to the bound alone.
+            if self.cycles.is_multiple_of(TIMER_TICK_CYCLES) && self.cycles >= self.bus.timers_due {
+                self.bus.tick_timers();
+            }
+            if self.ee.interrupt_pending(&self.bus) {
+                self.ee.idle = false;
+                self.cycles += 1;
+                self.frame_pos += 1;
+                self.wrap_frame_pos();
+                self.ee_group_tail();
+                return;
+            }
+            self.cycles += EE_PER_IOP;
+            self.frame_pos += EE_PER_IOP;
+        }
+        // The batch may end exactly on the frame edge; `machine_cycle`
+        // recognises the vblank-end edge by a wrapped position.
         self.wrap_frame_pos();
     }
 
