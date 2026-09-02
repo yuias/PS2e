@@ -1528,6 +1528,13 @@ pub struct Bus {
     /// Counted here because only the memory helpers see one.
     #[serde(skip)]
     pub(crate) iop_mmio_exits: u64,
+    /// Addresses of `iop_ram` and `iop_code_pages` for the IOP
+    /// recompiler's inline RAM path (the boxes never move; kept as
+    /// integers so Bus stays Send).
+    #[serde(skip)]
+    pub(crate) iop_ram_ptr: usize,
+    #[serde(skip)]
+    pub(crate) iop_code_pages_ptr: usize,
     /// Instruction-fetch page cache: virtual page tag and its RAM offset
     /// (tag 1 never matches an aligned page).
     fetch_tag: u32,
@@ -1619,6 +1626,8 @@ impl Bus {
             iop_chain_start: 0,
             iop_chain_budget: 0,
             iop_mmio_exits: 0,
+            iop_ram_ptr: 0,
+            iop_code_pages_ptr: 0,
             ram_ptr: 0,
             code_pages_ptr: 0,
             fetch_tag: 1,
@@ -1627,6 +1636,8 @@ impl Bus {
         };
         bus.ram_ptr = bus.ram.as_mut_ptr() as usize;
         bus.code_pages_ptr = bus.code_pages.as_ptr() as usize;
+        bus.iop_ram_ptr = bus.iop_ram.as_mut_ptr() as usize;
+        bus.iop_code_pages_ptr = bus.iop_code_pages.as_ptr() as usize;
         bus
     }
 
@@ -3812,7 +3823,9 @@ impl Bus {
         self.code_pages.fill(false);
         self.dirty_code_writes.clear();
         self.jit_flush_needed = true;
+        self.iop_ram_ptr = self.iop_ram.as_mut_ptr() as usize;
         self.iop_code_pages = vec![false; IOP_RAM_SIZE >> 12].into_boxed_slice();
+        self.iop_code_pages_ptr = self.iop_code_pages.as_ptr() as usize;
         self.iop_dirty_code_writes.clear();
         self.iop_dirty_code_pages.clear();
         self.iop_jit_flush_needed = true;

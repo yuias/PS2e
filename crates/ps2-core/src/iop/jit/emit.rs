@@ -64,6 +64,12 @@ fn chain_start_off() -> i32 {
 fn now_off() -> i32 {
     offset_of!(Bus, now) as i32
 }
+fn ram_ptr_off() -> i32 {
+    offset_of!(Bus, iop_ram_ptr) as i32
+}
+fn code_pages_ptr_off() -> i32 {
+    offset_of!(Bus, iop_code_pages_ptr) as i32
+}
 
 /// What a decoded instruction turned into.
 pub enum Emitted {
@@ -267,6 +273,25 @@ pub fn emit_now(ops: &mut Ops, local: u32) {
         ; lea rax, [rax + rcx * 8]
         ; mov QWORD [r12 + now_off()], rax
     );
+}
+
+/// eax = the IOP RAM offset r10d addresses, or jump to `slow`. IOP RAM is
+/// a flat 2 MiB mirrored through the low 8 MiB, so the window test and the
+/// offset are one mask each; the second bound keeps an unaligned access at
+/// the very top of the mirror from running off the end, which `read_le`
+/// would have panicked on.
+fn ram_offset(ops: &mut Ops, bytes: u32, slow: DynamicLabel) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov eax, r10d
+        ; and eax, 0x1FFF_FFFF
+        ; cmp eax, 0x0080_0000
+        ; jae =>slow
+        ; and eax, 0x1F_FFFF
+    );
+    if bytes > 1 {
+        dynasm!(ops ; .arch x64 ; cmp eax, (0x20_0000 - bytes) as i32 ; ja =>slow);
+    }
 }
 
 /// Record the exit an out-of-RAM access jumps to, and test for it. rax
@@ -502,11 +527,24 @@ pub fn emit(ops: &mut Ops, st: &mut State, addr: u32, instr: u32, delay: bool) -
                 dynasm!(ops ; .arch x64 ; add r10d, simm);
             }
             commit(ops, st, 0);
-            let f = match op {
-                0x20 | 0x24 => h::rd8 as *const () as usize,
-                0x21 | 0x25 => h::rd16 as *const () as usize,
-                _ => h::rd32 as *const () as usize,
+            let (bytes, f) = match op {
+                0x20 | 0x24 => (1, h::rd8 as *const () as usize),
+                0x21 | 0x25 => (2, h::rd16 as *const () as usize),
+                _ => (4, h::rd32 as *const () as usize),
             };
+            // Straight out of IOP RAM when the address is in it; only the
+            // rest can move anything the chain's caller re-tests.
+            let (slow, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+            ram_offset(ops, bytes, slow);
+            dynasm!(ops ; .arch x64 ; mov rcx, QWORD [r12 + ram_ptr_off()]);
+            match op {
+                0x20 => dynasm!(ops ; .arch x64 ; movsx r14d, BYTE [rcx + rax]),
+                0x21 => dynasm!(ops ; .arch x64 ; movsx r14d, WORD [rcx + rax]),
+                0x24 => dynasm!(ops ; .arch x64 ; movzx r14d, BYTE [rcx + rax]),
+                0x25 => dynasm!(ops ; .arch x64 ; movzx r14d, WORD [rcx + rax]),
+                _ => dynasm!(ops ; .arch x64 ; mov r14d, DWORD [rcx + rax]),
+            }
+            dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
             call2(ops, f, st.local);
             if rt != 0 {
                 match op {
@@ -523,6 +561,7 @@ pub fn emit(ops: &mut Ops, st: &mut State, addr: u32, instr: u32, delay: bool) -
             } else {
                 mem_test(ops, st, addr, true);
             }
+            dynasm!(ops ; .arch x64 ; =>done);
         }
         0x22 | 0x26 => {
             ld_addr(ops, rs);
@@ -560,27 +599,50 @@ pub fn emit(ops: &mut Ops, st: &mut State, addr: u32, instr: u32, delay: bool) -
             }
             ld_data(ops, rt);
             commit(ops, st, 0);
-            let f = match op {
-                0x28 => h::wr8 as *const () as usize,
-                0x29 => h::wr16 as *const () as usize,
-                0x2A => h::swl as *const () as usize,
-                0x2B => h::wr32 as *const () as usize,
-                _ => h::swr as *const () as usize,
+            let (bytes, f) = match op {
+                0x28 => (1, h::wr8 as *const () as usize),
+                0x29 => (2, h::wr16 as *const () as usize),
+                // The unaligned pair reads before it writes; it is 0.1% of
+                // the stream and stays on the helper.
+                0x2A => (0, h::swl as *const () as usize),
+                0x2B => (4, h::wr32 as *const () as usize),
+                _ => (0, h::swr as *const () as usize),
             };
             // Cache isolation swallows the store, bus access and all.
-            let isolated = ops.new_dynamic_label();
+            let done = ops.new_dynamic_label();
             dynasm!(ops
                 ; .arch x64
                 ; test DWORD [rbx + cop0(STATUS)], STATUS_ISC
-                ; jnz =>isolated
+                ; jnz =>done
             );
+            let slow = ops.new_dynamic_label();
+            if bytes > 0 {
+                ram_offset(ops, bytes, slow);
+                // A page holding translated code goes the slow way, which
+                // is where the write is reported for invalidation.
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov rcx, QWORD [r12 + code_pages_ptr_off()]
+                    ; mov edx, eax
+                    ; shr edx, 12
+                    ; cmp BYTE [rcx + rdx], 0
+                    ; jne =>slow
+                    ; mov rcx, QWORD [r12 + ram_ptr_off()]
+                );
+                match bytes {
+                    1 => dynasm!(ops ; .arch x64 ; mov BYTE [rcx + rax], r11b),
+                    2 => dynasm!(ops ; .arch x64 ; mov WORD [rcx + rax], r11w),
+                    _ => dynasm!(ops ; .arch x64 ; mov DWORD [rcx + rax], r11d),
+                }
+                dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
+            }
             call3(ops, f, st.local);
             if delay {
                 mem_test_delay(ops, st, false);
             } else {
                 mem_test(ops, st, addr, false);
             }
-            dynasm!(ops ; .arch x64 ; =>isolated);
+            dynasm!(ops ; .arch x64 ; =>done);
         }
         _ => return Emitted::Interp,
     }
