@@ -1,8 +1,11 @@
 //! EE timers (T0-T3): 16-bit counters on BUSCLK (EE clock / 2).
 //!
 //! Counts are computed lazily from the cycle counter instead of ticking —
-//! reads reconstruct the value from (now - base). Gates and interrupts are
-//! not wired up yet; MODE's interrupt flags are write-1-to-clear.
+//! reads reconstruct the value from (now - base). Compare interrupts are
+//! wired to INTC (cause 9+t, see [`Timers::check_irqs`]); hardware gating
+//! (MODE's GATE/GATS/GATM) and the overflow interrupt are not modeled, so
+//! the overflow flag never sets. MODE's interrupt flags are
+//! write-1-to-clear.
 
 use crate::Region;
 use tracing::trace;
