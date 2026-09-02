@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub const RAM_SIZE: usize = 32 * 1024 * 1024;
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
 pub const SPAD_SIZE: usize = 16 * 1024;
+pub const IOP_RAM_SIZE: usize = 2 * 1024 * 1024;
 /// Shadow register file for 0x1000_0000..0x1001_0000 MMIO.
 const MMIO_SIZE: usize = 0x10000;
 
@@ -1500,6 +1501,33 @@ pub struct Bus {
     /// fast paths (the boxes never move; kept as integers so Bus stays Send).
     pub(crate) ram_ptr: usize,
     pub(crate) code_pages_ptr: usize,
+    /// IOP RAM pages (4 KiB) holding recompiled IOP code, and the writes
+    /// to them the IOP recompiler has yet to act on. IOP code is loaded at
+    /// runtime by more than the IOP itself — the EE's 0x1C00_0000 window,
+    /// IOP DMA and SIF all deliver modules — so every writer of `iop_ram`
+    /// reports through [`Bus::iop_ram_written`] or its bulk form.
+    #[serde(skip)]
+    pub(crate) iop_code_pages: Box<[bool]>,
+    #[serde(skip)]
+    pub(crate) iop_dirty_code_writes: Vec<u32>,
+    /// Whole pages a bulk transfer landed on: a module load rewrites far
+    /// too many words to queue one address each.
+    #[serde(skip)]
+    pub(crate) iop_dirty_code_pages: Vec<u32>,
+    #[serde(skip)]
+    pub(crate) iop_jit_flush_needed: bool,
+    /// EE cycle the running IOP chain started at, and the instructions it
+    /// may still retire. The IOP retires one instruction per
+    /// [`crate::EE_PER_IOP`] cycles, so the pair fixes the time of any bus
+    /// access made inside the chain. Scratch: not part of machine state.
+    #[serde(skip)]
+    pub(crate) iop_chain_start: u64,
+    #[serde(skip)]
+    pub(crate) iop_chain_budget: u32,
+    /// Chains the IOP recompiler ended because an access left IOP RAM.
+    /// Counted here because only the memory helpers see one.
+    #[serde(skip)]
+    pub(crate) iop_mmio_exits: u64,
     /// Instruction-fetch page cache: virtual page tag and its RAM offset
     /// (tag 1 never matches an aligned page).
     fetch_tag: u32,
@@ -1584,6 +1612,13 @@ impl Bus {
             code_pages: vec![false; RAM_SIZE >> 12].into_boxed_slice(),
             dirty_code_writes: Vec::new(),
             jit_flush_needed: false,
+            iop_code_pages: vec![false; IOP_RAM_SIZE >> 12].into_boxed_slice(),
+            iop_dirty_code_writes: Vec::new(),
+            iop_dirty_code_pages: Vec::new(),
+            iop_jit_flush_needed: false,
+            iop_chain_start: 0,
+            iop_chain_budget: 0,
+            iop_mmio_exits: 0,
             ram_ptr: 0,
             code_pages_ptr: 0,
             fetch_tag: 1,
@@ -1652,6 +1687,61 @@ impl Bus {
                 self.dirty_code_writes.push(a);
             }
         }
+    }
+
+    /// An IOP RAM offset was written: if recompiled IOP code lives on its
+    /// page, queue the instruction words it covers.
+    #[inline(always)]
+    pub(crate) fn iop_ram_written(&mut self, off: usize, len: usize) {
+        let end = off + len - 1;
+        if !self.iop_code_page(off >> 12) && !self.iop_code_page(end >> 12) {
+            return;
+        }
+        let mut a = (off & !3) as u32;
+        let last = (end & !3) as u32;
+        loop {
+            if self.iop_dirty_code_writes.last() != Some(&a) {
+                self.iop_dirty_code_writes.push(a);
+            }
+            if a == last {
+                break;
+            }
+            a += 4;
+        }
+    }
+
+    /// A bulk transfer wrote `bytes` from `start`, wrapping in IOP RAM as
+    /// the DMA engines do. Module loads land this way, so the pages it
+    /// covered are queued whole rather than one address per word — but
+    /// only the pages, because SIF1 also carries the RPC traffic that
+    /// shares pages with resident code.
+    fn iop_ram_bulk_written(&mut self, start: usize, bytes: usize) {
+        let pages = self.iop_code_pages.len();
+        if bytes == 0 || pages == 0 {
+            return;
+        }
+        let len = self.iop_ram.len();
+        let n = bytes.min(len);
+        let mut p = (start % len) >> 12;
+        let last = ((start + n - 1) % len) >> 12;
+        loop {
+            if self.iop_code_pages[p] {
+                let p = p as u32;
+                if self.iop_dirty_code_pages.last() != Some(&p) {
+                    self.iop_dirty_code_pages.push(p);
+                }
+            }
+            if p == last {
+                break;
+            }
+            p = (p + 1) % pages;
+        }
+    }
+
+    /// A deserialized `Bus` has no page table until [`Bus::after_load`].
+    #[inline(always)]
+    fn iop_code_page(&self, page: usize) -> bool {
+        self.iop_code_pages.get(page).copied().unwrap_or(false)
     }
 
     /// Walk the TLB for a mapped-segment address. Returns a physical
@@ -1840,7 +1930,11 @@ impl Bus {
                 self.note_ram_write(addr as usize);
             }
             0x7000_0000..=0x7000_3FFF => self.spad[(addr & 0x3FFF) as usize] = v,
-            0x1C00_0000..=0x1C1F_FFFF => self.iop_ram[(addr & 0x1F_FFFF) as usize] = v,
+            0x1C00_0000..=0x1C1F_FFFF => {
+                let off = (addr & 0x1F_FFFF) as usize;
+                self.iop_ram[off] = v;
+                self.iop_ram_written(off, 1);
+            }
             _ => return false,
         }
         true
@@ -1867,7 +1961,11 @@ impl Bus {
         }
         let addr = vaddr & 0x1FFF_FFFF;
         match addr {
-            0x0000_0000..=0x007F_FFFF => self.iop_ram[(addr & 0x1F_FFFF) as usize] = v,
+            0x0000_0000..=0x007F_FFFF => {
+                let off = (addr & 0x1F_FFFF) as usize;
+                self.iop_ram[off] = v;
+                self.iop_ram_written(off, 1);
+            }
             0x1F80_0000..=0x1F80_03FF => self.iop_spad[(addr & 0x3FF) as usize] = v,
             _ => return false,
         }
@@ -1950,7 +2048,9 @@ impl Bus {
             }
             0x1200_0000..=0x1200_1FFF => self.write_gs_priv::<N>(addr, v),
             0x1C00_0000..=0x1C1F_FFFF => {
-                write_le::<N>(&mut self.iop_ram, (addr & 0x1F_FFFF) as usize, v)
+                let off = (addr & 0x1F_FFFF) as usize;
+                write_le::<N>(&mut self.iop_ram, off, v);
+                self.iop_ram_written(off, N);
             }
             0x1F80_0000..=0x1F80_FFFF => {
                 self.warn_stub(addr, "IOP MMIO window seen from the EE");
@@ -3245,6 +3345,14 @@ impl Bus {
         self.chain_budget = self.chain_budget.min(cut);
     }
 
+    /// Cycle at which an INTC line becomes deliverable to the EE, or
+    /// `u64::MAX` when none is armed. The only part of the EE's wake-up
+    /// test that moves with time alone, so it bounds how long the IOP may
+    /// run in one chain while the EE sleeps.
+    pub(crate) fn ee_wake_at(&self) -> u64 {
+        self.intc_ready_at
+    }
+
     pub fn ee_int1_pending(&self) -> bool {
         self.d_stat & self.d_mask & 0x3FF != 0
     }
@@ -3303,9 +3411,11 @@ impl Bus {
         self.spu2.dma(core, to_spu, &mut buf, self.now);
         self.reschedule();
         if !to_spu {
+            let n = buf.len();
             for (i, b) in buf.into_iter().enumerate() {
                 self.iop_ram[(start + i) % len] = b;
             }
+            self.iop_ram_bulk_written(start, n);
         }
         if self.spu2.take_irq() {
             self.iop_i_stat |= 1 << 9;
@@ -3319,9 +3429,11 @@ impl Bus {
         let len = self.iop_ram.len();
         let mut chunk = vec![0u8; bytes];
         self.cdvd.dma_read(&mut chunk);
+        let n = chunk.len();
         for (i, b) in chunk.into_iter().enumerate() {
             self.iop_ram[(start + i) % len] = b;
         }
+        self.iop_ram_bulk_written(start, n);
         debug!(target: "ps2_core::iop::cdvd", bytes,
             madr = format_args!("{:#x}", self.iop_dma_cdvd.madr),
             "DMA ch3");
@@ -3337,6 +3449,7 @@ impl Bus {
             let len = self.iop_ram.len();
             self.iop_ram[(start + i) % len] = b;
         }
+        self.iop_ram_bulk_written(start, bytes);
         debug!(target: "ps2_core::iop::sio2",
             bytes,
             madr = format_args!("{:#x}", self.iop_dma_sio2out.madr),
@@ -3493,14 +3606,21 @@ impl Bus {
                 );
                 progressed = true;
             }
+            let wrote_from = (ch.recv_addr & 0x1F_FFFC) as usize;
+            let mut wrote = 0usize;
             while ch.recv_left > 0 && !self.sif.fifo1.is_empty() {
                 let w = self.sif.fifo1.pop_front().unwrap();
                 let a = (ch.recv_addr & 0x1F_FFFC) as usize;
                 write_le::<4>(&mut self.iop_ram, a, w as u64);
                 ch.recv_addr = ch.recv_addr.wrapping_add(4);
                 ch.recv_left -= 1;
+                wrote += 4;
                 progressed = true;
             }
+            // The IOP's modules arrive down this channel, so a run that
+            // lands on a page holding translated code drops the cache.
+            self.iop_ram_bulk_written(wrote_from, wrote);
+            let ch = &mut self.iop_dma_sif1;
             if ch.recv_left > 0 {
                 break; // wait for more data
             }
@@ -3692,6 +3812,10 @@ impl Bus {
         self.code_pages.fill(false);
         self.dirty_code_writes.clear();
         self.jit_flush_needed = true;
+        self.iop_code_pages = vec![false; IOP_RAM_SIZE >> 12].into_boxed_slice();
+        self.iop_dirty_code_writes.clear();
+        self.iop_dirty_code_pages.clear();
+        self.iop_jit_flush_needed = true;
     }
 
     pub fn iop_read32(&mut self, vaddr: u32) -> u32 {
@@ -3772,7 +3896,9 @@ impl Bus {
         let addr = vaddr & 0x1FFF_FFFF;
         match addr {
             0x0000_0000..=0x007F_FFFF => {
-                write_le::<N>(&mut self.iop_ram, (addr & 0x1F_FFFF) as usize, v as u64)
+                let off = (addr & 0x1F_FFFF) as usize;
+                write_le::<N>(&mut self.iop_ram, off, v as u64);
+                self.iop_ram_written(off, N);
             }
             0x1F80_0000..=0x1F80_03FF => {
                 write_le::<N>(&mut self.iop_spad, (addr & 0x3FF) as usize, v as u64)

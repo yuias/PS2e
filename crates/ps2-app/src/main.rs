@@ -561,6 +561,12 @@ fn run_headless(
     if run > 0 {
         tracing::info!(compiled, invalidated, run, interp, "recompiler");
     }
+    let (compiled, invalidated, chains, interp) = sys.iop_jit_stats();
+    if chains > 0 {
+        let exits: Vec<String> =
+            sys.iop_jit_exits().iter().map(|(n, c)| format!("{n}={c}")).collect();
+        tracing::info!(compiled, invalidated, chains, interp, exits = exits.join(" "), "IOP recompiler");
+    }
     let (compiled, run, flushes, bails) = sys.vu1_jit_stats();
     if run > 0 {
         tracing::info!(compiled, run, flushes, bails, "VU1 recompiler");

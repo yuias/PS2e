@@ -131,6 +131,10 @@ pub struct Ps2System {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[serde(skip)]
     jit: Option<ee::jit::Jit>,
+    /// IOP recompiler; `None` runs the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[serde(skip)]
+    iop_jit: Option<iop::jit::Jit>,
 }
 
 impl Ps2System {
@@ -176,6 +180,10 @@ impl Ps2System {
             frame_pos: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: Some(ee::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            iop_jit: Some(
+                iop::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?,
+            ),
         };
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         sys.bus.vu1.set_jit(true)?;
@@ -195,6 +203,7 @@ impl Ps2System {
                 self.jit = None;
             }
             self.bus.vu1.set_jit(on)?;
+            self.set_iop_jit(on)?;
             Ok(())
         }
         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -249,6 +258,7 @@ impl Ps2System {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             sys.jit = self.jit.take();
+            sys.iop_jit = self.iop_jit.take();
             // Micro memory came from the file, so nothing translated
             // against the running machine's copy is still valid, and the
             // generation counters on either side say nothing about it.
@@ -279,6 +289,48 @@ impl Ps2System {
             return (j.blocks_compiled, j.blocks_run, j.flushes, j.bails);
         }
         (0, 0, 0, 0)
+    }
+
+    /// Enable or disable the IOP recompiler on its own. The interpreter
+    /// and the recompiler are interchangeable at any instruction boundary,
+    /// which is what the differential test relies on.
+    pub fn set_iop_jit(&mut self, on: bool) -> Result<(), String> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            if on && self.iop_jit.is_none() {
+                self.iop_jit = Some(
+                    iop::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?,
+                );
+            } else if !on {
+                self.iop_jit = None;
+            }
+            Ok(())
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            if on { Err("built without the jit feature".into()) } else { Ok(()) }
+        }
+    }
+
+    /// IOP recompiler counters: (blocks compiled, invalidated, chains run,
+    /// interpreter steps taken by the dispatcher); zeros without one.
+    pub fn iop_jit_stats(&self) -> (u64, u64, u64, u64) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(j) = &self.iop_jit {
+            return (j.blocks_compiled, j.blocks_invalidated, j.chains_run, j.interp_steps);
+        }
+        (0, 0, 0, 0)
+    }
+
+    /// Why IOP chains ended, named (zeros without a recompiler). A
+    /// bring-up measurement: the dispatcher costs a round trip, so what
+    /// sends it there is what is left to win.
+    pub fn iop_jit_exits(&self) -> [(&'static str, u64); 6] {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(j) = &self.iop_jit {
+            return j.exit_counts();
+        }
+        std::array::from_fn(|_| ("", 0))
     }
 
     /// Whether the EE recompiler is active.
@@ -586,18 +638,37 @@ impl Ps2System {
         (to_timer / EE_PER_IOP).min(to_vblank / EE_PER_IOP).min(limit)
     }
 
+    /// One IOP instruction, or a chain of up to `budget` of them through
+    /// the recompiler. Returns how many retired (at least one, never more
+    /// than the budget).
+    #[inline]
+    fn iop_run(&mut self, budget: u64) -> u64 {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.iop_jit.is_some() {
+            let budget = budget.clamp(1, u32::MAX as u64) as u32;
+            let jit = self.iop_jit.as_mut().expect("checked above");
+            return u64::from(jit.run(&mut self.iop, &mut self.bus, budget));
+        }
+        let _ = budget;
+        self.iop.step(&mut self.bus);
+        1
+    }
+
     /// `g` IOP slots, [`EE_PER_IOP`] cycles apart, with nothing else due.
     fn run_iop_groups(&mut self, g: u64) {
         let _guard = prof::scope(prof::Slot::Iop);
-        for _ in 0..g {
+        let mut left = g;
+        while left > 0 {
             self.bus.now = self.cycles;
             // Same idle-loop skip as `machine_cycle`.
+            let mut n = 1;
             if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
                 self.iop.idle = false;
-                self.iop.step(&mut self.bus);
+                n = self.iop_run(left).min(left);
             }
-            self.cycles += EE_PER_IOP;
-            self.frame_pos += EE_PER_IOP;
+            self.cycles += EE_PER_IOP * n;
+            self.frame_pos += EE_PER_IOP * n;
+            left -= n;
         }
         // The batch may end exactly on the frame edge; `machine_cycle`
         // recognises the vblank-end edge by a wrapped position, not by the
@@ -616,13 +687,29 @@ impl Ps2System {
     /// cycle-at-a-time path would have.
     fn run_idle_ee_groups(&mut self, g: u64) {
         let _guard = prof::scope(prof::Slot::Iop);
-        for _ in 0..g {
+        let mut left = g;
+        while left > 0 {
             self.bus.now = self.cycles;
             // Same idle-loop skip as `machine_cycle`.
+            let mut n = 1;
             if !self.iop.idle || self.iop.interrupt_pending(&self.bus) {
                 self.iop.idle = false;
-                self.iop.step(&mut self.bus);
+                let cap = self.ee_wake_cap().min(self.tick_cap());
+                n = self.iop_run(left.min(cap)).min(left);
             }
+            // A chain stands in for `n` groups. None of the tests below
+            // could have answered differently in the ones it skipped: the
+            // chain ends on any access outside IOP RAM, which is the only
+            // way the IOP moves the timer due time or either core's
+            // interrupt lines, and the two caps cover what moves with time
+            // alone — the EE's armed interrupt and the periodic tick, which
+            // this loop re-arms itself. So land on the last of them and
+            // test there.
+            let skipped = n - 1;
+            self.cycles += EE_PER_IOP * skipped;
+            self.frame_pos += EE_PER_IOP * skipped;
+            self.bus.now = self.cycles;
+            left -= n;
             // The IOP can arm an event from inside this batch, and
             // `machine_cycle` would have run the tick in the same cycle it
             // did, so the test cannot be left to the bound alone.
@@ -653,6 +740,31 @@ impl Ps2System {
         // The batch may end exactly on the frame edge; `machine_cycle`
         // recognises the vblank-end edge by a wrapped position.
         self.wrap_frame_pos();
+    }
+
+    /// How many IOP instructions may retire in one chain before the
+    /// periodic tick is due again. [`Ps2System::quiet_iop_groups`] bounds
+    /// the whole batch the same way, but the tick this loop runs re-arms
+    /// [`bus::Bus::timers_due`] inside it, so the bound has to be taken
+    /// again for every chain rather than trusted from before the loop.
+    #[inline]
+    fn tick_cap(&self) -> u64 {
+        let due = self.bus.timers_due.max(self.cycles);
+        let to_tick = due.div_ceil(TIMER_TICK_CYCLES) * TIMER_TICK_CYCLES - self.cycles;
+        to_tick / EE_PER_IOP + 1
+    }
+
+    /// How many IOP instructions may retire in one chain before the
+    /// sleeping EE's wake-up test could change its answer on its own.
+    /// [`bus::Bus::ee_wake_at`] is the only part of it that moves with time
+    /// rather than with an access, and an access ends the chain anyway.
+    #[inline]
+    fn ee_wake_cap(&self) -> u64 {
+        let at = self.bus.ee_wake_at();
+        if at == u64::MAX {
+            return u64::MAX;
+        }
+        at.saturating_sub(self.cycles) / EE_PER_IOP + 1
     }
 
     #[inline]

@@ -11,6 +11,10 @@ use crate::bus::Bus;
 use tracing::{error, trace};
 use serde::{Deserialize, Serialize};
 
+/// IOP dynamic recompiler (x86-64 native builds only).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub mod jit;
+
 const EXC_INTERRUPT: u32 = 0;
 const EXC_SYSCALL: u32 = 8;
 const EXC_BREAK: u32 = 9;
@@ -416,6 +420,33 @@ impl Cpu {
             }
             _ => self.unimplemented("opcode", instr),
         }
+    }
+
+    /// Run `instr` as if fetched at `addr`, delayed load and all: the
+    /// recompiler's fallback for anything it does not translate. Returns
+    /// whether control was diverted (a branch registered or an exception
+    /// taken), which ends the block. `in_delay` marks a branch delay slot,
+    /// so an exception raised there reports the branch as its EPC.
+    pub(crate) fn exec_at(&mut self, bus: &mut Bus, addr: u32, instr: u32, in_delay: bool) -> bool {
+        self.current_pc = addr;
+        self.in_delay = in_delay;
+        self.next_is_delay = false;
+        // `execute` reads pc/next_pc as the interpreter leaves them: pc is
+        // the delay slot of a branch taken here, next_pc its link value.
+        self.pc = addr.wrapping_add(4);
+        self.next_pc = addr.wrapping_add(8);
+        let pending = self.pending_load;
+        self.written_reg = 0;
+        self.execute(instr, bus);
+        if let Some((reg, v)) = pending {
+            if self.pending_load == pending {
+                self.pending_load = None;
+            }
+            if reg != self.written_reg {
+                self.gpr[reg] = v;
+            }
+        }
+        self.next_is_delay || self.pc != addr.wrapping_add(4)
     }
 
     /// lwl/lwr merge with an in-flight load to the same register (hardware
