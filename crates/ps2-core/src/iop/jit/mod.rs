@@ -47,11 +47,45 @@ const ARENA_BYTES: usize = 8 << 20;
 /// and a shorter cap keeps the entry's all-or-nothing budget test from
 /// wasting a large tail when the budget runs low.
 const MAX_BLOCK: u32 = 24;
-/// Direct-mapped lookup entries (indexed by pc >> 2).
-const LOOKUP_ENTRIES: usize = 1 << 16;
-/// Link cells (one per constant-target exit); the cache is flushed when
-/// they run out.
-const LINK_CELLS: usize = 1 << 17;
+/// Direct-mapped lookup entries (indexed by pc >> 2). Each holds its own
+/// pc and entry point, so a hit is one cache line: the dispatcher runs
+/// once per chain, and a chain is only ~16 instructions, so a second
+/// dependent load into the (megabytes-long) block table was over half of
+/// what the recompiler spent outside translated code.
+const LOOKUP_ENTRIES: usize = 1 << 14;
+
+
+/// One direct-mapped lookup slot: a null `entry` is empty.
+#[derive(Clone, Copy)]
+struct Slot {
+    pc: u32,
+    entry: usize,
+}
+
+/// A `jmp rel32` at a block exit: where its displacement field is, and
+/// where the instruction after it starts (displacements are relative to
+/// that). Zero sends control into the slow path that follows.
+#[derive(Clone, Copy)]
+struct Link {
+    field: usize,
+    after: usize,
+}
+
+impl Link {
+    /// Point the jump at `target`, or at the slow path when it is `None`.
+    ///
+    /// # Safety
+    /// `field` must address the displacement of a complete `jmp rel32` in
+    /// the arena, and no thread may be executing that jump.
+    unsafe fn patch(self, target: Option<u64>) {
+        let rel = match target {
+            Some(t) => (t as i64 - self.after as i64) as i32,
+            None => 0,
+        };
+        // SAFETY: the arena is writable and the field is 4 bytes inside it.
+        unsafe { std::ptr::write_unaligned(self.field as *mut i32, rel) };
+    }
+}
 
 struct Block {
     pc: u32,
@@ -60,8 +94,8 @@ struct Block {
     body: u64,
     /// IOP RAM byte range the block was translated from.
     phys: Option<(u32, u32)>,
-    /// Link cells currently pointing at this block's body.
-    incoming: Vec<usize>,
+    /// Jumps currently patched to land in this block's body.
+    incoming: Vec<Link>,
     valid: bool,
 }
 
@@ -69,17 +103,12 @@ pub struct Jit {
     arena: Arena,
     blocks: Vec<Block>,
     by_pc: HashMap<u32, u32>,
-    /// pc >> 2 -> block index + 1 (0 = empty); verified against `blocks`.
-    lookup: Box<[u32]>,
+    /// pc >> 2 -> the block there, or an empty slot.
+    lookup: Box<[Slot]>,
     /// IOP RAM page -> blocks translated from it.
     page_blocks: Vec<Vec<u32>>,
-    /// Link cells: jump targets read by block exits (see `emit::Exits`).
-    cells: Box<[u64]>,
-    /// Each cell's own slow path, restored when its target goes away.
-    cell_slow: Box<[u64]>,
-    cells_used: usize,
-    /// Cells waiting for a block at this pc to be compiled.
-    pending_links: HashMap<u32, Vec<usize>>,
+    /// Jumps waiting for a block at this pc to be compiled.
+    pending_links: HashMap<u32, Vec<Link>>,
     pub blocks_compiled: u64,
     pub blocks_invalidated: u64,
     pub chains_run: u64,
@@ -97,11 +126,8 @@ impl Jit {
             arena: Arena::new(ARENA_BYTES)?,
             blocks: Vec::new(),
             by_pc: HashMap::new(),
-            lookup: vec![0u32; LOOKUP_ENTRIES].into_boxed_slice(),
+            lookup: vec![Slot { pc: 0, entry: 0 }; LOOKUP_ENTRIES].into_boxed_slice(),
             page_blocks: vec![Vec::new(); IOP_RAM_SIZE >> 12],
-            cells: vec![0u64; LINK_CELLS].into_boxed_slice(),
-            cell_slow: vec![0u64; LINK_CELLS].into_boxed_slice(),
-            cells_used: 0,
             pending_links: HashMap::new(),
             blocks_compiled: 0,
             blocks_invalidated: 0,
@@ -142,7 +168,6 @@ impl Jit {
             None => self.compile(pc, bus),
         };
         bus.iop_chain_start = bus.now;
-        bus.iop_chain_budget = budget;
         // SAFETY: `entry` is a complete block in our arena; the pointers are
         // exclusively ours for the call and the block only touches the CPU
         // and bus through the helpers.
@@ -172,13 +197,11 @@ impl Jit {
 
     #[inline]
     fn find(&self, pc: u32) -> Option<Entry> {
-        let slot = ((pc >> 2) as usize) & (LOOKUP_ENTRIES - 1);
-        let idx = self.lookup[slot];
-        if idx != 0 {
-            let b = &self.blocks[idx as usize - 1];
-            if b.valid && b.pc == pc {
-                return Some(b.entry);
-            }
+        let s = self.lookup[slot_of(pc)];
+        if s.entry != 0 && s.pc == pc {
+            // SAFETY: a non-null slot holds the entry of a live block; it
+            // is cleared when that block is invalidated or flushed.
+            return Some(unsafe { std::mem::transmute::<usize, Entry>(s.entry) });
         }
         let &idx = self.by_pc.get(&pc)?;
         let b = &self.blocks[idx as usize];
@@ -188,9 +211,19 @@ impl Jit {
         Some(b.entry)
     }
 
+    /// Forget a block's lookup slot, if it still holds that block.
+    #[inline]
+    fn drop_slot(&mut self, pc: u32) {
+        let s = &mut self.lookup[slot_of(pc)];
+        if s.pc == pc {
+            s.entry = 0;
+        }
+    }
+
     /// Drop the blocks whose code was written: one instruction word for a
     /// store, a whole page for a transfer that landed on one.
     fn invalidate_dirty(&mut self, bus: &mut Bus) {
+        let mut dropped: Vec<u32> = Vec::new();
         for p in std::mem::take(&mut bus.iop_dirty_code_pages) {
             let page = p as usize;
             for &idx in &self.page_blocks[page] {
@@ -202,10 +235,12 @@ impl Jit {
                 self.by_pc.remove(&b.pc);
                 self.blocks_invalidated += 1;
                 let (pc, incoming) = (b.pc, std::mem::take(&mut b.incoming));
-                for &c in &incoming {
-                    self.cells[c] = self.cell_slow[c];
+                for &l in &incoming {
+                    // SAFETY: the arena is ours and no chain is running.
+                    unsafe { l.patch(None) };
                 }
                 self.pending_links.entry(pc).or_default().extend(incoming);
+                dropped.push(pc);
             }
             self.page_blocks[page].clear();
             bus.iop_code_pages[page] = false;
@@ -226,10 +261,12 @@ impl Jit {
                         // Anything linked here goes back to its slow path
                         // and waits for a recompile at this pc.
                         let (pc, incoming) = (b.pc, std::mem::take(&mut b.incoming));
-                        for &c in &incoming {
-                            self.cells[c] = self.cell_slow[c];
+                        for &l in &incoming {
+                            // SAFETY: the arena is ours and no chain is running.
+                            unsafe { l.patch(None) };
                         }
                         self.pending_links.entry(pc).or_default().extend(incoming);
+                        dropped.push(pc);
                     }
                     _ => any_left = true,
                 }
@@ -239,6 +276,9 @@ impl Jit {
                 bus.iop_code_pages[page] = false;
             }
         }
+        for pc in dropped {
+            self.drop_slot(pc);
+        }
     }
 
     /// Drop every block (arena full, a module loaded over one, ...).
@@ -246,27 +286,19 @@ impl Jit {
         self.arena.reset();
         self.blocks.clear();
         self.by_pc.clear();
-        self.lookup.fill(0);
+        self.lookup.fill(Slot { pc: 0, entry: 0 });
         for v in &mut self.page_blocks {
             v.clear();
         }
         bus.iop_code_pages.fill(false);
         bus.iop_dirty_code_writes.clear();
         bus.iop_dirty_code_pages.clear();
-        self.cells_used = 0;
         self.pending_links.clear();
-    }
-
-    /// Allocate a link cell; returns (index, address).
-    fn link_cell(&mut self) -> (usize, u64) {
-        let idx = self.cells_used;
-        self.cells_used += 1;
-        (idx, &self.cells[idx] as *const u64 as u64)
     }
 
     fn compile(&mut self, pc: u32, bus: &mut Bus) -> Entry {
         // Generous upper bound per block; reset the arena rather than fail.
-        if self.arena.remaining() < 16 * 1024 || self.cells_used + 64 > LINK_CELLS {
+        if self.arena.remaining() < 16 * 1024 {
             self.flush(bus);
         }
         // The entry test is all-or-nothing, so the block's own length has to
@@ -282,7 +314,7 @@ impl Jit {
         dynasm!(ops
             ; .arch x64
             ; lea eax, [r15 + len as i32]
-            ; cmp eax, DWORD [r12 + emit::chain_budget_off()]
+            ; cmp eax, ebp
             ; ja =>budget_exit
         );
         let mut exits = emit::Exits { jit: self, links: Vec::new() };
@@ -443,33 +475,39 @@ impl Jit {
         }
         self.blocks.push(Block { pc, entry, body, phys, incoming: Vec::new(), valid: true });
         self.by_pc.insert(pc, idx);
-        self.lookup[((pc >> 2) as usize) & (LOOKUP_ENTRIES - 1)] = idx + 1;
+        self.lookup[slot_of(pc)] = Slot { pc, entry: entry as usize };
         self.blocks_compiled += 1;
 
         // Wire this block's exits to compiled targets (or park them), and
-        // point exits parked on this pc at the new body.
-        for (cell, target, slow_off) in links {
-            let slow = (base + slow_off) as u64;
-            self.cell_slow[cell] = slow;
+        // point exits parked on this pc at the new body. A parked jump has
+        // a zero displacement and falls into the slow path behind it, so
+        // nothing has to be written for that case.
+        for (field, after, target) in links {
+            let link = Link { field: base + field, after: base + after };
             match self.by_pc.get(&target).map(|&i| i as usize) {
                 Some(t) if self.blocks[t].valid => {
-                    self.cells[cell] = self.blocks[t].body;
-                    self.blocks[t].incoming.push(cell);
+                    // SAFETY: the arena is ours and no chain is running.
+                    unsafe { link.patch(Some(self.blocks[t].body)) };
+                    self.blocks[t].incoming.push(link);
                 }
-                _ => {
-                    self.cells[cell] = slow;
-                    self.pending_links.entry(target).or_default().push(cell);
-                }
+                _ => self.pending_links.entry(target).or_default().push(link),
             }
         }
         if let Some(waiting) = self.pending_links.remove(&pc) {
-            for cell in waiting {
-                self.cells[cell] = body;
-                self.blocks[idx as usize].incoming.push(cell);
+            for link in waiting {
+                // SAFETY: as above.
+                unsafe { link.patch(Some(body)) };
+                self.blocks[idx as usize].incoming.push(link);
             }
         }
         entry
     }
+}
+
+/// Direct-mapped lookup slot for a pc.
+#[inline]
+fn slot_of(pc: u32) -> usize {
+    ((pc >> 2) as usize) & (LOOKUP_ENTRIES - 1)
 }
 
 /// IOP RAM offset a virtual address reads its code from, if RAM at all.
@@ -542,9 +580,11 @@ fn is_idle_loop(addr: u32, instr: u32, delay_slot: u32) -> bool {
 
 /// Save callee-saved registers, keep the stack 16-aligned with 32 bytes of
 /// shadow space (Windows needs it, SysV does not mind); rbx = cpu, r12 =
-/// bus, r15 = instructions retired so far. The budget goes to
-/// `Bus::iop_chain_budget`, which every block entry tests its own length
-/// against.
+/// bus, r15 = instructions retired so far, ebp = the chain's budget, which
+/// every block entry tests its own length against. Nothing can cut that
+/// budget once the chain is running — everything that could schedule an
+/// event ends the block instead — so it lives in a register rather than
+/// being re-read from the bus, which is worth 7% on its own.
 fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
     dynasm!(ops
         ; .arch x64
@@ -561,14 +601,14 @@ fn emit_prologue(ops: &mut VecAssembler<X64Relocation>) {
         ; .arch x64
         ; mov rbx, rcx
         ; mov r12, rdx
-        ; mov DWORD [r12 + emit::chain_budget_off()], r8d
+        ; mov ebp, r8d
     );
     #[cfg(not(windows))]
     dynasm!(ops
         ; .arch x64
         ; mov rbx, rdi
         ; mov r12, rsi
-        ; mov DWORD [r12 + emit::chain_budget_off()], edx
+        ; mov ebp, edx
     );
     dynasm!(ops ; .arch x64 ; xor r15d, r15d);
 }

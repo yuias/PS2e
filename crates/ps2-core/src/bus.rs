@@ -1522,8 +1522,6 @@ pub struct Bus {
     /// access made inside the chain. Scratch: not part of machine state.
     #[serde(skip)]
     pub(crate) iop_chain_start: u64,
-    #[serde(skip)]
-    pub(crate) iop_chain_budget: u32,
     /// Chains the IOP recompiler ended because an access left IOP RAM.
     /// Counted here because only the memory helpers see one.
     #[serde(skip)]
@@ -1624,7 +1622,6 @@ impl Bus {
             iop_dirty_code_pages: Vec::new(),
             iop_jit_flush_needed: false,
             iop_chain_start: 0,
-            iop_chain_budget: 0,
             iop_mmio_exits: 0,
             iop_ram_ptr: 0,
             iop_code_pages_ptr: 0,

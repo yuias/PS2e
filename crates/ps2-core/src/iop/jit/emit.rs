@@ -4,8 +4,8 @@
 //! an instruction is a load, an ALU op and a store. Fixed roles: r12 =
 //! &Bus, r13d = a branch's condition or its register target, r14d = the
 //! value of the load in flight, r15d = instructions the chain retired
-//! before this block. rax, rcx, rdx, r8-r11 are scratch (a helper call
-//! clobbers them).
+//! before this block, ebp the chain's budget. rax, rcx, rdx, r8-r11 are
+//! scratch (a helper call clobbers them).
 //!
 //! The architectural load delay is resolved while translating: a load
 //! leaves its result in r14d and the *next* instruction commits it to the
@@ -54,9 +54,6 @@ pub fn idle_off() -> i32 {
 }
 fn next_is_delay_off() -> i32 {
     offset_of!(Cpu, next_is_delay) as i32
-}
-pub fn chain_budget_off() -> i32 {
-    offset_of!(Bus, iop_chain_budget) as i32
 }
 fn chain_start_off() -> i32 {
     offset_of!(Bus, iop_chain_start) as i32
@@ -275,23 +272,22 @@ pub fn emit_now(ops: &mut Ops, local: u32) {
     );
 }
 
-/// eax = the IOP RAM offset r10d addresses, or jump to `slow`. IOP RAM is
-/// a flat 2 MiB mirrored through the low 8 MiB, so the window test and the
-/// offset are one mask each; the second bound keeps an unaligned access at
-/// the very top of the mirror from running off the end, which `read_le`
-/// would have panicked on.
+/// eax = the IOP RAM offset r10d addresses, or jump to `slow`.
+///
+/// One mask and one compare answer three questions at once: the address is
+/// physical RAM, the whole access fits inside it (an unaligned word at the
+/// very top would otherwise run off the end), and the masked address *is*
+/// the offset. That last one costs the 2-8 MiB mirror, which takes the
+/// slow path — software addresses the 2 MiB through KUSEG and KSEG0, and
+/// the helper handles the mirror correctly anyway.
 fn ram_offset(ops: &mut Ops, bytes: u32, slow: DynamicLabel) {
     dynasm!(ops
         ; .arch x64
         ; mov eax, r10d
         ; and eax, 0x1FFF_FFFF
-        ; cmp eax, 0x0080_0000
-        ; jae =>slow
-        ; and eax, 0x1F_FFFF
+        ; cmp eax, (0x20_0000 - bytes) as i32
+        ; ja =>slow
     );
-    if bytes > 1 {
-        dynasm!(ops ; .arch x64 ; cmp eax, (0x20_0000 - bytes) as i32 ; ja =>slow);
-    }
 }
 
 /// Record the exit an out-of-RAM access jumps to, and test for it. rax
@@ -652,13 +648,18 @@ pub fn emit(ops: &mut Ops, st: &mut State, addr: u32, instr: u32, delay: bool) -
 // --- exits ----------------------------------------------------------------
 
 /// Exit sequences. Every exit adds the block's retired count to r15d first.
-/// A constant target goes through a link cell: an indirect jump whose cell
-/// holds either the target block's body, once compiled, or this block's own
-/// slow path, which stores pc and returns to the dispatcher.
+///
+/// A constant target leaves through a `jmp rel32` that is rewritten in
+/// place: zero while the target has no block, so control falls into the
+/// slow path immediately after it, and the target's body once one exists.
+/// A direct jump is what makes linking worth having at all — an indirect
+/// one through a cell is not predicted, and blocks here are five
+/// instructions long, so the exit is a fifth of the work.
 pub struct Exits<'a> {
     pub jit: &'a mut super::Jit,
-    /// (cell index, target pc, offset of the slow path in this block).
-    pub links: Vec<(usize, u32, usize)>,
+    /// One per constant-target exit: (offset of the rel32 field, offset of
+    /// the instruction after the jump, target pc).
+    pub links: Vec<(usize, usize, u32)>,
 }
 
 impl Exits<'_> {
@@ -666,14 +667,14 @@ impl Exits<'_> {
     /// jump to the target block once one exists. `last` is the address of
     /// the instruction that retired last.
     pub fn to(&mut self, ops: &mut Ops, target: u32, count: u32, last: u32) {
-        let (idx, cell) = self.jit.link_cell();
         dynasm!(ops
             ; .arch x64
             ; add r15d, count as i32
-            ; mov rax, QWORD cell as i64
-            ; jmp QWORD [rax]
+            ; .bytes [0xE9u8]
+            ; .i32 0
         );
-        self.links.push((idx, target, ops.offset().0));
+        let after = ops.offset().0;
+        self.links.push((after - 4, after, target));
         store_pc(ops, target, last);
         dynasm!(ops ; .arch x64 ; mov eax, r15d ; jmp ->epilogue);
     }
