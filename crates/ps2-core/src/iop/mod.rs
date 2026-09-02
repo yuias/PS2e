@@ -8,7 +8,7 @@
 //! COP0 PRId (< 0x59 selects the IOP path).
 
 use crate::bus::Bus;
-use tracing::{error, trace};
+use tracing::{trace, warn};
 use serde::{Deserialize, Serialize};
 
 /// IOP dynamic recompiler (x86-64 native builds only).
@@ -18,6 +18,7 @@ pub mod jit;
 const EXC_INTERRUPT: u32 = 0;
 const EXC_SYSCALL: u32 = 8;
 const EXC_BREAK: u32 = 9;
+const EXC_RESERVED_INSTR: u32 = 10;
 
 const STATUS: usize = 12;
 const CAUSE: usize = 13;
@@ -140,17 +141,19 @@ impl Cpu {
         self.next_is_delay = false;
     }
 
-    fn unimplemented(&self, kind: &str, instr: u32) -> ! {
-        error!(
+    /// Raise a Reserved Instruction exception, as hardware does for any
+    /// encoding the CPU does not decode. Guest code reaches this both from
+    /// genuinely unimplemented opcodes and from its own bad jumps, so the
+    /// guest's exception handler must get the chance to report it rather
+    /// than the emulator dying and taking that instrument away.
+    fn unimplemented(&mut self, kind: &str, instr: u32) {
+        warn!(
             target: "ps2_core::iop::cpu",
             pc = format_args!("{:#010x}", self.current_pc),
             instr = format_args!("{instr:#010x}"),
-            "unimplemented {kind}"
+            "unimplemented {kind}, raising Reserved Instruction"
         );
-        panic!(
-            "unimplemented IOP {kind}: instr {instr:#010x} at pc {:#010x}",
-            self.current_pc
-        );
+        self.exception(EXC_RESERVED_INSTR);
     }
 
     /// True when stores must be swallowed (cache isolation during cache init).
@@ -461,6 +464,7 @@ impl Cpu {
 
 #[cfg(test)]
 mod tests {
+    use super::{CAUSE, EPC};
     use crate::Ps2System;
     use crate::bus::BIOS_SIZE;
 
@@ -478,6 +482,36 @@ mod tests {
             let iop = &mut sys.iop;
             iop.step(&mut sys.bus);
         }
+    }
+
+    /// An encoding the interpreter does not decode must reach the guest's
+    /// own handler; a relocation bug landing here used to kill the process
+    /// and with it the only thing that could report where it happened.
+    #[test]
+    fn unimplemented_instruction_raises_reserved_instruction() {
+        // SPECIAL funct 0x2C: unassigned on the R3000A.
+        let mut sys = iop_system(&[0x0000_40EC]);
+        step_iop(&mut sys, 1);
+        assert_eq!((sys.iop.cop0[CAUSE] >> 2) & 0x1F, 10);
+        assert_eq!(sys.iop.cop0[CAUSE] & (1 << 31), 0);
+        assert_eq!(sys.iop.cop0[EPC], 0xBFC0_0000);
+        // BEV is set out of reset, so the ROM vector takes it.
+        assert_eq!(sys.iop.pc, 0xBFC0_0180);
+    }
+
+    /// In a delay slot the exception reports the branch, with CAUSE's BD
+    /// bit set, so the handler can re-execute it.
+    #[test]
+    fn reserved_instruction_in_delay_slot_reports_the_branch() {
+        let mut sys = iop_system(&[
+            0x1000_0004, // beq $0, $0, +4
+            0x0000_40EC, // (delay slot) unassigned SPECIAL
+        ]);
+        step_iop(&mut sys, 2);
+        assert_eq!((sys.iop.cop0[CAUSE] >> 2) & 0x1F, 10);
+        assert_ne!(sys.iop.cop0[CAUSE] & (1 << 31), 0);
+        assert_eq!(sys.iop.cop0[EPC], 0xBFC0_0000);
+        assert_eq!(sys.iop.pc, 0xBFC0_0180);
     }
 
     #[test]

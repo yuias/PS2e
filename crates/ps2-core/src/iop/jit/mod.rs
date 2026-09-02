@@ -802,6 +802,19 @@ mod tests {
         assert_eq!(a.iop.pc, 0xBFC0_0008, "the delay slot must not have run");
     }
 
+    /// An encoding neither core decodes ends the block and takes the
+    /// Reserved Instruction exception, landing both cores on the vector.
+    #[test]
+    fn an_unassigned_encoding_takes_the_reserved_instruction_exception() {
+        same(
+            &[
+                0x2408_0007, // addiu $t0, $0, 7
+                0x0000_40EC, // unassigned SPECIAL
+            ],
+            2,
+        );
+    }
+
     #[test]
     fn multiply_and_divide_fall_back_without_ending_the_block() {
         same(
