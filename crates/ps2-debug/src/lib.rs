@@ -58,6 +58,14 @@ fn canonical(t: Target, addr: u32) -> u32 {
     }
 }
 
+/// Enter a due interrupt handler before the pc is examined. `step` takes the
+/// exception and runs the handler's first instruction in the same call, so
+/// without this the vector entry is retired by a step whose pc check saw the
+/// interrupted instruction — an accepted breakpoint there would never fire.
+fn take_pending_interrupt(sys: &mut Ps2System, t: Target) -> bool {
+    sys.take_pending_interrupt(t == Target::Iop)
+}
+
 /// Side-effect-free byte read on the target's own bus view.
 fn peek(sys: &mut Ps2System, t: Target, addr: u32) -> Option<u8> {
     match t {
@@ -139,22 +147,30 @@ impl DebugServer {
         while sys.cycles < end {
             if let Some(stub) = &mut self.ee
                 && stub.client.is_some()
-                && !std::mem::take(&mut stub.resume_skip)
-                && stub.breakpoints.contains(&ee_canonical(sys.ee.pc))
             {
-                stub.stop(b"T05thread:01;");
-                return;
+                // A resume skips the pc it resumes from; a handler entered
+                // on the way there is a new pc, and must still be checked.
+                let entered = take_pending_interrupt(sys, Target::Ee);
+                if !(std::mem::take(&mut stub.resume_skip) && !entered)
+                    && stub.breakpoints.contains(&ee_canonical(sys.ee.pc))
+                {
+                    stub.stop(b"T05thread:01;");
+                    return;
+                }
             }
             // The IOP only executes on every 8th EE cycle; check its
             // breakpoints (and consume its resume_skip) just before those.
             if sys.cycles.is_multiple_of(EE_PER_IOP)
                 && let Some(stub) = &mut self.iop
                 && stub.client.is_some()
-                && !std::mem::take(&mut stub.resume_skip)
-                && stub.breakpoints.contains(&iop_canonical(sys.iop.pc))
             {
-                stub.stop(b"T05thread:01;");
-                return;
+                let entered = take_pending_interrupt(sys, Target::Iop);
+                if !(std::mem::take(&mut stub.resume_skip) && !entered)
+                    && stub.breakpoints.contains(&iop_canonical(sys.iop.pc))
+                {
+                    stub.stop(b"T05thread:01;");
+                    return;
+                }
             }
             sys.step();
             if let Some(stub) = &mut self.ee
@@ -304,6 +320,10 @@ impl Stub {
     /// Execute exactly one instruction of this stub's core. For the IOP that
     /// means running the interleave until its next 1-of-8 slot.
     fn step_target(&mut self, sys: &mut Ps2System) {
+        // Entering a handler is a step of its own, as it is on hardware.
+        if take_pending_interrupt(sys, self.target) {
+            return;
+        }
         match self.target {
             Target::Ee => sys.step(),
             Target::Iop => loop {

@@ -171,19 +171,37 @@ impl Cpu {
             && bus.iop_irq_pending()
     }
 
-    pub fn step(&mut self, bus: &mut Bus) {
-        if self.interrupt_pending(bus) {
-            // A load issued before the interrupt still writes back: the
-            // handler's first instruction sees the loaded value, as on the
-            // R3000, rather than the stale register.
-            if let Some((reg, v)) = self.pending_load.take() {
-                self.gpr[reg] = v;
-            }
-            self.cop0[CAUSE] = (self.cop0[CAUSE] & !0xFF) | (1 << 10);
-            self.in_delay = self.next_is_delay;
-            self.current_pc = self.pc;
-            self.exception(EXC_INTERRUPT);
+    /// Enter the interrupt handler if one is due, leaving `pc` on its first
+    /// instruction.
+    #[inline]
+    fn take_interrupt(&mut self, bus: &mut Bus) -> bool {
+        if !self.interrupt_pending(bus) {
+            return false;
         }
+        // A load issued before the interrupt still writes back: the
+        // handler's first instruction sees the loaded value, as on the
+        // R3000, rather than the stale register.
+        if let Some((reg, v)) = self.pending_load.take() {
+            self.gpr[reg] = v;
+        }
+        self.cop0[CAUSE] = (self.cop0[CAUSE] & !0xFF) | (1 << 10);
+        self.in_delay = self.next_is_delay;
+        self.current_pc = self.pc;
+        self.exception(EXC_INTERRUPT);
+        true
+    }
+
+    /// Take a pending interrupt without executing anything, for a debugger
+    /// that checks `pc` between steps. [`Cpu::step`] takes the same
+    /// exception and then runs the handler's first instruction in that one
+    /// call, which puts the vector entry out of reach of a breakpoint.
+    /// An idle IOP is left alone: it is woken by the machine, not here.
+    pub fn take_pending_interrupt(&mut self, bus: &mut Bus) -> bool {
+        !self.idle && self.take_interrupt(bus)
+    }
+
+    pub fn step(&mut self, bus: &mut Bus) {
+        self.take_interrupt(bus);
         self.current_pc = self.pc;
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;

@@ -211,6 +211,28 @@ impl Cpu {
             .interrupt_pending(bus.ee_int0_pending(), bus.ee_int1_pending())
     }
 
+    /// Enter the interrupt handler if one is due, leaving `pc` on its first
+    /// instruction.
+    #[inline]
+    fn take_interrupt(&mut self, bus: &mut Bus) -> bool {
+        if !self.interrupt_pending(bus) {
+            return false;
+        }
+        self.current_pc = self.pc;
+        self.in_delay = self.next_is_delay;
+        self.exception(EXC_INTERRUPT);
+        true
+    }
+
+    /// Take a pending interrupt without executing anything, for a debugger
+    /// that checks `pc` between steps. [`Cpu::step`] takes the same
+    /// exception and then runs the handler's first instruction in that one
+    /// call, which puts the vector entry out of reach of a breakpoint.
+    /// An idle EE is left alone: it is woken by the machine, not here.
+    pub fn take_pending_interrupt(&mut self, bus: &mut Bus) -> bool {
+        !self.idle && self.take_interrupt(bus)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) {
         debug_assert_eq!(self.gpr[0], [0, 0]);
         // Sampled phase timing for the profile report (every 64th step).
@@ -219,11 +241,7 @@ impl Cpu {
         if self.pc == 0 {
             panic!("EE jumped to null (previous pc {:#010x})", self.current_pc);
         }
-        if self.interrupt_pending(bus) {
-            self.current_pc = self.pc;
-            self.in_delay = self.next_is_delay;
-            self.exception(EXC_INTERRUPT);
-        }
+        self.take_interrupt(bus);
         self.current_pc = self.pc;
         self.in_delay = self.next_is_delay;
         self.next_is_delay = false;

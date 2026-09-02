@@ -345,6 +345,21 @@ impl Ps2System {
         }
     }
 
+    /// Enter a due interrupt handler on either core without executing an
+    /// instruction, leaving `pc` on the handler's first one.
+    ///
+    /// For a debugger that examines `pc` between steps: [`Ps2System::step`]
+    /// takes the same exception and then runs that first instruction inside
+    /// the same call, so a breakpoint on a vector would never be seen.
+    pub fn take_pending_interrupt(&mut self, iop: bool) -> bool {
+        self.bus.now = self.cycles;
+        if iop {
+            self.iop.take_pending_interrupt(&mut self.bus)
+        } else {
+            self.ee.take_pending_interrupt(&mut self.bus)
+        }
+    }
+
     /// Execute one EE instruction, stepping the IOP at the 8:1 clock ratio.
     pub fn step(&mut self) {
         self.bus.now = self.cycles;
