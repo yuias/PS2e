@@ -38,11 +38,20 @@ impl Session {
     /// Plant `code` at the reset vector and attach a client to the EE stub.
     /// `code` is `(byte offset from 0xBFC00000, instruction)` pairs.
     fn new(code: &[(usize, u32)]) -> Self {
+        Session::with_ram(code, &[])
+    }
+
+    /// As [`Session::new`], plus `ram` planted at absolute EE addresses
+    /// before the client attaches.
+    fn with_ram(code: &[(usize, u32)], ram: &[(u32, u32)]) -> Self {
         let mut bios = vec![0u8; BIOS_SIZE];
         for &(off, w) in code {
             bios[off..off + 4].copy_from_slice(&w.to_le_bytes());
         }
-        let sys = Ps2System::new(bios).unwrap();
+        let mut sys = Ps2System::new(bios).unwrap();
+        for &(addr, w) in ram {
+            sys.bus.write32(addr, w);
+        }
         let dbg = DebugServer::bind(Some(0), None).unwrap();
         let port = dbg.ee_port().unwrap();
         let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -326,4 +335,109 @@ fn a_single_step_lands_on_the_vector() {
     assert_eq!(s.reg(16), 0, "$s0 shows 0xBFC00400 already executed");
     assert_eq!(s.step_to_stop(), RESET + 0x404);
     assert_eq!(s.reg(16), 1, "$s0 shows 0xBFC00400 was skipped");
+}
+
+// --- a caller's report: an entry in RAM that never stopped -----------------
+
+/// Entry stub in ROM: set a stack pointer and call into RAM.
+const CALL_INTO_RAM: &[(usize, u32)] = &[
+    (0x00, 0x3C1D_0100), // lui   $sp, 0x0100      -- 16 MiB into RAM
+    (0x04, 0x3C08_0018), // lui   $t0, 0x0018
+    (0x08, 0x3508_1078), // ori   $t0, $t0, 0x1078
+    (0x0c, 0x0100_F809), // jalr  $ra, $t0         -- into LOAD_MODULE
+    (0x10, 0x3409_0001), // ori   $t1, $0, 1       -- delay slot
+];
+
+/// The words a caller reported as breakpointed-but-never-stopped, at the
+/// address they reported them at. `0x00181078..0x00181094` are verbatim from
+/// their RAM dump -- a prologue of seven back-to-back 64-bit stores, the
+/// shape [`PROGRAM`] does not contain -- and the rest follows their
+/// disassembly to the second call. `$2` is left non-negative so the `bltz`
+/// falls through, as it did on their run.
+const LOAD_MODULE: &[(u32, u32)] = &[
+    (0x0018_1078, 0x27BD_FF70), // addiu $sp, $sp, -0x90   -- the entry that never stopped
+    (0x0018_107c, 0xFFB6_0070), // sd    $22, 0x70($sp)
+    (0x0018_1080, 0xFFB3_0040), // sd    $19, 0x40($sp)
+    (0x0018_1084, 0x00E0_B02D), // move  $22, $7
+    (0x0018_1088, 0xFFB1_0020), // sd    $17, 0x20($sp)
+    (0x0018_108c, 0x0080_982D), // move  $19, $4
+    (0x0018_1090, 0xFFB0_0010), // sd    $16, 0x10($sp)
+    (0x0018_1094, 0x00A0_882D), // move  $17, $5
+    (0x0018_1098, 0xFFBF_0080), // sd    $ra, 0x80($sp)
+    (0x0018_109c, 0x00C0_802D), // move  $16, $6
+    (0x0018_10a0, 0xFFB5_0060), // sd    $21, 0x60($sp)
+    (0x0018_10a4, 0xFFB4_0050), // sd    $20, 0x50($sp)
+    (0x0018_10a8, 0x0C06_03AC), // jal   0x00180eb0
+    (0x0018_10ac, 0xFFB2_0030), // sd    $18, 0x30($sp)   -- delay slot
+    (0x0018_10b0, 0x0440_0069), // bltz  $2, 0x00181258   -- not taken
+    (0x0018_10b4, 0x3C02_FFFF), // lui   $2, 0xffff       -- delay slot
+    (0x0018_10b8, 0x0C06_03EC), // jal   0x00180fb0       -- the call that stopped 12x
+    (0x0018_10bc, 0x0000_0000), // nop                    -- delay slot
+    // Terminal loop, with a non-nop delay slot so the idle-loop check does
+    // not park the EE.
+    (0x0018_10c0, 0x1000_FFFF), // beq   $0, $0, -1
+    (0x0018_10c4, 0x3413_000C), // ori   $s3, $0, 12      -- delay slot
+    // Callee at 0x00180eb0: returns a non-negative $2.
+    (0x0018_0eb0, 0x03E0_0008), // jr    $ra
+    (0x0018_0eb4, 0x3402_0001), // ori   $2, $0, 1        -- delay slot
+    // Callee at 0x00180fb0, the one their breakpoint did fire on.
+    (0x0018_0fb0, 0x27BD_FFB0), // addiu $sp, $sp, -0x50
+    (0x0018_0fb4, 0x03E0_0008), // jr    $ra
+    (0x0018_0fb8, 0x27BD_0050), // addiu $sp, $sp, 0x50   -- delay slot
+];
+
+/// Their table shows the entry at `0x00181078` and the three words after it
+/// never stopping while the callee at `0x00180fb0` stopped every time. Run
+/// their code at their addresses and breakpoint every word of it.
+#[test]
+fn a_reported_ram_prologue_stops_at_every_word() {
+    let mut s = Session::with_ram(CALL_INTO_RAM, LOAD_MODULE);
+    for &(addr, _) in LOAD_MODULE {
+        s.set_breakpoint(addr);
+    }
+
+    let expected: Vec<u32> = vec![
+        0x0018_1078,
+        0x0018_107c,
+        0x0018_1080,
+        0x0018_1084,
+        0x0018_1088,
+        0x0018_108c,
+        0x0018_1090,
+        0x0018_1094,
+        0x0018_1098,
+        0x0018_109c,
+        0x0018_10a0,
+        0x0018_10a4,
+        0x0018_10a8,
+        0x0018_10ac,
+        0x0018_0eb0,
+        0x0018_0eb4,
+        0x0018_10b0,
+        0x0018_10b4,
+        0x0018_10b8,
+        0x0018_10bc,
+        0x0018_0fb0,
+        0x0018_0fb4,
+        0x0018_0fb8,
+        0x0018_10c0,
+        0x0018_10c4,
+    ];
+
+    let mut seen = Vec::new();
+    for _ in 0..expected.len() {
+        seen.push(s.continue_to_stop());
+    }
+
+    let missing: Vec<String> = LOAD_MODULE
+        .iter()
+        .map(|&(a, _)| a)
+        .filter(|a| !seen.contains(a))
+        .map(|a| format!("{a:#010x}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "breakpoints never fired at {missing:?}; observed stops: {seen:#010x?}"
+    );
+    assert_eq!(seen, expected, "stop order does not match execution order");
 }
