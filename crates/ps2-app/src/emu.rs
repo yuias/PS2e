@@ -547,9 +547,11 @@ impl Worker {
     }
 
     /// Stream kernel TTY output to stdout (same as the headless path) and
-    /// accumulate it for the UI panel, capped to [`TTY_CAP`].
+    /// accumulate it for the UI panel, capped to [`TTY_CAP`]. The IOP
+    /// console shares the stream: both are the machine talking.
     fn flush_tty(&mut self) {
-        let tty = self.sys.take_tty();
+        let mut tty = self.sys.take_tty();
+        tty.push_str(&self.sys.take_iop_tty());
         if tty.is_empty() {
             return;
         }

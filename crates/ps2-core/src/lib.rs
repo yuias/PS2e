@@ -803,6 +803,13 @@ impl Ps2System {
         core::mem::take(&mut self.bus.tty_buffer)
     }
 
+    /// Drain IOP console output captured since the last call. A guest IOP
+    /// kernel's `Kprintf` hook has to write the bytes there; the reference
+    /// kernel leaves the hook null, so this is empty unless one is installed.
+    pub fn take_iop_tty(&mut self) -> String {
+        core::mem::take(&mut self.bus.iop_tty_buffer)
+    }
+
     /// Current display output as RGBA8: (width, height, pixels). Waits for
     /// the renderer to catch up with everything written so far.
     pub fn framebuffer(&mut self) -> gs::Frame {

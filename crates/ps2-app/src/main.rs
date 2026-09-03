@@ -622,7 +622,8 @@ fn run_headless(
 }
 
 fn flush_tty(stdout: &std::io::Stdout, sys: &mut Ps2System) {
-    let tty = sys.take_tty();
+    let mut tty = sys.take_tty();
+    tty.push_str(&sys.take_iop_tty());
     if !tty.is_empty() {
         let mut out = stdout.lock();
         let _ = out.write_all(tty.as_bytes());

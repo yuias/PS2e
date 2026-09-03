@@ -1479,6 +1479,17 @@ pub struct Bus {
     pub tty_buffer: String,
     /// Current TTY line, flushed to the log on '\n'.
     tty_line: String,
+    /// IOP console output captured from 0x1F80380C (observation only, so
+    /// it stays out of save states).
+    #[serde(skip)]
+    pub iop_tty_buffer: String,
+    /// Current IOP console line, flushed to the log on '\n' or '\r'.
+    #[serde(skip)]
+    iop_tty_line: String,
+    /// A '\r' just ended a line, so an immediately following '\n' is not a
+    /// second line break.
+    #[serde(skip)]
+    iop_tty_cr: bool,
     /// RDRAM init handshake state (MCH_RICM/MCH_DRD).
     rdram_sdevid: u32,
     /// Unmapped addresses already reported, to keep the log readable.
@@ -1610,6 +1621,9 @@ impl Bus {
             now: 0,
             tty_buffer: String::new(),
             tty_line: String::new(),
+            iop_tty_buffer: String::new(),
+            iop_tty_line: String::new(),
+            iop_tty_cr: false,
             rdram_sdevid: 0,
             warned_unmapped: HashSet::new(),
             ee_tlb: [(0, 0, 0, 0); 48],
@@ -4190,6 +4204,10 @@ impl Bus {
                 self.iop_dicr2 =
                     (v & 0x00FF_FFFF) | (self.iop_dicr2 & !(v & 0x7F00_0000) & 0x7F00_0000);
             }
+            // IOP console: the address PCSX2 decodes as the IOP's STDOUT.
+            // A guest kernel's Kprintf hook writes its bytes here; nothing
+            // on the machine reads them back.
+            0x1F80_380C => self.iop_tty_push(v as u8),
             // POST: boot progress byte from the IOP BIOS.
             0x1F80_2070 => {
                 debug!(target: "ps2_core::iop::bus", stage = format_args!("{:#04x}", v as u8), "POST");
@@ -4210,6 +4228,27 @@ impl Bus {
             self.tty_line.push(c);
         }
         self.tty_buffer.push(c);
+    }
+
+    /// IOP console byte. Modules end a line with either '\n' or '\r', so
+    /// both flush and a "\r\n" pair counts once.
+    fn iop_tty_push(&mut self, byte: u8) {
+        let c = byte as char;
+        let after_cr = self.iop_tty_cr;
+        self.iop_tty_cr = c == '\r';
+        if c == '\n' && after_cr {
+            return;
+        }
+        if c == '\n' || c == '\r' {
+            debug!(target: "ps2_core::iop::tty", "{}", self.iop_tty_line);
+            self.iop_tty_line.clear();
+            self.iop_tty_buffer.push('\n');
+        } else {
+            if byte.is_ascii() && !c.is_control() {
+                self.iop_tty_line.push(c);
+            }
+            self.iop_tty_buffer.push(c);
+        }
     }
 }
 
@@ -4355,6 +4394,15 @@ mod tests {
             b.write8(0x1000_F180, *c);
         }
         assert_eq!(b.tty_buffer, "hi\n");
+    }
+
+    #[test]
+    fn iop_tty_capture() {
+        let mut b = bus();
+        for c in b"hi\r\nyo\n" {
+            b.iop_write8(0x1F80_380C, *c);
+        }
+        assert_eq!(b.iop_tty_buffer, "hi\nyo\n");
     }
 
     #[test]
