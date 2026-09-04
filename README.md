@@ -144,7 +144,7 @@ to run, which is what changes get checked against.
 | `--dump <dir>` | EE and IOP RAM dumps after the run |
 | `--memcard <p>` | Card image to load and persist |
 | `--log <filter>` | Tracing filter, e.g. `info,ps2_core::tty=debug` |
-| `--no-jit` | Interpret the EE instead of recompiling it |
+| `--no-jit` | Interpret EE, VU1 and IOP instead of recompiling them |
 | `--gs-inline` | Render on the emulation thread, no GS worker |
 | `--internal-2x` | Render internally at 2x |
 | `--region <r>` | Video timing until `SetGsCrt`, `ntsc` (default) or `pal` |

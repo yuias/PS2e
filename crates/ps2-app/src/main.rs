@@ -207,7 +207,7 @@ fn parse_args() -> Result<Args, String> {
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
                      --gs-inline      render on the emulation thread (no GS worker)\n\
-                     --no-jit         interpret the EE instead of recompiling it\n\
+                     --no-jit         interpret EE, VU1 and IOP instead of recompiling\n\
                      --internal-2x    render internally at 2x (sharper 3D)\n\
                      --region         video timing until SetGsCrt, 'ntsc' (default) or 'pal'\n\
                      --press          hold a pad button, <button>@<cycle>[-<cycle>] (headless)\n\
