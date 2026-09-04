@@ -3672,10 +3672,16 @@ impl Bus {
                     0
                 };
                 if cid & 0x8000_0000 != 0 {
-                    let payload: Vec<u32> = (0..6)
+                    // psize counts the header, so a header-only packet has no
+                    // payload at all; a fixed six words there would print
+                    // whatever the previous packet left in the buffer.
+                    let words = (((hdr & 0xFF) as usize).saturating_sub(16) / 4).min(6);
+                    let payload: Vec<u32> = (0..words)
                         .map(|i| {
-                            read_le::<4>(&self.iop_ram, ((start + 16 + i * 4) & 0x1F_FFFC) as usize)
-                                as u32
+                            read_le::<4>(
+                                &self.iop_ram,
+                                ((start + 16 + i as u32 * 4) & 0x1F_FFFC) as usize,
+                            ) as u32
                         })
                         .collect();
                     debug!(
