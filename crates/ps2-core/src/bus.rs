@@ -3659,10 +3659,18 @@ impl Bus {
                 ch.chcr &= !IOP_CHCR_BUSY;
                 let start = ch.recv_start;
                 self.iop_dma_irq(10);
-                // An sceSifIopReset command (cid 0x80000003) means the IOP
-                // is about to reboot silently via UDNL: drop in-flight SIF
-                // state so the new kernel starts with clean FIFOs.
-                let cid = read_le::<4>(&self.iop_ram, ((start + 8) & 0x1F_FFFC) as usize) as u32;
+                // The last block of a run carries a command only when it
+                // starts with a plausible sceSifCmdHeader: a plain
+                // sceSifSetDma run ends on payload, whose third word is
+                // whatever the destination buffer happened to hold. psize
+                // counts the 16-byte header, so anything smaller is not a
+                // packet.
+                let hdr = read_le::<4>(&self.iop_ram, (start & 0x1F_FFFC) as usize) as u32;
+                let cid = if hdr & 0xFF >= 16 {
+                    read_le::<4>(&self.iop_ram, ((start + 8) & 0x1F_FFFC) as usize) as u32
+                } else {
+                    0
+                };
                 if cid & 0x8000_0000 != 0 {
                     let payload: Vec<u32> = (0..6)
                         .map(|i| {
@@ -3677,6 +3685,9 @@ impl Bus {
                         "EE->IOP command"
                     );
                 }
+                // An sceSifIopReset command means the IOP is about to reboot
+                // silently via UDNL: drop in-flight SIF state so the new
+                // kernel starts with clean FIFOs.
                 if cid == 0x8000_0003 {
                     debug!(target: "ps2_core::bus::sifdma", "IOP reset command: flushing SIF state");
                     // From the third reboot on (PS2LOGO -> game), the
