@@ -3674,7 +3674,8 @@ impl Bus {
                 if cid & 0x8000_0000 != 0 {
                     // psize counts the header, so a header-only packet has no
                     // payload at all; a fixed six words there would print
-                    // whatever the previous packet left in the buffer.
+                    // whatever the previous packet left in the buffer. Still
+                    // capped, to keep a large packet's line short.
                     let words = (((hdr & 0xFF) as usize).saturating_sub(16) / 4).min(6);
                     let payload: Vec<u32> = (0..words)
                         .map(|i| {
