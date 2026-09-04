@@ -563,6 +563,7 @@ impl Gs {
             cpsm = format_args!("{:#04x}", (v >> 51) & 0xF),
             csm = (v >> 55) & 1,
             csa = (v >> 56) & 0x1F,
+            cld = (v >> 61) & 7,
             "TEX0");
     }
 
