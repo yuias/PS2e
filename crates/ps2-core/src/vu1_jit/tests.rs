@@ -302,7 +302,34 @@ fn random_lower_pipeline_programs_agree() {
     for _ in 0..64 {
         let mut p: Vec<(u32, u32)> = Vec::new();
         while p.len() < 40 {
-            let l = (next() as u32) & 0x7FFF_FFFF;
+            let l = next() as u32;
+            if super::emit::is_branch(l) {
+                continue;
+            }
+            p.push((upper(0x28, 0xF, 2, 3, 4), l));
+        }
+        p.push(END);
+        agree(&p);
+    }
+}
+
+/// The lower pipeline's special table (opcode 0x40), where IADD/ISUB/IAND/
+/// IOR, MOVE and XITOP are emitted natively. A uniform 32-bit draw reaches
+/// it once in 128, too rarely to cover 64 sub-opcodes, so pin the opcode
+/// and fuzz the rest.
+#[test]
+fn random_lower_special_programs_agree() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..64 {
+        let mut p: Vec<(u32, u32)> = Vec::new();
+        while p.len() < 40 {
+            let l = 0x8000_0000 | (next() as u32 & 0x01FF_FFFF);
             if super::emit::is_branch(l) {
                 continue;
             }
@@ -383,7 +410,7 @@ fn random_lower_pipeline_programs_agree_on_wild_bits() {
     for _ in 0..64 {
         let mut p: Vec<(u32, u32)> = Vec::new();
         while p.len() < 40 {
-            let l = (next() as u32) & 0x7FFF_FFFF;
+            let l = next() as u32;
             if super::emit::is_branch(l) {
                 continue;
             }
