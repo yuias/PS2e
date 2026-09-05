@@ -240,6 +240,9 @@ fn parse_args() -> Result<Args, String> {
     if !args.watches.is_empty() && (args.debug_ee.is_some() || args.debug_iop.is_some()) {
         return Err("--watch and --debug-ee/--debug-iop are exclusive; use a Z2 watchpoint".into());
     }
+    if let Some(dir) = &args.dump {
+        std::fs::create_dir_all(dir).map_err(|e| format!("--dump: cannot create '{dir}': {e}"))?;
+    }
     Ok(args)
 }
 
