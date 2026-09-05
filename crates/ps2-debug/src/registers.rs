@@ -34,6 +34,14 @@ impl Target {
         }
     }
 
+    /// Short lower-case name, as the command line and logs spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Ee => "ee",
+            Target::Iop => "iop",
+        }
+    }
+
     pub fn hostname(self) -> &'static str {
         match self {
             Target::Ee => "ps2e-ee",

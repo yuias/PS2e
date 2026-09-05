@@ -73,6 +73,29 @@ pub struct IopDmaChannel {
 
 const IOP_CHCR_BUSY: u32 = 1 << 24;
 
+/// A RAM range whose DMA writers are recorded (see [`Bus::dma_watch`]).
+/// `start` is an offset into EE RAM, or into IOP RAM when `iop` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaWatch {
+    pub iop: bool,
+    pub start: u32,
+    pub len: u32,
+}
+
+/// One DMA transfer that overlapped a [`DmaWatch`] range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmaHit {
+    /// Written into IOP RAM (else EE RAM).
+    pub iop: bool,
+    /// The engine, e.g. `"SIF1"` or `"CDVD"`.
+    pub channel: &'static str,
+    /// RAM offset the run started at and its length in bytes.
+    pub start: u32,
+    pub bytes: u32,
+    /// `Bus::now` when the run was written.
+    pub cycle: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 /// CDVD (MECHACON) model: S commands answer instantly; N commands read
 /// sectors from an optional disc image, streamed from disk one request
@@ -1490,6 +1513,14 @@ pub struct Bus {
     /// second line break.
     #[serde(skip)]
     iop_tty_cr: bool,
+    /// RAM ranges whose DMA writers the debugger wants named. Empty in a
+    /// free run, so the engines pay one emptiness test per transfer.
+    #[serde(skip)]
+    pub dma_watch: Vec<DmaWatch>,
+    /// DMA transfers that touched a watched range since the debugger last
+    /// cleared them.
+    #[serde(skip)]
+    pub dma_hits: Vec<DmaHit>,
     /// RDRAM init handshake state (MCH_RICM/MCH_DRD).
     rdram_sdevid: u32,
     /// Unmapped addresses already reported, to keep the log readable.
@@ -1624,6 +1655,8 @@ impl Bus {
             iop_tty_buffer: String::new(),
             iop_tty_line: String::new(),
             iop_tty_cr: false,
+            dma_watch: Vec::new(),
+            dma_hits: Vec::new(),
             rdram_sdevid: 0,
             warned_unmapped: HashSet::new(),
             ee_tlb: [(0, 0, 0, 0); 48],
@@ -1757,6 +1790,28 @@ impl Bus {
                 break;
             }
             p = (p + 1) % pages;
+        }
+    }
+
+    /// A DMA engine wrote `bytes` from RAM offset `start` (IOP RAM when
+    /// `iop`): remember the run if it overlaps a watched range, so a
+    /// watchpoint stop can name the writer. Runs once per transfer.
+    fn note_dma_write(&mut self, iop: bool, channel: &'static str, start: usize, bytes: usize) {
+        if self.dma_watch.is_empty() || bytes == 0 {
+            return;
+        }
+        let (s, e) = (start as u64, (start + bytes) as u64);
+        let hit = self.dma_watch.iter().any(|w| {
+            w.iop == iop && u64::from(w.start) < e && s < u64::from(w.start) + u64::from(w.len)
+        });
+        if hit {
+            self.dma_hits.push(DmaHit {
+                iop,
+                channel,
+                start: start as u32,
+                bytes: bytes as u32,
+                cycle: self.now,
+            });
         }
     }
 
@@ -3234,6 +3289,7 @@ impl Bus {
             write_le::<4>(&mut self.ram, a + i * 4, *w as u64);
         }
         self.note_ram_write(a);
+        self.note_dma_write(false, "fromSPR", a, 16);
     }
 
     fn pump_gif(&mut self) {
@@ -3438,6 +3494,7 @@ impl Bus {
                 self.iop_ram[(start + i) % len] = b;
             }
             self.iop_ram_bulk_written(start, n);
+            self.note_dma_write(true, ["SPU2 core 0", "SPU2 core 1"][core], start, n);
         }
         if self.spu2.take_irq() {
             self.iop_i_stat |= 1 << 9;
@@ -3456,6 +3513,7 @@ impl Bus {
             self.iop_ram[(start + i) % len] = b;
         }
         self.iop_ram_bulk_written(start, n);
+        self.note_dma_write(true, "CDVD", start, n);
         debug!(target: "ps2_core::iop::cdvd", bytes,
             madr = format_args!("{:#x}", self.iop_dma_cdvd.madr),
             "DMA ch3");
@@ -3472,6 +3530,7 @@ impl Bus {
             self.iop_ram[(start + i) % len] = b;
         }
         self.iop_ram_bulk_written(start, bytes);
+        self.note_dma_write(true, "SIO2 out", start, bytes);
         debug!(target: "ps2_core::iop::sio2",
             bytes,
             madr = format_args!("{:#x}", self.iop_dma_sio2out.madr),
@@ -3642,6 +3701,7 @@ impl Bus {
             // The IOP's modules arrive down this channel, so a run that
             // lands on a page holding translated code drops the cache.
             self.iop_ram_bulk_written(wrote_from, wrote);
+            self.note_dma_write(true, "SIF1", wrote_from, wrote);
             let ch = &mut self.iop_dma_sif1;
             if ch.recv_left > 0 {
                 break; // wait for more data
@@ -3810,6 +3870,8 @@ impl Bus {
                 );
                 progressed = true;
             }
+            let run_from = (self.dma_sif0.madr & 0x1FFF_FFF0) as usize;
+            let mut run = 0usize;
             while self.dma_sif0.qwc > 0 && self.sif.fifo0.len() >= 4 {
                 let a = (self.dma_sif0.madr & 0x1FFF_FFF0) as usize;
                 for i in 0..4 {
@@ -3821,8 +3883,10 @@ impl Bus {
                 }
                 self.dma_sif0.madr = self.dma_sif0.madr.wrapping_add(16);
                 self.dma_sif0.qwc -= 1;
+                run += 16;
                 progressed = true;
             }
+            self.note_dma_write(false, "SIF0", run_from, run.min(RAM_SIZE.saturating_sub(run_from)));
             if self.dma_sif0.qwc > 0 {
                 break; // wait for more data
             }

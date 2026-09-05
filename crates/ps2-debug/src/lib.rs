@@ -22,10 +22,13 @@
 
 mod packet;
 mod registers;
+mod watch;
+
+pub use registers::Target;
+pub use watch::WatchLog;
 
 use packet::{Item, Receiver};
 use ps2_core::{EE_PER_IOP, Ps2System};
-use registers::Target;
 use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -131,10 +134,12 @@ impl DebugServer {
         if let Some(stub) = &mut self.ee {
             stub.accept_new_client();
             stub.service_client(sys);
+            stub.drop_stale_dma_watch(sys);
         }
         if let Some(stub) = &mut self.iop {
             stub.accept_new_client();
             stub.service_client(sys);
+            stub.drop_stale_dma_watch(sys);
         }
         if self.attached() && !self.halted() {
             self.run_slice(sys, budget_cycles);
@@ -173,14 +178,16 @@ impl DebugServer {
                 }
             }
             sys.step();
-            if let Some(stub) = &mut self.ee
-                && stub.check_watchpoints(sys)
-            {
-                return;
+            let mut stopped = false;
+            if let Some(stub) = &mut self.ee {
+                stopped |= stub.check_watchpoints(sys);
             }
-            if let Some(stub) = &mut self.iop
-                && stub.check_watchpoints(sys)
-            {
+            if let Some(stub) = &mut self.iop {
+                stopped |= stub.check_watchpoints(sys);
+            }
+            // DMA runs recorded for this step have been read by now.
+            sys.bus.dma_hits.clear();
+            if stopped {
                 return;
             }
         }
@@ -197,6 +204,9 @@ struct Stub {
     breakpoints: HashSet<u32>,
     /// Write watchpoints, polled against a snapshot after every step.
     watchpoints: Vec<Watchpoint>,
+    /// A detach cleared the watchpoints without a `Ps2System` in reach; the
+    /// bus's DMA watch ranges for this target are dropped on the next pump.
+    dma_stale: bool,
     /// Execution is suspended, waiting for debugger commands.
     halted: bool,
     /// Skip the breakpoint check for the first instruction after a resume so
@@ -232,6 +242,7 @@ impl Stub {
             client: None,
             breakpoints: HashSet::new(),
             watchpoints: Vec::new(),
+            dma_stale: false,
             halted: false,
             resume_skip: false,
             no_ack: false,
@@ -270,6 +281,7 @@ impl Stub {
         self.client = None;
         self.breakpoints.clear();
         self.watchpoints.clear();
+        self.dma_stale = true;
         self.halted = false;
         self.no_ack = false;
     }
@@ -342,6 +354,13 @@ impl Stub {
         self.send_reply(reply);
     }
 
+    fn drop_stale_dma_watch(&mut self, sys: &mut Ps2System) {
+        if std::mem::take(&mut self.dma_stale) {
+            let iop = self.target == Target::Iop;
+            sys.bus.dma_watch.retain(|w| w.iop != iop);
+        }
+    }
+
     /// Re-snapshot all watchpoints, e.g. when resuming: memory edited while
     /// halted must not read as a program write.
     fn refresh_watchpoints(&mut self, sys: &mut Ps2System) {
@@ -367,8 +386,14 @@ impl Stub {
         let Some(idx) = hit else {
             return false;
         };
-        let addr = self.watchpoints[idx].addr;
+        let (addr, len) = (self.watchpoints[idx].addr, self.watchpoints[idx].len);
         self.refresh_watchpoints(sys);
+        // A DMA engine leaves no pc to stop at, so name it in the console
+        // before the stop reply; the core's own stores stop just past them.
+        for line in watch::dma_writers(sys, self.target, addr, len) {
+            info!(target: "ps2_debug", "{line}");
+            self.send_reply(format!("O{}", packet::to_hex(format!("{line}\n").as_bytes())).as_bytes());
+        }
         self.stop(format!("T05watch:{addr:x};thread:01;").as_bytes());
         true
     }
@@ -611,9 +636,11 @@ impl Stub {
                         .map(|i| peek(sys, t, addr.wrapping_add(i)).unwrap_or(0))
                         .collect();
                     self.watchpoints.push(Watchpoint { addr, len, old });
+                    watch::arm_dma(sys, t, addr, len);
                 } else {
                     self.watchpoints
                         .retain(|w| !(w.addr == addr && w.len == len));
+                    watch::disarm_dma(sys, self.target, addr, len);
                 }
                 b"OK".to_vec()
             }

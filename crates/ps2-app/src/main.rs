@@ -41,6 +41,9 @@ struct Args {
     screenshot: Option<String>,
     /// Also write a numbered BMP next to `screenshot` every N cycles.
     screenshot_every: Option<u64>,
+    /// Headless writer log: (core, address, byte length) triples whose every
+    /// change is logged with the cycle and the writer.
+    watches: Vec<(ps2_debug::Target, u32, u32)>,
     /// gdb-remote stub ports for the EE and IOP targets.
     debug_ee: Option<u16>,
     debug_iop: Option<u16>,
@@ -116,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
         dump: None,
         screenshot: None,
         screenshot_every: None,
+        watches: Vec::new(),
         debug_ee: None,
         debug_iop: None,
         wait_debugger: false,
@@ -164,6 +168,9 @@ fn parse_args() -> Result<Args, String> {
                 args.debug_iop = Some(parse_port(it.next().ok_or("--debug-iop needs a port")?)?)
             }
             "--wait-debugger" => args.wait_debugger = true,
+            "--watch" => args
+                .watches
+                .push(parse_watch(&it.next().ok_or("--watch needs <ee|iop>:<addr>[,<len>]")?)?),
             "--gs-inline" => args.gs_inline = true,
             "--no-jit" => args.no_jit = true,
             "--internal-2x" => args.internal_2x = true,
@@ -206,6 +213,8 @@ fn parse_args() -> Result<Args, String> {
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
+                     --watch          log every writer of <ee|iop>:<hex addr>[,<len>] with the\n\
+                     \x20                cycle, CPU or DMA (headless, interpreted; repeatable)\n\
                      --gs-inline      render on the emulation thread (no GS worker)\n\
                      --no-jit         interpret EE, VU1 and IOP instead of recompiling\n\
                      --internal-2x    render internally at 2x (sharper 3D)\n\
@@ -228,7 +237,28 @@ fn parse_args() -> Result<Args, String> {
     if args.wait_debugger && args.debug_ee.is_none() && args.debug_iop.is_none() {
         return Err("--wait-debugger needs --debug-ee or --debug-iop".to_string());
     }
+    if !args.watches.is_empty() && (args.debug_ee.is_some() || args.debug_iop.is_some()) {
+        return Err("--watch and --debug-ee/--debug-iop are exclusive; use a Z2 watchpoint".into());
+    }
     Ok(args)
+}
+
+/// `<ee|iop>:<hex addr>[,<len>]`; the length defaults to a word.
+fn parse_watch(spec: &str) -> Result<(ps2_debug::Target, u32, u32), String> {
+    let bad = || format!("--watch needs <ee|iop>:<hex addr>[,<len>], got '{spec}'");
+    let (core, rest) = spec.split_once(':').ok_or_else(bad)?;
+    let target = match core {
+        "ee" => ps2_debug::Target::Ee,
+        "iop" => ps2_debug::Target::Iop,
+        _ => return Err(bad()),
+    };
+    let (addr, len) = rest.split_once(',').unwrap_or((rest, "4"));
+    let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16).map_err(|_| bad())?;
+    let len: u32 = len.parse().map_err(|_| bad())?;
+    if len == 0 || len > 4096 {
+        return Err(bad());
+    }
+    Ok((target, addr, len))
 }
 
 fn parse_port(s: String) -> Result<u16, String> {
@@ -435,6 +465,12 @@ fn run_headless(
         sys.bus.gs.set_internal_2x(true);
     }
 
+    // The snapshot has to follow --load-state, so the log is armed here.
+    let mut watch_log = ps2_debug::WatchLog::new();
+    for &(target, addr, len) in &args.watches {
+        watch_log.add(&mut sys, target, addr, len);
+    }
+
     // Run in slices so TTY output streams out as it appears.
     const SLICE: u64 = 1_000_000;
     let stdout = std::io::stdout();
@@ -486,7 +522,11 @@ fn run_headless(
             .iter()
             .filter(|&&(_, from, to)| sys.cycles >= from && sys.cycles < to)
             .fold(0, |acc, &(mask, _, _)| acc | mask);
-        sys.run(n);
+        if watch_log.is_empty() {
+            sys.run(n);
+        } else {
+            watch_log.run(&mut sys, n);
+        }
         remaining -= n;
         if let Some((path, at)) = &save_state
             && sys.cycles >= *at
