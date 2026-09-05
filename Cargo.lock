@@ -2262,6 +2262,7 @@ dependencies = [
  "cpal",
  "eframe",
  "gilrs",
+ "png",
  "ps2-core",
  "ps2-debug",
  "rfd",

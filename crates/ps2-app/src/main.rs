@@ -37,9 +37,9 @@ struct Args {
     log: Option<String>,
     /// Directory to dump EE/IOP RAM into after a headless run.
     dump: Option<String>,
-    /// Write the final framebuffer as a BMP (headless only).
+    /// Write the final framebuffer here, `.bmp` or `.png` (headless only).
     screenshot: Option<String>,
-    /// Also write a numbered BMP next to `screenshot` every N cycles.
+    /// Also write a numbered image next to `screenshot` every N cycles.
     screenshot_every: Option<u64>,
     /// Headless writer log: (core, address, byte length) triples whose every
     /// change is logged with the cycle and the writer.
@@ -208,8 +208,8 @@ fn parse_args() -> Result<Args, String> {
                      --window         open a window even when --cycles is given\n\
                      --log            tracing filter, e.g. 'info,ps2_core::tty=debug'\n\
                      --dump           directory for EE/IOP RAM dumps after a headless run\n\
-                     --screenshot     write the final framebuffer as a BMP (headless)\n\
-                     --screenshot-every  also write <screenshot>_<n>.bmp every N cycles\n\
+                     --screenshot     write the final framebuffer, .bmp or .png (headless)\n\
+                     --screenshot-every  also write <screenshot>_<n>.<ext> every N cycles\n\
                      --debug-ee       gdb-remote stub port for the EE (LLDB-first)\n\
                      --debug-iop      gdb-remote stub port for the IOP\n\
                      --wait-debugger  hold at the reset vector until a debugger attaches\n\
@@ -239,6 +239,11 @@ fn parse_args() -> Result<Args, String> {
     }
     if !args.watches.is_empty() && (args.debug_ee.is_some() || args.debug_iop.is_some()) {
         return Err("--watch and --debug-ee/--debug-iop are exclusive; use a Z2 watchpoint".into());
+    }
+    if let Some(path) = &args.screenshot
+        && image_format(path).is_none()
+    {
+        return Err(format!("--screenshot needs a .bmp or .png path, got '{path}'"));
     }
     if let Some(dir) = &args.dump {
         std::fs::create_dir_all(dir).map_err(|e| format!("--dump: cannot create '{dir}': {e}"))?;
@@ -561,7 +566,7 @@ fn run_headless(
             } else {
                 sys.framebuffer()
             };
-            if let Err(e) = write_bmp(&numbered, w, h, &rgba) {
+            if let Err(e) = write_image(&numbered, w, h, &rgba) {
                 eprintln!("error: screenshot failed: {e}");
                 return ExitCode::FAILURE;
             }
@@ -655,7 +660,7 @@ fn run_headless(
     }
     if let Some(path) = &args.screenshot {
         let (w, h, rgba) = sys.framebuffer();
-        if let Err(e) = write_bmp(path, w, h, &rgba) {
+        if let Err(e) = write_image(path, w, h, &rgba) {
             eprintln!("error: screenshot failed: {e}");
             return ExitCode::FAILURE;
         }
@@ -712,6 +717,41 @@ fn write_wav(path: &str, samples: &[i16]) -> std::io::Result<()> {
         out.extend_from_slice(&s.to_le_bytes());
     }
     std::fs::write(path, out)
+}
+
+enum ImageFormat {
+    Bmp,
+    Png,
+}
+
+/// The format a screenshot path's extension asks for.
+fn image_format(path: &str) -> Option<ImageFormat> {
+    match Path::new(path).extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "bmp" => Some(ImageFormat::Bmp),
+        "png" => Some(ImageFormat::Png),
+        _ => None,
+    }
+}
+
+/// Write RGBA pixels in the format the path's extension names.
+fn write_image(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    match image_format(path) {
+        Some(ImageFormat::Png) => write_png(path, w, h, rgba),
+        Some(ImageFormat::Bmp) => write_bmp(path, w, h, rgba),
+        None => Err(std::io::Error::other(format!("'{path}': only .bmp and .png are written"))),
+    }
+}
+
+/// 8-bit RGB PNG (the alpha plane carries nothing a viewer wants).
+fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = png::Encoder::new(file, w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(std::io::Error::other)?;
+    writer.write_image_data(&rgb).map_err(std::io::Error::other)?;
+    writer.finish().map_err(std::io::Error::other)
 }
 
 /// Minimal 24-bit bottom-up BMP writer.
