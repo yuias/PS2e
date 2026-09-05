@@ -233,3 +233,13 @@ fn detach_resumes_emulation() {
     let mut c2 = Client::connect(h.ee_port);
     assert_eq!(c2.roundtrip("?"), "T05thread:01;");
 }
+
+/// A second emulator started on a port that is already served must fail
+/// at bind time; nothing may silently run undebugged.
+#[test]
+fn a_port_in_use_is_refused() {
+    let first = DebugServer::bind(Some(0), None).unwrap();
+    let port = first.ee_port().unwrap();
+    assert!(DebugServer::bind(Some(port), None).is_err());
+    assert!(DebugServer::bind(None, Some(port)).is_err());
+}
