@@ -286,7 +286,7 @@ impl Cpu {
         let addr = |cpu: &Cpu| cpu.r32(rs).wrapping_add(imm as i16 as i32 as u32);
 
         match op {
-            0x00 => self.op_special(instr, rs, rt, rd, sa),
+            0x00 => self.op_special(instr, rs, rt, rd, sa, bus),
             0x01 => self.op_regimm(instr, rs, rt, imm),
             // j / jal
             0x02 => self.branch_to((self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2)),
@@ -386,7 +386,7 @@ impl Cpu {
 
     // --- SPECIAL ---------------------------------------------------------
 
-    fn op_special(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, sa: u32) {
+    fn op_special(&mut self, instr: u32, rs: usize, rt: usize, rd: usize, sa: u32, bus: &mut Bus) {
         match instr & 0x3F {
             0x00 => self.set32(rd, self.r32(rt) << sa),
             0x02 => self.set32(rd, self.r32(rt) >> sa),
@@ -419,6 +419,11 @@ impl Cpu {
                     a1 = format_args!("{:#010x}", self.r32(5)),
                     "syscall"
                 );
+                // Deci2Call(0x10, ..) is kputs; the kernel also accepts the
+                // negated number for its no-interrupt variants.
+                if (self.r32(3) as i32).unsigned_abs() == 0x7C && self.r32(4) == 0x10 {
+                    bus.deci2_kputs(self.r32(5));
+                }
                 self.exception(EXC_SYSCALL)
             }
             0x0D => self.exception(EXC_BREAK),

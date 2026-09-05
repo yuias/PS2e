@@ -1513,6 +1513,9 @@ pub struct Bus {
     /// second line break.
     #[serde(skip)]
     iop_tty_cr: bool,
+    /// Current `Deci2Call` kputs line, flushed to the log on '\n'.
+    #[serde(skip)]
+    deci2_line: String,
     /// RAM ranges whose DMA writers the debugger wants named. Empty in a
     /// free run, so the engines pay one emptiness test per transfer.
     #[serde(skip)]
@@ -1655,6 +1658,7 @@ impl Bus {
             iop_tty_buffer: String::new(),
             iop_tty_line: String::new(),
             iop_tty_cr: false,
+            deci2_line: String::new(),
             dma_watch: Vec::new(),
             dma_hits: Vec::new(),
             rdram_sdevid: 0,
@@ -1948,6 +1952,15 @@ impl Bus {
             0x1FC0_0000..=0x1FFF_FFFF => Some(self.bios[(addr & 0x3F_FFFF) as usize]),
             _ => self.peek_mmio(addr),
         }
+    }
+
+    /// Four [`Bus::peek8`]s, little-endian.
+    pub fn peek32(&mut self, vaddr: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for i in 0..4 {
+            v |= u32::from(self.peek8(vaddr.wrapping_add(i))?) << (8 * i);
+        }
+        Some(v)
     }
 
     /// Side-effect-free MMIO byte read for the debugger.
@@ -4312,6 +4325,35 @@ impl Bus {
         self.tty_buffer.push(c);
     }
 
+    /// `Deci2Call(0x10, arg)` — the kernel's kputs, which the SDK's
+    /// `printf` ends in. `arg` holds a pointer to a NUL-terminated string
+    /// that on a devkit reaches the host and on a console reaches nothing,
+    /// so a title's own log is invisible unless the emulator prints it.
+    /// Logged per line on `ps2_core::ee::deci2` and appended to the EE
+    /// console capture. Bytes outside printable ASCII (Shift-JIS text) are
+    /// kept in the log as `\xNN` escapes.
+    pub fn deci2_kputs(&mut self, arg: u32) {
+        // A missing terminator must not walk the whole of RAM.
+        const MAX: u32 = 4096;
+        let Some(ptr) = self.peek32(arg) else { return };
+        for i in 0..MAX {
+            let byte = match self.peek8(ptr.wrapping_add(i)) {
+                Some(0) | None => break,
+                Some(b) => b,
+            };
+            let c = byte as char;
+            if c == '\n' {
+                debug!(target: "ps2_core::ee::deci2", "{}", self.deci2_line);
+                self.deci2_line.clear();
+            } else if byte.is_ascii() && !c.is_control() {
+                self.deci2_line.push(c);
+            } else if byte != b'\r' {
+                self.deci2_line.push_str(&format!("\\x{byte:02x}"));
+            }
+            self.tty_buffer.push(if byte.is_ascii() { c } else { '?' });
+        }
+    }
+
     /// IOP console byte. Modules end a line with either '\n' or '\r', so
     /// both flush and a "\r\n" pair counts once.
     fn iop_tty_push(&mut self, byte: u8) {
@@ -4476,6 +4518,24 @@ mod tests {
             b.write8(0x1000_F180, *c);
         }
         assert_eq!(b.tty_buffer, "hi\n");
+    }
+
+    #[test]
+    fn deci2_kputs_prints_the_string_the_argument_points_at() {
+        let mut b = bus();
+        // Deci2Call(0x10, 0x1000): *0x1000 -> the text at 0x2000, ending in
+        // a Shift-JIS character.
+        b.write32(0x1000, 0x2000);
+        for (i, c) in b"Grow two:256\n\x82\xa0".iter().enumerate() {
+            b.write8(0x2000 + i as u32, *c);
+        }
+        b.deci2_kputs(0x1000);
+        assert_eq!(b.tty_buffer, "Grow two:256\n??");
+        assert_eq!(b.deci2_line, r"\x82\xa0");
+        // An unreadable pointer prints nothing rather than faulting.
+        b.write32(0x1000, 0x1234_5678);
+        b.deci2_kputs(0x1000);
+        assert_eq!(b.tty_buffer, "Grow two:256\n??");
     }
 
     #[test]
