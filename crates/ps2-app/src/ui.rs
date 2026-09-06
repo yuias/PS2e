@@ -199,8 +199,14 @@ impl eframe::App for App {
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
         });
-        let buttons = buttons | self.gamepad.as_mut().map_or(0, Gamepad::poll);
-        self.emu.shared.buttons.store(buttons, Ordering::Relaxed);
+        let (pad_buttons, sticks) = self
+            .gamepad
+            .as_mut()
+            .map_or((0, crate::emu::STICKS_CENTRED), Gamepad::poll);
+        self.emu
+            .shared
+            .pad
+            .store(crate::emu::pack_pad(buttons | pad_buttons, sticks), Ordering::Relaxed);
         self.emu
             .shared
             .volume

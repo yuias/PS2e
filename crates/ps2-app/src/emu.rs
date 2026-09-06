@@ -10,7 +10,7 @@
 use crate::audio::Audio;
 use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -138,8 +138,9 @@ pub struct Shared {
     /// Accumulated kernel/game TTY text, capped to [`TTY_CAP`]. Cleared
     /// directly by the UI (no round-trip through the worker needed).
     pub tty: Mutex<String>,
-    /// Digital pad bits (UI -> worker), SIO2 bit order (see [`crate::pad`]).
-    pub buttons: AtomicU16,
+    /// Pad state (UI -> worker) as one word, so buttons and sticks land in
+    /// the same slice: see [`pack_pad`].
+    pub pad: AtomicU64,
     /// Master volume as f32 bits (UI -> worker).
     pub volume: AtomicU32,
     /// Deinterlace mode index (UI -> worker), see [`deinterlace_mode`].
@@ -167,6 +168,19 @@ pub const DEINTERLACE_MODES: [ps2_core::gs::Deinterlace; 7] = [
     ps2_core::gs::Deinterlace::Yadif,
     ps2_core::gs::Deinterlace::Bwdif,
 ];
+
+/// Stick bytes at rest: 0x7F on every axis.
+pub const STICKS_CENTRED: [u8; 4] = [0x7F; 4];
+
+/// The pad word: button bits in the low half-word (SIO2 order), then the
+/// four stick bytes in the order the pad reports them (rx, ry, lx, ly).
+pub fn pack_pad(buttons: u16, sticks: [u8; 4]) -> u64 {
+    sticks.iter().enumerate().fold(u64::from(buttons), |w, (i, &b)| w | u64::from(b) << (16 + 8 * i))
+}
+
+pub fn unpack_pad(word: u64) -> (u16, [u8; 4]) {
+    (word as u16, std::array::from_fn(|i| (word >> (16 + 8 * i)) as u8))
+}
 
 pub fn deinterlace_mode(index: u8) -> ps2_core::gs::Deinterlace {
     DEINTERLACE_MODES.get(index as usize).copied().unwrap_or_default()
@@ -213,7 +227,10 @@ impl Drop for Emu {
 }
 
 pub fn spawn(sys: Ps2System, cfg: WorkerConfig, ctx: eframe::egui::Context) -> Emu {
-    let shared = Arc::new(Shared::default());
+    let shared = Arc::new(Shared {
+        pad: AtomicU64::new(pack_pad(0, STICKS_CENTRED)),
+        ..Default::default()
+    });
     shared.volume.store(cfg.volume.to_bits(), Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     let sh = shared.clone();
@@ -309,7 +326,9 @@ impl Worker {
             if !self.handle_commands() {
                 break;
             }
-            self.sys.bus.sio2.buttons = self.shared.buttons.load(Ordering::Relaxed);
+            let (buttons, sticks) = unpack_pad(self.shared.pad.load(Ordering::Relaxed));
+            self.sys.bus.sio2.buttons = buttons;
+            self.sys.bus.sio2.sticks = sticks;
             self.sys.bus.gs.deinterlace = deinterlace_mode(self.shared.deinterlace.load(Ordering::Relaxed));
             self.sys.bus.gs.swap_fields = self.shared.swap_fields.load(Ordering::Relaxed);
             self.sys.bus.gs.set_internal_2x(self.shared.internal_2x.load(Ordering::Relaxed));

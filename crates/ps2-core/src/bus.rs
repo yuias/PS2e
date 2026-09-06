@@ -783,6 +783,11 @@ pub struct Sio2 {
     /// (SELECT=0, L3, R3, START, UP, RIGHT, DOWN, LEFT,
     ///  L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE=15).
     pub buttons: u16,
+    /// Stick positions as the pad reports them: right X, right Y, left X,
+    /// left Y, 0x00 left/up through 0x7F centred to 0xFF right/down.
+    /// Live input like `buttons`, so a save state does not carry it.
+    #[serde(skip, default = "sticks_centred")]
+    pub sticks: [u8; 4],
     /// Transfer started while the in-FIFO was empty: waiting for DMA ch11
     /// to deliver the command bytes (the DMAC only moves data once the
     /// start bit asserts DRQ, so CTRL can legitimately come first).
@@ -806,6 +811,10 @@ pub struct Sio2 {
 /// Pad modes, which are also the id byte a poll answers with.
 const PAD_DIGITAL: u8 = 0x41;
 const PAD_ANALOG: u8 = 0x73;
+
+fn sticks_centred() -> [u8; 4] {
+    [0x7F; 4]
+}
 const PAD_DS2: u8 = 0x79;
 /// Held-button bits in [`Sio2::buttons`], in the order a DualShock 2 reports
 /// their pressure.
@@ -1046,6 +1055,7 @@ impl Default for Sio2 {
             fifo_pos: [0; 2],
             istat: 0,
             buttons: 0,
+            sticks: sticks_centred(),
             pending: false,
             in_block: (0, 0),
             pad_config: false,
@@ -1210,8 +1220,8 @@ impl Sio2 {
         } else if op == 0x42 || op == 0x43 {
             r.extend([b as u8, (b >> 8) as u8]);
             if self.pad_mode != PAD_DIGITAL {
-                // Centered sticks: rx, ry, lx, ly.
-                r.extend([0x7F; 4]);
+                // Sticks, right pair first: rx, ry, lx, ly.
+                r.extend(self.sticks);
             }
             if self.pad_mode == PAD_DS2 {
                 // Pressure. A key is either fully down or not pressed at
@@ -4539,6 +4549,21 @@ mod tests {
         // The IPU interrupt and the channel's own both raised.
         assert_ne!(b.intc_stat & 1 << 8, 0);
         assert!(b.dma_irq_queue.iter().any(|&(ch, _)| ch == 1 << 3));
+    }
+
+    /// A poll in analog mode carries the four stick bytes after the button
+    /// word, right stick first; a digital poll carries none.
+    #[test]
+    fn an_analog_poll_reports_the_sticks() {
+        let mut b = bus();
+        b.sio2.buttons = 1 << 14; // cross
+        b.sio2.sticks = [0x10, 0x20, 0xE0, 0xF0];
+        b.sio2.pad_respond(&[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0], 9);
+        assert_eq!(b.sio2.fifo_out, [0xFF, PAD_DIGITAL, 0x5A, 0xFF, 0xBF, 0, 0, 0, 0]);
+        b.sio2.fifo_out.clear();
+        b.sio2.pad_mode = PAD_ANALOG;
+        b.sio2.pad_respond(&[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0], 9);
+        assert_eq!(b.sio2.fifo_out, [0xFF, PAD_ANALOG, 0x5A, 0xFF, 0xBF, 0x10, 0x20, 0xE0, 0xF0]);
     }
 
     /// CPCOND0 follows D_PCR's channel selection against D_STAT: set when
