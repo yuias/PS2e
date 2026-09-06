@@ -137,7 +137,8 @@ pub struct Ps2System {
     #[serde(skip)]
     iop_jit: Option<iop::jit::Jit>,
     /// Cheats applied at each vertical blank: host configuration, not
-    /// machine state, so a save state does not carry them.
+    /// machine state, so the file does not carry them — the running
+    /// table survives a load instead, like the other ambient assets.
     #[serde(skip)]
     cheats: cheats::Table,
 }
@@ -234,7 +235,7 @@ impl Ps2System {
     }
 
     /// Restore a state from [`Ps2System::save_state`], carrying over the
-    /// BIOS, disc, memory card and the running renderer.
+    /// BIOS, disc, memory card, cheat table and the running renderer.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         let (header, body) = data.split_at_checked(10).ok_or("state file too short")?;
         if &header[..4] != STATE_MAGIC {
@@ -261,6 +262,9 @@ impl Ps2System {
         sys.bus.gs = std::mem::replace(&mut self.bus.gs, gs::front::GsFront::inline());
         sys.bus.cdvd.carry_over(&mut self.bus.cdvd);
         sys.bus.sio2.memcard = std::mem::take(&mut self.bus.sio2.memcard);
+        // Carried as it stands, one-shots included: a load is not a boot,
+        // so an entry that has already fired stays spent.
+        sys.cheats = std::mem::take(&mut self.cheats);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             sys.jit = self.jit.take();
@@ -900,6 +904,32 @@ mod state_tests {
         sys.run(frame);
         assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
         assert_eq!(sys.bus.peek8(0x0010_0010), Some(0));
+    }
+
+    /// The table belongs to the running machine, so a load keeps the one
+    /// that is installed and never takes one out of the file.
+    #[test]
+    fn a_state_load_keeps_the_installed_cheats() {
+        use cheats::{Cheat, Op, Target};
+        let mut a = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        a.set_cheats(vec![Cheat {
+            target: Target::Ee,
+            once: false,
+            op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
+        }]);
+        a.set_cheats_enabled(true);
+        let blob = a.save_state().unwrap();
+        a.load_state(&blob).unwrap();
+        assert_eq!(a.cheats().len(), 1);
+        // Still live: it lands again on the next frame boundary.
+        a.bus.poke8(0x0010_0000, 0);
+        a.run(a.frame_cycles());
+        assert_eq!(a.bus.peek8(0x0010_0000), Some(0x34));
+
+        // A machine with no table loads the same state and gains none.
+        let mut b = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        b.load_state(&blob).unwrap();
+        assert!(b.cheats().is_empty());
     }
 
     #[test]
