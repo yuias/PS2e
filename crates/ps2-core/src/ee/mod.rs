@@ -14,7 +14,7 @@ pub mod jit;
 use crate::bus::Bus;
 use cop0::Cop0;
 use fpu::Fpu;
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 use serde::{Deserialize, Serialize};
 
 /// Exception codes (Cause.ExcCode).
@@ -634,9 +634,9 @@ impl Cpu {
                 self.cop0.write(rd, v);
             }
             0x08 => {
-                // BC0: CPCOND0 stubbed as true (DMA "always finished").
-                let cond = true;
-                warn!(target: "ps2_core::ee::cpu", pc = format_args!("{:#010x}", self.current_pc), "bc0 with stubbed CPCOND0");
+                // BC0: branch on CPCOND0, the DMAC's "selected channels
+                // all done" flag.
+                let cond = bus.cpcond0();
                 match rt {
                     0 => self.branch_cond(!cond, instr & 0xFFFF, false),
                     1 => self.branch_cond(cond, instr & 0xFFFF, false),

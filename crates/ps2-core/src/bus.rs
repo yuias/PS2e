@@ -1715,6 +1715,14 @@ impl Bus {
         self.ee_dma_irq(ch);
     }
 
+    /// COP0's CPCOND0, what `bc0t`/`bc0f` test: every channel D_PCR's CPC
+    /// field names has raised its D_STAT completion bit. With CPC empty
+    /// the condition is trivially true. D_PCR itself lives in the shadow.
+    pub fn cpcond0(&self) -> bool {
+        let cpc = read_le::<4>(&self.mmio, 0xE020) as u32 & 0x3FF;
+        self.d_stat & cpc == cpc
+    }
+
     fn ee_dma_irq(&mut self, ch: u32) {
         self.dma_irq_queue.push((1 << ch, self.now + 1024));
         self.reschedule();
@@ -4531,6 +4539,23 @@ mod tests {
         // The IPU interrupt and the channel's own both raised.
         assert_ne!(b.intc_stat & 1 << 8, 0);
         assert!(b.dma_irq_queue.iter().any(|&(ch, _)| ch == 1 << 3));
+    }
+
+    /// CPCOND0 follows D_PCR's channel selection against D_STAT: set when
+    /// nothing is selected, then only once every selected channel has
+    /// completed, and dropped again when the software acknowledges.
+    #[test]
+    fn cpcond0_tracks_the_selected_channels() {
+        let mut b = bus();
+        assert!(b.cpcond0());
+        b.write32(0x1000_E020, 1 << 3 | 1 << 5); // CPC: IPU_FROM and SIF0
+        assert!(!b.cpcond0());
+        b.d_stat |= 1 << 3;
+        assert!(!b.cpcond0());
+        b.d_stat |= 1 << 5 | 1 << 1;
+        assert!(b.cpcond0());
+        b.write32(0x1000_E010, 1 << 5); // clear SIF0's completion
+        assert!(!b.cpcond0());
     }
 
     /// Channel 8 the other way, and its start bit clears the same way.
