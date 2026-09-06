@@ -1439,6 +1439,8 @@ pub struct Bus {
     pub dma_vif0: EeDmaChannel,
     pub dma_vif1: EeDmaChannel,
     pub dma_ipu_to: EeDmaChannel,
+    /// Channel 3: the IPU's decoded output into memory.
+    pub dma_ipu_from: EeDmaChannel,
     pub dma_gif: EeDmaChannel,
     /// Scratchpad channels: 8 copies out of the SPR, 9 into it.
     pub dma_spr_from: EeDmaChannel,
@@ -1635,6 +1637,7 @@ impl Bus {
             dma_spr_to: EeDmaChannel::default(),
             ipu: crate::ipu::Ipu::new(),
             dma_ipu_to: EeDmaChannel::default(),
+            dma_ipu_from: EeDmaChannel::default(),
             dma_sif0: EeDmaChannel::default(),
             dma_sif1: EeDmaChannel::default(),
             d_stat: 0,
@@ -1996,6 +1999,7 @@ impl Bus {
             0x1000_D080 => self.dma_spr_from.sadr,
             0x1000_D400..=0x1000_D43F => chan(&self.dma_spr_to, reg)?,
             0x1000_D480 => self.dma_spr_to.sadr,
+            0x1000_B000..=0x1000_B03F => chan(&self.dma_ipu_from, reg)?,
             0x1000_B400..=0x1000_B43F => chan(&self.dma_ipu_to, reg)?,
             0x1000_C000..=0x1000_C03F => chan(&self.dma_sif0, reg)?,
             0x1000_C400..=0x1000_C43F => chan(&self.dma_sif1, reg)?,
@@ -2205,8 +2209,21 @@ impl Bus {
                     u64::from(self.ipu.read32(addr))
                 }
             }
-            // IPU output FIFO. Nothing decodes yet, so it stays empty.
-            0x1000_7000..=0x1000_700F => 0,
+            // IPU output FIFO by programmed I/O: a quadword is taken out
+            // when its first byte is read and served from the shadow, the
+            // mirror of how the input side assembles writes.
+            0x1000_7000..=0x1000_700F => {
+                let off = (addr & 0xFFFF) as usize;
+                if addr & 0xF == 0 {
+                    let q = self.ipu.pop_out().unwrap_or([0; 16]);
+                    self.mmio[off..off + 16].copy_from_slice(&q);
+                }
+                read_le::<N>(&self.mmio, off)
+            }
+            // IPU_FROM (ch3): drains the output FIFO into memory.
+            0x1000_B000 => self.dma_ipu_from.chcr as u64,
+            0x1000_B010 => self.dma_ipu_from.madr as u64,
+            0x1000_B020 => self.dma_ipu_from.qwc as u64,
             // IPU_TO (ch4): the input FIFO is fed by the channel, and the
             // channel is drained by whatever command is waiting on it.
             0x1000_B400 => self.dma_ipu_to.chcr as u64,
@@ -2339,8 +2356,21 @@ impl Bus {
                 }
                 return;
             }
+            // IPU_FROM (ch3): normal mode only; it runs as far as the
+            // output FIFO allows and finishes as decoding refills it.
             0x1000_B000 => {
-                self.ee_dma_stub::<N>(addr, 3, v, "IPU_FROM channel (no IPU)");
+                self.dma_ipu_from.chcr = v as u32;
+                if v as u32 & EE_CHCR_STR != 0 {
+                    self.pump_ipu_from();
+                }
+                return;
+            }
+            0x1000_B010 => {
+                self.dma_ipu_from.madr = v as u32;
+                return;
+            }
+            0x1000_B020 => {
+                self.dma_ipu_from.qwc = v as u32 & 0xFFFF;
                 return;
             }
             0x1000_C800 => {
@@ -2422,10 +2452,7 @@ impl Bus {
                 } else {
                     self.ipu.write32(addr, v as u32)
                 };
-                if done {
-                    self.intc_stat |= 1 << 8;
-                    self.intc_changed();
-                }
+                self.ipu_ran(done);
                 return;
             }
             // IPU input FIFO written by programmed I/O: assembled in the
@@ -2437,10 +2464,8 @@ impl Bus {
                     let base = off & !0xF;
                     let mut q = [0u8; 16];
                     q.copy_from_slice(&self.mmio[base..base + 16]);
-                    if self.ipu.push_in(q) {
-                        self.intc_stat |= 1 << 8;
-                        self.intc_changed();
-                    }
+                    let done = self.ipu.push_in(q);
+                    self.ipu_ran(done);
                 }
                 return;
             }
@@ -3107,10 +3132,35 @@ impl Bus {
             }
             self.dma_ipu_to.qwc = qwc;
         }
-        if irq {
+        self.ipu_ran(irq);
+    }
+
+    /// After the IPU has run: raise its interrupt if a command finished,
+    /// and let channel 3 carry away whatever it decoded.
+    fn ipu_ran(&mut self, done: bool) {
+        if done {
             self.intc_stat |= 1 << 8;
             self.intc_changed();
         }
+        if self.dma_ipu_from.chcr & EE_CHCR_STR != 0 {
+            self.pump_ipu_from();
+        }
+    }
+
+    /// Channel 3: quadwords from the IPU's output FIFO into memory. It
+    /// stops short when the FIFO is empty and resumes from `ipu_ran`; the
+    /// transfer ends, with its interrupt, when QWC is exhausted.
+    fn pump_ipu_from(&mut self) {
+        while self.dma_ipu_from.qwc > 0 {
+            let Some(q) = self.ipu.pop_out() else { return };
+            let words = std::array::from_fn(|i| u32::from_le_bytes(q[i * 4..i * 4 + 4].try_into().unwrap()));
+            self.ee_dma_write128(self.dma_ipu_from.madr, words);
+            self.dma_ipu_from.madr = self.dma_ipu_from.madr.wrapping_add(16);
+            self.dma_ipu_from.qwc -= 1;
+        }
+        self.dma_ipu_from.chcr &= !EE_CHCR_STR;
+        debug!(target: "ps2_core::bus::dma", "IPU_FROM DMA done");
+        self.ee_dma_irq(3);
     }
 
     /// Channel 9 (toSPR): quadwords from main memory into the scratchpad.
@@ -4451,6 +4501,36 @@ mod tests {
         assert_eq!(b.read32(0x1000_D420), 0);
         assert_eq!(b.read32(0x1000_D410), 0x0010_0020);
         assert_eq!(b.read32(0x1000_D480), 0x0120);
+    }
+
+    /// Channel 3 waits on the IPU: armed before anything is decoded it
+    /// sits with its start bit set, then carries the macroblock away as
+    /// soon as the command that produces it completes.
+    #[test]
+    fn ipu_from_drains_what_the_decoder_produces() {
+        let mut b = bus();
+        b.write32(0x1000_B010, 0x0010_0000); // MADR
+        b.write32(0x1000_B020, 48); // QWC: one BDEC macroblock
+        b.write32(0x1000_B000, EE_CHCR_STR);
+        assert_ne!(b.read32(0x1000_B000) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_B020), 48);
+        // An intra macroblock of DC-only blocks, each luma DC +8 above the
+        // reset prediction, through the programmed input FIFO.
+        // Bits: 110 1000 10 | 100 10 | 100 10 | 100 10 | 00 10 | 00 10.
+        let bits: u128 = 0b1101_0001_0100_1010_0101_0010_0010_0010 << 96;
+        b.write128(0x1000_7010, [(bits >> 64) as u64, bits as u64].map(u64::swap_bytes));
+        b.write128(0x1000_7010, [0, 0]);
+        b.write32(0x1000_2000, 0x2000_0000 | 1 << 27 | 1 << 26 | 1 << 16);
+        assert_eq!(b.read32(0x1000_B000) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_B020), 0);
+        assert_eq!(b.read32(0x1000_B010), 0x0010_0300);
+        // Luma row 0 is 136, the chroma planes 128, as 16-bit samples.
+        assert_eq!(b.read32(0x0010_0000), 0x0088_0088);
+        assert_eq!(b.read32(0x0010_0200), 0x0080_0080);
+        assert_eq!(b.read32(0x0010_02FC), 0x0080_0080);
+        // The IPU interrupt and the channel's own both raised.
+        assert_ne!(b.intc_stat & 1 << 8, 0);
+        assert!(b.dma_irq_queue.iter().any(|&(ch, _)| ch == 1 << 3));
     }
 
     /// Channel 8 the other way, and its start bit clears the same way.
