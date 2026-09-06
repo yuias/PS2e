@@ -60,6 +60,9 @@ pub struct Vertex {
     /// 12.4 fixed texel coords (UV addressing).
     pub u: i32,
     pub v: i32,
+    /// Fog value (0 = fully fogged, 0xFF = unfogged), from the FOG/XYZF
+    /// latch at the time this vertex was kicked.
+    pub f: u8,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,6 +105,8 @@ pub struct Gs {
     pub dthe: u64,
     pub pabe: u64,
     pub ctx: [Context; 2],
+    /// FOG/XYZF2/XYZF3 share one hardware latch for the F (fog) value.
+    fog_latch: u8,
     // Vertex queue.
     vq: [Vertex; 4],
     vq_len: usize,
@@ -276,6 +281,7 @@ impl Gs {
             dthe: 0,
             pabe: 0,
             ctx: [Context::default(); 2],
+            fog_latch: 0,
             vq: [Vertex::default(); 4],
             vq_len: 0,
             vq_total: 0,
@@ -350,7 +356,10 @@ impl Gs {
             0x02 => self.st = v,
             0x03 => self.uv = v,
             0x04 | 0x0C => {
-                // XYZF2/XYZF3: F in bits 56-63, Z in bits 32-55.
+                // XYZF2/XYZF3: F in bits 56-63, Z in bits 32-55. The F byte
+                // shares FOG's latch, and must land before the vertex is
+                // built.
+                self.fog_latch = (v >> 56) as u8;
                 let z = ((v >> 32) & 0xFF_FFFF) as u32;
                 self.vertex_kick(v, z, reg == 0x04);
             }
@@ -365,7 +374,7 @@ impl Gs {
             }
             0x08 => self.ctx[0].clamp = v,
             0x09 => self.ctx[1].clamp = v,
-            0x0A => {} // FOG
+            0x0A => self.fog_latch = (v >> 56) as u8, // FOG
             0x14 => self.ctx[0].tex1 = v,
             0x15 => self.ctx[1].tex1 = v,
             0x16 | 0x17 => {
@@ -471,6 +480,7 @@ impl Gs {
             t: f32::from_bits((self.st >> 32) as u32),
             u: (self.uv & 0x3FFF) as i32,
             v: ((self.uv >> 16) & 0x3FFF) as i32,
+            f: self.fog_latch,
         };
         if self.vq_len < self.vq.len() {
             self.vq[self.vq_len] = v;
@@ -2008,4 +2018,37 @@ mod tests {
         }
     }
 
+    /// PRIM's FGE fades the fragment towards FOGCOL as F falls (RGB only —
+    /// alpha is untouched). F comes flat from the sprite's second vertex,
+    /// set through the FOG register's latch (XYZ2 leaves it alone).
+    #[test]
+    fn fogging_blends_toward_fogcol() {
+        let mut gs = Gs::new();
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 1 << 16); // FRAME_1: bp 0, fbw 1, PSMCT32
+        gs.write_reg(0x40, (63u64 << 16) | (63u64 << 48)); // SCISSOR_1: 0..63 x 0..63
+        gs.write_reg(0x18, 0); // XYOFFSET_1: none
+        gs.write_reg(0x3D, 0); // FOGCOL: black
+        let (src_r, src_g, src_b, src_a) = (255u64, 255u64, 255u64, 77u64);
+        let rgbaq = src_r | (src_g << 8) | (src_b << 16) | (src_a << 24);
+        let draw_sprite = |gs: &mut Gs, x0: i32, f: u8| {
+            gs.write_reg(0x00, 0x26); // sprite, FGE
+            gs.write_reg(0x01, rgbaq);
+            gs.write_reg(0x05, x0 as u64 * 16); // vertex 0: (x0, 0)
+            gs.write_reg(0x01, rgbaq);
+            gs.write_reg(0x0A, (f as u64) << 56); // FOG latch
+            gs.write_reg(0x05, ((x0 + 4) as u64 * 16) | (4u64 * 16 << 16)); // vertex 1: (x0+4, 4)
+            gs.flush_pending();
+            gs.read_psmct32(0, 1, x0 as u32 + 1, 1)
+        };
+        let unpack = |px: u32| (px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF, (px >> 24) & 0xFF);
+        let (r0, g0, b0, a0) = unpack(draw_sprite(&mut gs, 0, 0x00));
+        let (rm, gm, bm, am) = unpack(draw_sprite(&mut gs, 10, 0x80));
+        let (rx, gx, bx, ax) = unpack(draw_sprite(&mut gs, 20, 0xFF));
+        assert_eq!((r0, g0, b0), (0, 0, 0), "F=0 is fully FOGCOL");
+        // Hardware divides by 256, not 255: F=0xFF is one shy of unfogged.
+        assert_eq!((rx, gx, bx), (254, 254, 254), "F=0xFF is essentially unfogged");
+        assert!(rm > r0 && rm < rx && gm > g0 && gm < gx && bm > b0 && bm < bx, "mid F lands strictly between");
+        assert_eq!((a0, am, ax), (77, 77, 77), "fog never touches alpha");
+    }
 }

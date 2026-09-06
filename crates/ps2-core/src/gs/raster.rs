@@ -45,6 +45,8 @@ struct Frag {
     q: f32,
     u: f32,
     v: f32,
+    /// Fog value (see [`Vertex::f`]).
+    f: f32,
 }
 
 /// Per-thread rasterization state.
@@ -293,8 +295,8 @@ struct TriGeom {
     sa: [f32; 4],
     sb: [f32; 4],
     sc: [f32; 4],
-    /// Per-pixel steps of the colour and STQU attributes, v and z along a
-    /// row, for the incremental fast loop.
+    /// Per-pixel steps of the colour and STQU attributes, v, f and z along
+    /// a row, for the incremental fast loop.
     d_rgba: [f32; 4],
     d_stqu: [f32; 4],
     d_v: f32,
@@ -317,6 +319,7 @@ impl Gs {
             q: v.q,
             u: v.u as f32 / 16.0,
             v: v.v as f32 / 16.0,
+            f: v.f as f32,
         };
         let (px, py) = (v.x >> 4, v.y >> 4);
         if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
@@ -923,6 +926,8 @@ impl Gs {
             tme: attrs & (1 << 4) != 0,
             fst: attrs & (1 << 8) != 0,
             abe: attrs & (1 << 6) != 0,
+            fge: attrs & (1 << 5) != 0,
+            fogcol: (self.fogcol & 0xFF_FFFF) as u32,
             tfx: ((ctx.tex0 >> 35) & 3) as u8,
             tcc: ctx.tex0 & (1 << 34) != 0,
             bilinear: (ctx.tex1 >> 5) & 1 != 0,
@@ -966,6 +971,12 @@ impl Gs {
         // Z may be written (ALWAYS) but never tested; the alpha test on a
         // flat colour is decided once per row by the loop itself.
         pipe.flat_fill = !pipe.tme && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0;
+        if pipe.fge {
+            // Fogging is only implemented on the generic per-pixel path.
+            pipe.fast = false;
+            pipe.fast_decal = false;
+            pipe.flat_fill = false;
+        }
         pipe
     }
 
@@ -1104,6 +1115,7 @@ impl Painter<'_> {
                 q: v1.q,
                 u: 0.0,
                 v: (g.tv0 as f32 + (g.tv1 - g.tv0) as f32 * fy) / 16.0,
+                f: v1.f as f32,
             };
             let row = Row::new(pipe, py as u32);
             if pipe.tme && pxb > pxa {
@@ -1231,6 +1243,7 @@ impl Painter<'_> {
                 q: lerp(a.q, b.q, t),
                 u: lerp(a.u as f32, b.u as f32, t) / 16.0,
                 v: lerp(a.v as f32, b.v as f32, t) / 16.0,
+                f: if g.gouraud { lerp(a.f as f32, b.f as f32, t) } else { b.f as f32 },
             };
             let texel = if pipe.tme { self.sample(&frag) } else { 0 };
             let row = Row::new(pipe, py as u32);
@@ -1285,6 +1298,7 @@ impl Painter<'_> {
                     rgba: interp3(&g.ca, &g.cb, &g.cc, l0, l1, l2),
                     stqu: interp3(&g.sa, &g.sb, &g.sc, l0, l1, l2),
                     v: a.v as f32 * l0 + b.v as f32 * l1 + c.v as f32 * l2,
+                    f: a.f as f32 * l0 + b.f as f32 * l1 + c.f as f32 * l2,
                     z: a.z as f64 * l0 as f64 + b.z as f64 * l1 as f64 + c.z as f64 * l2 as f64,
                     d_rgba: g.d_rgba,
                     d_stqu: g.d_stqu,
@@ -1339,6 +1353,7 @@ impl Painter<'_> {
                     q: stqu[2],
                     u: stqu[3] / 16.0,
                     v: tv,
+                    f: a.f as f32 * l0 + b.f as f32 * l1 + c.f as f32 * l2,
                 };
                 let texel = if pipe.tme { self.sample_cached(&frag) } else { 0 };
                 self.shade_row_px(&row, px as u32, frag, texel);
@@ -1410,6 +1425,7 @@ impl Painter<'_> {
             q: 1.0,
             u: 0.0,
             v: 0.0,
+            f: a.f,
         };
         let args = FastRow {
             row: a.row,
@@ -2127,6 +2143,19 @@ impl Painter<'_> {
             }
         }
 
+        // GS fogging, per the GS User's Manual: the fragment fades to FOGCOL as
+        // F falls. Hardware divides by 256, not 255, so F = 0xFF is very
+        // slightly short of the unfogged colour.
+        if pipe.fge {
+            let f = (frag.f as i32).clamp(0, 255) as u32;
+            let fog_r = pipe.fogcol & 0xFF;
+            let fog_g = (pipe.fogcol >> 8) & 0xFF;
+            let fog_b = (pipe.fogcol >> 16) & 0xFF;
+            r = (r * f + fog_r * (0xFF - f)) >> 8;
+            g = (g * f + fog_g * (0xFF - f)) >> 8;
+            b = (b * f + fog_b * (0xFF - f)) >> 8;
+        }
+
         // Alpha test. AFAIL decides what a failing pixel still updates:
         // FB_ONLY leaves Z alone, ZB_ONLY updates only Z, RGB_ONLY keeps
         // the destination alpha as well as Z.
@@ -2421,6 +2450,7 @@ struct FastTri<'a> {
     rgba: [f32; 4],
     stqu: [f32; 4],
     v: f32,
+    f: f32,
     z: f64,
     d_rgba: [f32; 4],
     d_stqu: [f32; 4],
@@ -2656,6 +2686,10 @@ struct PixelPipe {
     tme: bool,
     fst: bool,
     abe: bool,
+    /// PRIM/PRMODE FGE: fog the fragment towards `fogcol` by its F value.
+    fge: bool,
+    /// FOGCOL bits 0-23, packed the same way as a frame-buffer pixel.
+    fogcol: u32,
     tfx: u8,
     tcc: bool,
     bilinear: bool,
