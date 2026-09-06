@@ -876,12 +876,13 @@ mod state_tests {
     /// one-shot entry fires on the first frame only.
     #[test]
     fn cheats_are_applied_at_vblank() {
-        use cheats::{Cheat, Target};
+        use cheats::{Cheat, Op, Target};
+        let write = |target, once, addr, data: &[u8]| Cheat { target, once, op: Op::Write { addr, data: data.to_vec() } };
         let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
         sys.set_cheats(vec![
-            Cheat { target: Target::Ee, addr: 0x0010_0000, data: vec![0x34, 0x12], once: false },
-            Cheat { target: Target::Iop, addr: 0x0000_2000, data: vec![0x5A], once: false },
-            Cheat { target: Target::Ee, addr: 0x0010_0010, data: vec![0x77], once: true },
+            write(Target::Ee, false, 0x0010_0000, &[0x34, 0x12]),
+            write(Target::Iop, false, 0x0000_2000, &[0x5A]),
+            write(Target::Ee, true, 0x0010_0010, &[0x77]),
         ]);
         let frame = sys.frame_cycles();
         // Disabled: a whole frame passes and nothing is written.
