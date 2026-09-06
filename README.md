@@ -53,6 +53,10 @@ is fed by the emulator, so the two behind it cost nothing, and the whole
 pane can be closed from the View menu. The pane's width and whether it
 opens are remembered in `config.toml`.
 
+While a text field in the pane has focus it takes the keyboard, so typing an
+address does not also press the pad buttons those keys are bound to. Esc, or
+a click on empty pane, hands the keyboard back.
+
 The status bar names the image in the drive, and the window title carries the
 disc's boot serial ("PS2e - SLPS-25418"): a PS2 disc has no printable game
 title on it, so the serial stands in for one.

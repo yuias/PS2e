@@ -515,12 +515,21 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let buttons = ctx.input(|i| {
-            self.keymap
-                .iter()
-                .filter(|(k, _)| i.key_down(*k))
-                .fold(0u16, |acc, (_, b)| acc | b)
-        });
+        // A text field in the pane (an address, a scan value) owns the
+        // keyboard while it has focus: without this, typing "1000" also
+        // presses whatever pad buttons those keys are bound to. The
+        // frontend's own function keys below stay live either way.
+        let typing = ctx.wants_keyboard_input();
+        let buttons = if typing {
+            0
+        } else {
+            ctx.input(|i| {
+                self.keymap
+                    .iter()
+                    .filter(|(k, _)| i.key_down(*k))
+                    .fold(0u16, |acc, (_, b)| acc | b)
+            })
+        };
         let (pad_buttons, sticks) = self
             .gamepad
             .as_mut()
@@ -584,6 +593,10 @@ impl eframe::App for App {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
+        // Esc leaves fullscreen. It also gives the keyboard back to the pad
+        // when a pane text field holds it, but that needs no code here:
+        // egui drops focus on Esc in its own begin_pass, so `typing` above
+        // is already false by the time this runs.
         if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.fullscreen = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -684,6 +697,8 @@ impl eframe::App for App {
                         ui.monospace(format!("    load = {}", self.config.hotkeys.load_state));
                         ui.separator();
                         ui.label("F11 fullscreen (Esc leaves), F12 screenshot.");
+                        ui.label("A pane text field holds the keyboard while focused;");
+                        ui.label("Esc, or a click on empty pane, gives it back to the pad.");
                     });
                 });
             });
@@ -745,6 +760,12 @@ impl eframe::App for App {
                 .min_width(240.0)
                 .default_width(self.pane_width)
                 .show(ctx, |ui| {
+                    // Claimed before the content so the pages' own widgets
+                    // sit on top of it: a click that lands here is a click
+                    // on empty pane, which drops text focus and gives the
+                    // keyboard back to the pad.
+                    let background =
+                        ui.interact(ui.max_rect(), ui.id().with("background"), egui::Sense::click());
                     ui.horizontal(|ui| {
                         for page in Page::ALL {
                             ui.selectable_value(&mut self.page, page, page.label());
@@ -755,6 +776,9 @@ impl eframe::App for App {
                         Page::Settings => self.settings_page(ui),
                         Page::Memory => self.memory_page(ui),
                         Page::Registers => registers_page(ui, &status),
+                    }
+                    if background.clicked() {
+                        ui.memory_mut(|m| m.stop_text_input());
                     }
                 });
             // Follow the drag handle so the width survives to the config.
