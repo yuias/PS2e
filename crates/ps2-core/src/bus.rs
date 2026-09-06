@@ -1558,6 +1558,13 @@ pub struct Bus {
     /// Current `Deci2Call` kputs line, flushed to the log on '\n'.
     #[serde(skip)]
     deci2_line: String,
+    /// Repeat suppression for the three console streams, one each.
+    #[serde(skip)]
+    tty_collapse: LineCollapse,
+    #[serde(skip)]
+    deci2_collapse: LineCollapse,
+    #[serde(skip)]
+    iop_tty_collapse: LineCollapse,
     /// RAM ranges whose DMA writers the debugger wants named. Empty in a
     /// free run, so the engines pay one emptiness test per transfer.
     #[serde(skip)]
@@ -1702,6 +1709,9 @@ impl Bus {
             iop_tty_line: String::new(),
             iop_tty_cr: false,
             deci2_line: String::new(),
+            tty_collapse: LineCollapse::default(),
+            deci2_collapse: LineCollapse::default(),
+            iop_tty_collapse: LineCollapse::default(),
             dma_watch: Vec::new(),
             dma_hits: Vec::new(),
             rdram_sdevid: 0,
@@ -4525,12 +4535,15 @@ impl Bus {
     fn tty_push(&mut self, byte: u8) {
         let c = byte as char;
         if c == '\n' {
-            debug!(target: "ps2_core::tty", "{}", self.tty_line);
-            self.tty_line.clear();
+            let line = core::mem::take(&mut self.tty_line);
+            for text in self.tty_collapse.feed(&line) {
+                debug!(target: "ps2_core::tty", "{}", text);
+                self.tty_buffer.push_str(&text);
+                self.tty_buffer.push('\n');
+            }
         } else if byte.is_ascii() && !c.is_control() {
             self.tty_line.push(c);
         }
-        self.tty_buffer.push(c);
     }
 
     /// `Deci2Call(0x10, arg)` — the kernel's kputs, which the SDK's
@@ -4539,7 +4552,8 @@ impl Bus {
     /// so a title's own log is invisible unless the emulator prints it.
     /// Logged per line on `ps2_core::ee::deci2` and appended to the EE
     /// console capture. Bytes outside printable ASCII (Shift-JIS text) are
-    /// kept in the log as `\xNN` escapes.
+    /// kept as `\xNN` escapes, and a line the title repeats is collapsed
+    /// (see [`LineCollapse`]).
     pub fn deci2_kputs(&mut self, arg: u32) {
         // A missing terminator must not walk the whole of RAM.
         const MAX: u32 = 4096;
@@ -4551,14 +4565,17 @@ impl Bus {
             };
             let c = byte as char;
             if c == '\n' {
-                debug!(target: "ps2_core::ee::deci2", "{}", self.deci2_line);
-                self.deci2_line.clear();
+                let line = core::mem::take(&mut self.deci2_line);
+                for text in self.deci2_collapse.feed(&line) {
+                    debug!(target: "ps2_core::ee::deci2", "{}", text);
+                    self.tty_buffer.push_str(&text);
+                    self.tty_buffer.push('\n');
+                }
             } else if byte.is_ascii() && !c.is_control() {
                 self.deci2_line.push(c);
             } else if byte != b'\r' {
                 self.deci2_line.push_str(&format!("\\x{byte:02x}"));
             }
-            self.tty_buffer.push(if byte.is_ascii() { c } else { '?' });
         }
     }
 
@@ -4572,15 +4589,50 @@ impl Bus {
             return;
         }
         if c == '\n' || c == '\r' {
-            debug!(target: "ps2_core::iop::tty", "{}", self.iop_tty_line);
-            self.iop_tty_line.clear();
-            self.iop_tty_buffer.push('\n');
-        } else {
-            if byte.is_ascii() && !c.is_control() {
-                self.iop_tty_line.push(c);
+            let line = core::mem::take(&mut self.iop_tty_line);
+            for text in self.iop_tty_collapse.feed(&line) {
+                debug!(target: "ps2_core::iop::tty", "{}", text);
+                self.iop_tty_buffer.push_str(&text);
+                self.iop_tty_buffer.push('\n');
             }
-            self.iop_tty_buffer.push(c);
+        } else if byte.is_ascii() && !c.is_control() {
+            self.iop_tty_line.push(c);
         }
+    }
+}
+
+/// Consecutive identical console lines, kept once and counted. A title
+/// that prints the same decoder error for every macroblock it cannot parse
+/// buries everything else in the capture buffer otherwise: AC5's movie
+/// player writes about 1400 of them per second of emulated time, and
+/// nothing else at all.
+#[derive(Default)]
+struct LineCollapse {
+    /// The last line let through.
+    last: String,
+    /// Lines identical to it suppressed since.
+    repeats: u64,
+}
+
+impl LineCollapse {
+    /// Feed one completed line and get back what to print for it: nothing
+    /// while the line repeats, and the tally of the run that just ended in
+    /// front of the first line that differs. Blank lines are never
+    /// collapsed — they are layout, not content.
+    fn feed(&mut self, line: &str) -> Vec<String> {
+        if line == self.last && !line.is_empty() {
+            self.repeats += 1;
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(2);
+        if self.repeats > 0 {
+            out.push(format!("[last line repeated {} times]", self.repeats));
+            self.repeats = 0;
+        }
+        self.last.clear();
+        self.last.push_str(line);
+        out.push(line.to_string());
+        out
     }
 }
 
@@ -4882,12 +4934,33 @@ mod tests {
             b.write8(0x2000 + i as u32, *c);
         }
         b.deci2_kputs(0x1000);
-        assert_eq!(b.tty_buffer, "Grow two:256\n??");
+        // The capture takes whole lines, so the unterminated tail is still
+        // pending in `deci2_line`.
+        assert_eq!(b.tty_buffer, "Grow two:256\n");
         assert_eq!(b.deci2_line, r"\x82\xa0");
         // An unreadable pointer prints nothing rather than faulting.
         b.write32(0x1000, 0x1234_5678);
         b.deci2_kputs(0x1000);
-        assert_eq!(b.tty_buffer, "Grow two:256\n??");
+        assert_eq!(b.tty_buffer, "Grow two:256\n");
+    }
+
+    #[test]
+    fn a_repeated_console_line_is_printed_once_and_counted() {
+        let mut b = bus();
+        b.write32(0x1000, 0x2000);
+        for (i, c) in b"spam\n".iter().enumerate() {
+            b.write8(0x2000 + i as u32, *c);
+        }
+        for _ in 0..4 {
+            b.deci2_kputs(0x1000);
+        }
+        // Mid-run: only the first line has been let through.
+        assert_eq!(b.tty_buffer, "spam\n");
+        for (i, c) in b"eggs\n".iter().enumerate() {
+            b.write8(0x2000 + i as u32, *c);
+        }
+        b.deci2_kputs(0x1000);
+        assert_eq!(b.tty_buffer, "spam\n[last line repeated 3 times]\neggs\n");
     }
 
     /// Issue an N command with an LSN/count parameter block and return the
