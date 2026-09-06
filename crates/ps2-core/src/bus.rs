@@ -1633,13 +1633,20 @@ pub struct Bus {
 impl Bus {
     pub fn new(bios: Vec<u8>, gs_threaded: bool, region: Region) -> Self {
         assert_eq!(bios.len(), BIOS_SIZE);
+        Self::with_bios(bios.into_boxed_slice(), gs_threaded, region)
+    }
+
+    /// [`Bus::new`] around an image that has already been checked — or
+    /// around none at all, for a machine whose [`crate::Ambient`] assets
+    /// are about to be installed.
+    pub(crate) fn with_bios(bios: Box<[u8]>, gs_threaded: bool, region: Region) -> Self {
         let mut mmio = vec![0u8; MMIO_SIZE].into_boxed_slice();
         // DMAC ENABLER resets to 0x1201; the BIOS uses it as a board-revision
         // key into its RDRAM configuration table during InitRDRAM.
         write_le::<4>(&mut mmio, 0xF590, 0x1201);
         let mut bus = Self {
             ram: vec![0u8; RAM_SIZE].into_boxed_slice(),
-            bios: bios.into_boxed_slice(),
+            bios,
             spad: vec![0u8; SPAD_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; 2 * 1024 * 1024].into_boxed_slice(),
             timers_due: 0,

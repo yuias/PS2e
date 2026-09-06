@@ -315,7 +315,7 @@ fn main() -> ExitCode {
         }
     };
     let region = args.region.unwrap_or(cfg.region);
-    let mut sys = match Ps2System::new_with_region(bios.clone(), !args.gs_inline, region) {
+    let mut sys = match Ps2System::new_with_region(bios, !args.gs_inline, region) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -406,8 +406,7 @@ fn main() -> ExitCode {
     }
 
     if windowed {
-        let nvram_path = std::path::Path::new(&bios_path).with_extension("nvm");
-        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path, nvram_path, cheats)
+        run_windowed(sys, args, cfg, cfg_path, debugger, memcard_path, cheats)
     } else {
         run_headless(sys, &args, debugger, memcard_path, cheats)
     }
@@ -415,13 +414,11 @@ fn main() -> ExitCode {
 
 fn run_windowed(
     sys: Ps2System,
-    bios: Vec<u8>,
     args: Args,
     cfg: config::Config,
     cfg_path: Option<PathBuf>,
     debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
-    nvram_path: PathBuf,
     cheats: Vec<ps2_core::cheats::Cheat>,
 ) -> ExitCode {
     let region = sys.region();
@@ -441,8 +438,6 @@ fn run_windowed(
         options,
         Box::new(move |cc| {
             let worker_cfg = emu::WorkerConfig {
-                bios,
-                nvram_path: Some(nvram_path),
                 memcard_path,
                 state_path,
                 disc_name,

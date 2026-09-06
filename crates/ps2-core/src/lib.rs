@@ -206,12 +206,20 @@ impl Ps2System {
                 bios.len()
             ));
         }
+        Self::build(bios.into_boxed_slice(), gs_threaded, region)
+    }
+
+    /// The machine every constructor ends at. The image is not checked
+    /// here: a fresh one is checked by [`Ps2System::new_with_region`], and
+    /// a power cycle builds with none, then installs the checked one the
+    /// old machine was already running on.
+    fn build(bios: Box<[u8]>, gs_threaded: bool, region: Region) -> Result<Self, String> {
         // `mut` only for the recompiler hand-off just below it.
         #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_mut))]
         let mut sys = Self {
             ee: ee::Cpu::new(),
             iop: iop::Cpu::new(),
-            bus: Bus::new(bios, gs_threaded, region),
+            bus: Bus::with_bios(bios, gs_threaded, region),
             cycles: 0,
             frame_pos: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -283,6 +291,30 @@ impl Ps2System {
         self.bus.tty_buffer = ambient.tty;
         self.bus.iop_tty_buffer = ambient.iop_tty;
         self.bus.dma_watch = ambient.dma_watch;
+    }
+
+    /// Rebuild the machine from the reset vector, keeping the [`Ambient`]
+    /// assets — as a real console keeps the disc in the drive, the memory
+    /// card and the mechacon EEPROM across a power cycle. `region` is the
+    /// console's own video timing, not whatever the last program left the
+    /// CRTC programmed for.
+    pub fn power_cycle(&mut self, region: Region) -> Result<(), String> {
+        // Built BIOS-less and inline: `set_ambient` brings the image
+        // back, and a renderer built here would be a GS thread started
+        // only to be dropped. Everything that can fail happens on it
+        // before the assets move, so a failure leaves the running machine
+        // alone rather than stranded without them.
+        let mut fresh = Self::build(Box::default(), false, region)?;
+        fresh.set_jit(self.jit_enabled())?;
+        fresh.set_iop_jit(self.iop_jit_enabled())?;
+        let mut ambient = self.take_ambient();
+        // The renderer is the host's, but what it holds is the machine's.
+        ambient.gs.reset();
+        // This one *is* a boot, so the one-shot cheats fire again.
+        ambient.cheats.rearm();
+        fresh.set_ambient(ambient);
+        *self = fresh;
+        Ok(())
     }
 
     /// Serialize the complete machine state. The [`Ambient`] assets are
@@ -410,6 +442,18 @@ impl Ps2System {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.jit.is_some()
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
+    /// Whether the IOP recompiler is active.
+    pub fn iop_jit_enabled(&self) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.iop_jit.is_some()
         }
         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
         {
@@ -1045,6 +1089,57 @@ mod state_tests {
         // And it still runs: the cheat lands at the next frame boundary.
         sys.run(sys.frame_cycles());
         assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
+    }
+
+    /// A power cycle keeps the assets and starts the machine over: the
+    /// one-shot cheats arm again, the renderer comes up blank.
+    #[test]
+    fn a_power_cycle_keeps_the_assets_and_rearms() {
+        use cheats::{Cheat, Op, Target};
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        sys.set_cheats(vec![Cheat {
+            target: Target::Ee,
+            once: true,
+            op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
+        }]);
+        sys.set_cheats_enabled(true);
+        sys.bus.cdvd.nvram[0] = 0x5A;
+        sys.bus.dma_watch.push(bus::DmaWatch { iop: false, start: 0x1000, len: 16 });
+        sys.bus.gs.pmode = 0x66;
+        let frame = sys.frame_cycles();
+        sys.run(frame);
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
+
+        sys.power_cycle(Region::Ntsc).unwrap();
+        assert_eq!(sys.bus.cdvd.nvram[0], 0x5A);
+        assert_eq!(sys.cheats().len(), 1);
+        assert_eq!(sys.bus.dma_watch.len(), 1);
+        assert_eq!(sys.bus.gs.pmode, 0);
+        assert!(sys.bus.gs.vram().iter().all(|&b| b == 0));
+        // RAM went with the machine; the spent one-shot writes it again.
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0));
+        sys.run(frame);
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
+    }
+
+    /// The same, with the renderer on its worker thread: the reset has to
+    /// reach across the channel, and the thread has to outlive it.
+    #[cfg(feature = "threads")]
+    #[test]
+    fn a_power_cycle_blanks_a_threaded_renderer() {
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], true).unwrap();
+        // Upload two PSMCT32 pixels to the start of VRAM.
+        let gs = &mut sys.bus.gs;
+        gs.write_reg(0x50, 2 << 48); // BITBLTBUF: DBP 0, DBW 2, PSMCT32
+        gs.write_reg(0x51, 0); // TRXPOS
+        gs.write_reg(0x52, 2 | (1 << 32)); // TRXREG: 2x1
+        gs.write_reg(0x53, 0); // TRXDIR: host to local
+        gs.write_reg(0x54, u64::MAX); // HWREG
+        assert!(gs.vram().iter().any(|&b| b != 0));
+
+        sys.power_cycle(Region::Ntsc).unwrap();
+        assert!(sys.bus.gs.is_threaded());
+        assert!(sys.bus.gs.vram().iter().all(|&b| b == 0));
     }
 
     #[test]

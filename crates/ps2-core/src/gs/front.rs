@@ -88,6 +88,8 @@ enum Cmd {
     Snapshot(std::sync::mpsc::SyncSender<Vec<u8>>),
     /// Replace the renderer with a state from [`Cmd::Snapshot`].
     Restore(Vec<u8>),
+    /// Start over on a blank renderer (power cycle).
+    Reset,
 }
 
 /// A save state's view of the display side: the EE-visible privileged
@@ -277,6 +279,7 @@ impl GsFront {
                 Ok(new) => *gs = new,
                 Err(e) => tracing::error!("renderer state load failed: {e}"),
             },
+            Cmd::Reset => *gs = Gs::new(),
         }
     }
 
@@ -519,6 +522,38 @@ impl GsFront {
             internal_2x: self.internal_2x,
             renderer,
         })
+    }
+
+    /// Blank the renderer for a power cycle. VRAM and the privileged
+    /// registers are machine state and go; the renderer itself — the
+    /// worker thread, and the frame slot the frontend reads through — and
+    /// the display switches belong to the host and stay.
+    pub fn reset(&mut self) {
+        self.batch.clear();
+        self.image.clear();
+        self.pmode = 0;
+        self.smode1 = 0;
+        self.smode2 = 0;
+        self.dispfb1 = 0;
+        self.display1 = 0;
+        self.dispfb2 = 0;
+        self.display2 = 0;
+        self.bgcolor = 0;
+        self.csr = 0;
+        self.imr = 0xFF00; // all sources masked at reset
+        self.priv_shadow = [0; 32];
+        self.intc_pending = false;
+        match &mut self.inline {
+            Some(gs) => *gs = Gs::new(),
+            _ => {
+                self.push(Cmd::Reset);
+                self.flush();
+            }
+        }
+        // A fresh renderer draws at 1x whatever the front last asked for,
+        // so re-send the switch from a cleared copy of it.
+        let internal_2x = std::mem::take(&mut self.internal_2x);
+        self.set_internal_2x(internal_2x);
     }
 
     /// Put back a [`GsFront::snapshot`], keeping the renderer where it is.

@@ -257,9 +257,6 @@ pub fn deinterlace_mode(index: u8) -> ps2_core::gs::Deinterlace {
 
 /// Everything the worker owns besides the system itself.
 pub struct WorkerConfig {
-    pub bios: Vec<u8>,
-    /// Mechacon NVRAM image next to the BIOS; re-attached on reset.
-    pub nvram_path: Option<PathBuf>,
     /// None disables persistence (headless-style, no card mounted).
     pub memcard_path: Option<PathBuf>,
     /// Where the window's save state lives.
@@ -460,8 +457,7 @@ impl Worker {
                 Command::Reset if !debugger_active => {
                     self.running = false;
                     let name = self.disc_name.clone();
-                    let disc = self.sys.bus.cdvd.disc.take();
-                    self.power_cycle(disc);
+                    self.power_cycle();
                     self.publish_disc(name);
                 }
                 Command::OpenTray if !debugger_active => {
@@ -485,7 +481,8 @@ impl Worker {
                 Command::BootDisc(disc) if !debugger_active => {
                     let name = disc.as_ref().map(|d| d.name.clone());
                     let cheats = disc.as_ref().map(|d| d.cheats.clone()).unwrap_or_default();
-                    self.power_cycle(disc.map(|d| d.file));
+                    self.sys.bus.cdvd.disc = disc.map(|d| d.file);
+                    self.power_cycle();
                     self.install_cheats(cheats);
                     self.publish_disc(name);
                     self.running = true;
@@ -549,22 +546,11 @@ impl Worker {
         self.ctx.request_repaint();
     }
 
-    /// Rebuild the machine from the reset vector with `disc` in the drive.
-    /// The memory card (mid-write contents included) and the mechacon NVRAM
-    /// survive, as they do across a real power cycle.
-    fn power_cycle(&mut self, disc: Option<std::fs::File>) {
-        let nvram_path = self.cfg.nvram_path.clone();
-        let memcard = std::mem::take(&mut self.sys.bus.sio2.memcard);
-        let jit = self.sys.jit_enabled();
-        self.sys = Ps2System::new_region(self.cfg.bios.clone(), self.cfg.region).expect("reset failed");
-        let _ = self.sys.set_jit(jit);
-        self.sys.set_publish_frames(true);
-        if let Some(p) = nvram_path {
-            self.sys.load_nvram(p);
-        }
-        self.sys.bus.cdvd.disc = disc;
-        self.sys.bus.sio2.memcard = memcard;
-        self.sys.set_cheats(self.cheats.clone());
+    /// Rebuild the machine from the reset vector. The disc, memory card
+    /// (mid-write contents included) and mechacon NVRAM survive in the
+    /// core, as they do across a real power cycle.
+    fn power_cycle(&mut self) {
+        self.sys.power_cycle(self.cfg.region).expect("reset failed");
         // A scan's candidates describe the machine that was just replaced.
         self.scan = None;
         *self.shared.scan.lock().unwrap() = scan::Result::default();

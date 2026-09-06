@@ -296,6 +296,11 @@ pub struct Table {
 }
 
 impl Table {
+    /// Re-arm the one-shot entries, for a machine that starts over.
+    pub(crate) fn rearm(&mut self) {
+        self.done.fill(false);
+    }
+
     pub fn len(&self) -> usize {
         self.cheats.len()
     }
