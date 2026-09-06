@@ -18,6 +18,7 @@ mod display;
 mod emu;
 mod gamepad;
 mod pad;
+mod scan;
 mod state;
 mod ui;
 

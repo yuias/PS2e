@@ -8,6 +8,7 @@
 //! a wasm build driving the same snapshots single-threaded).
 
 use crate::audio::Audio;
+use crate::scan;
 use ps2_core::cheats::Cheat;
 use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 use std::path::PathBuf;
@@ -104,7 +105,37 @@ pub enum Command {
     SaveState,
     /// Restore it from there.
     LoadState,
+    /// One pass of the memory scanner; the result lands in
+    /// [`Shared::scan`].
+    Scan(scan::Request),
     Quit,
+}
+
+/// Debug panels the UI has open, as bits in [`Shared::panels`]. The
+/// worker does the work behind a panel only while its bit is set, so a
+/// closed panel costs nothing.
+pub const PANEL_REGS: u8 = 1;
+pub const PANEL_MEMORY: u8 = 2;
+
+/// Bytes the memory viewer shows at once.
+pub const VIEW_BYTES: usize = 256;
+
+/// One window of memory for the viewer, refreshed with the framebuffer
+/// while the panel is open.
+#[derive(Clone, Default)]
+pub struct MemoryView {
+    pub target: Option<scan::Target>,
+    pub base: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Pack the viewer's request into one atomic word.
+pub fn pack_view(target: scan::Target, base: u32) -> u64 {
+    u64::from(base) | u64::from(target == scan::Target::Iop) << 32
+}
+
+pub fn unpack_view(word: u64) -> (scan::Target, u32) {
+    (if word >> 32 != 0 { scan::Target::Iop } else { scan::Target::Ee }, word as u32)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +208,14 @@ pub struct Shared {
     pub swap_fields: AtomicBool,
     /// Whether the disc's cheats are applied (UI -> worker).
     pub cheats: AtomicBool,
+    /// Open debug panels (UI -> worker), `PANEL_*` bits.
+    pub panels: std::sync::atomic::AtomicU8,
+    /// The window the memory viewer wants (UI -> worker), see [`pack_view`].
+    pub view: AtomicU64,
+    /// That window's bytes (worker -> UI).
+    pub memory: Mutex<MemoryView>,
+    /// The last scanner pass (worker -> UI).
+    pub scan: Mutex<scan::Result>,
     /// Render internally at 2x (UI -> worker).
     pub internal_2x: AtomicBool,
     /// Debugger attached/halted (set by the worker) drives UI enablement.
@@ -292,6 +331,8 @@ struct Worker {
     removed: Option<Disc>,
     /// The cheat table of the disc in the drive, kept across power cycles.
     cheats: Vec<Cheat>,
+    /// Memory scan in progress.
+    scan: Option<scan::Scan>,
     /// File name of the disc in the drive; mirrors `Shared::disc` so the
     /// worker can restore it across a power cycle without reading it back.
     disc_name: Option<String>,
@@ -325,6 +366,7 @@ impl Worker {
             debugger_seen: false,
             removed: None,
             cheats: Vec::new(),
+            scan: None,
             disc_name: None,
             clock: now,
             deficit: 0.0,
@@ -467,6 +509,16 @@ impl Worker {
                         .map(|()| "state loaded".to_string());
                     self.report(outcome);
                 }
+                Command::Scan(req) => {
+                    let ram = match req.target {
+                        scan::Target::Ee => &self.sys.bus.ram[..],
+                        scan::Target::Iop => &self.sys.bus.iop_ram[..],
+                    };
+                    let (scan, result) = scan::Scan::pass(self.scan.take(), req, ram);
+                    self.scan = Some(scan);
+                    *self.shared.scan.lock().unwrap() = result;
+                    self.ctx.request_repaint();
+                }
                 Command::SetRunning(_)
                 | Command::Step
                 | Command::Reset
@@ -513,6 +565,9 @@ impl Worker {
         self.sys.bus.cdvd.disc = disc;
         self.sys.bus.sio2.memcard = memcard;
         self.sys.set_cheats(self.cheats.clone());
+        // A scan's candidates describe the machine that was just replaced.
+        self.scan = None;
+        *self.shared.scan.lock().unwrap() = scan::Result::default();
     }
 
     /// Run one slice if the pacer allows it. With an audio device the SPU2's
@@ -560,8 +615,12 @@ impl Worker {
 
     fn publish(&mut self) {
         let now = Instant::now();
+        let panels = self.shared.panels.load(Ordering::Relaxed);
         if now.duration_since(self.last_frame_publish) >= FRAME_INTERVAL {
             self.last_frame_publish = now;
+            if panels & PANEL_MEMORY != 0 {
+                self.publish_memory();
+            }
             if let Some((w, h, rgba)) = self.sys.latest_frame_shared()
                 && w > 0
                 && h > 0
@@ -603,20 +662,39 @@ impl Worker {
                 st.audio_buffered = audio.buffered_frames();
                 st.audio_underruns = audio.underruns();
             }
-            st.ee_pc = self.sys.ee.pc;
-            st.ee_gpr = self.sys.ee.gpr;
-            st.ee_hi = self.sys.ee.hi;
-            st.ee_lo = self.sys.ee.lo;
-            st.ee_cop0 = self.sys.ee.cop0.regs;
-            st.iop_pc = self.sys.iop.pc;
-            st.iop_gpr = self.sys.iop.gpr;
-            st.iop_hi = self.sys.iop.hi;
-            st.iop_lo = self.sys.iop.lo;
-            st.iop_cop0 = self.sys.iop.cop0;
+            // Both register files, only while a panel shows them.
+            if panels & PANEL_REGS != 0 {
+                st.ee_pc = self.sys.ee.pc;
+                st.ee_gpr = self.sys.ee.gpr;
+                st.ee_hi = self.sys.ee.hi;
+                st.ee_lo = self.sys.ee.lo;
+                st.ee_cop0 = self.sys.ee.cop0.regs;
+                st.iop_pc = self.sys.iop.pc;
+                st.iop_gpr = self.sys.iop.gpr;
+                st.iop_hi = self.sys.iop.hi;
+                st.iop_lo = self.sys.iop.lo;
+                st.iop_cop0 = self.sys.iop.cop0;
+            }
         }
         self.shared
             .debugger_active
             .store(self.debugger_active(), Ordering::Relaxed);
+    }
+
+    /// Copy the window the viewer asked for. Addresses are RAM offsets,
+    /// clamped so the window never runs off the end.
+    fn publish_memory(&mut self) {
+        let (target, base) = unpack_view(self.shared.view.load(Ordering::Relaxed));
+        let ram = match target {
+            scan::Target::Ee => &self.sys.bus.ram[..],
+            scan::Target::Iop => &self.sys.bus.iop_ram[..],
+        };
+        let base = (base as usize & !0xF).min(ram.len() - VIEW_BYTES);
+        let mut m = self.shared.memory.lock().unwrap();
+        m.target = Some(target);
+        m.base = base as u32;
+        m.bytes.clear();
+        m.bytes.extend_from_slice(&ram[base..base + VIEW_BYTES]);
     }
 
     /// Stream kernel TTY output to stdout (same as the headless path) and

@@ -5,7 +5,8 @@
 //! is deliberate — a wasm frontend could reuse the same snapshot types.
 
 use crate::config::Config;
-use crate::emu::{Command, DebuggerState, Disc, Emu};
+use crate::emu::{Command, DebuggerState, Disc, Emu, MemoryView, PANEL_MEMORY, PANEL_REGS};
+use crate::scan;
 use eframe::egui;
 use crate::gamepad::Gamepad;
 use std::path::PathBuf;
@@ -49,6 +50,41 @@ const REG_NAMES: [&str; 32] = [
 
 // Standard MIPS COP0 register numbers; identical on the EE (see
 // ps2_core::ee::cop0) and the IOP's private constants of the same values.
+/// An address as typed into the memory panel: always hex, with or
+/// without a `0x` prefix.
+fn parse_addr(text: &str) -> Option<u32> {
+    let t = text.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    u32::from_str_radix(t, 16).ok()
+}
+
+/// A value as typed into the scanner: hex with a `0x` prefix, otherwise
+/// decimal, which is how a score or a hit-point count is read off the
+/// screen.
+fn parse_value(text: &str) -> Option<u64> {
+    let t = text.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => t.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+
+    #[test]
+    fn addresses_are_hex_and_values_are_decimal_unless_prefixed() {
+        assert_eq!(parse_addr("1000"), Some(0x1000));
+        assert_eq!(parse_addr("0x00100000"), Some(0x10_0000));
+        assert_eq!(parse_addr("zz"), None);
+        assert_eq!(parse_value("12345"), Some(12345));
+        assert_eq!(parse_value("65535"), Some(65535));
+        assert_eq!(parse_value("0x10"), Some(16));
+        assert_eq!(parse_value(""), None);
+    }
+}
+
 const COP0_STATUS: usize = 12;
 const COP0_CAUSE: usize = 13;
 const COP0_EPC: usize = 14;
@@ -67,6 +103,13 @@ pub struct App {
     last_screenshot: Option<String>,
     show_tty: bool,
     show_regs: bool,
+    show_mem: bool,
+    /// Memory panel state: the viewer's target and address (as typed),
+    /// the scanner's width and value (as typed).
+    mem_target: scan::Target,
+    mem_addr: String,
+    scan_width: u8,
+    scan_value: String,
     fullscreen: bool,
     /// Key -> pad bit, resolved from the config once at startup.
     keymap: Vec<(egui::Key, u16)>,
@@ -101,6 +144,11 @@ impl App {
             last_screenshot: None,
             show_tty: false,
             show_regs: false,
+            show_mem: false,
+            mem_target: scan::Target::Ee,
+            mem_addr: "00100000".into(),
+            scan_width: 4,
+            scan_value: String::new(),
             fullscreen: false,
             keymap,
             gamepad,
@@ -126,6 +174,107 @@ impl App {
     fn boot_disc(&mut self) {
         if let Some(disc) = self.pick_disc() {
             self.emu.send(Command::BootDisc(Some(disc)));
+        }
+    }
+
+    /// The memory viewer (one window of RAM, refreshed with the frame)
+    /// and the scanner (find a value, narrow it down as it moves).
+    fn memory_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.mem_target, scan::Target::Ee, "EE");
+            ui.radio_value(&mut self.mem_target, scan::Target::Iop, "IOP");
+            ui.label("address");
+            ui.add(egui::TextEdit::singleline(&mut self.mem_addr).desired_width(90.0).font(egui::TextStyle::Monospace));
+        });
+        let view: MemoryView = self.emu.shared.memory.lock().unwrap().clone();
+        if view.target == Some(self.mem_target) && !view.bytes.is_empty() {
+            let mut text = String::new();
+            for (row, chunk) in view.bytes.chunks(16).enumerate() {
+                let addr = view.base + row as u32 * 16;
+                text.push_str(&format!("{addr:08x} "));
+                for (i, b) in chunk.iter().enumerate() {
+                    text.push_str(&format!(" {b:02x}"));
+                    if i == 7 {
+                        text.push(' ');
+                    }
+                }
+                text.push_str("  ");
+                text.extend(chunk.iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }));
+                text.push('\n');
+            }
+            ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap_mode(egui::TextWrapMode::Extend));
+        } else {
+            ui.label("waiting for the worker");
+        }
+
+        ui.separator();
+        ui.heading("Scan");
+        ui.horizontal(|ui| {
+            ui.label("width");
+            for w in [1u8, 2, 4] {
+                ui.radio_value(&mut self.scan_width, w, w.to_string());
+            }
+            ui.label("value");
+            ui.add(egui::TextEdit::singleline(&mut self.scan_value).desired_width(110.0).font(egui::TextStyle::Monospace))
+                .on_hover_text("decimal, or hex with a 0x prefix");
+        });
+        let value = parse_value(&self.scan_value);
+        let mut request = None;
+        ui.horizontal(|ui| {
+            ui.label("new scan");
+            if ui.add_enabled(value.is_some(), egui::Button::new("= value")).clicked() {
+                request = Some((scan::Filter::Exact(value.unwrap()), true));
+            }
+            if ui.button("unknown value").clicked() {
+                request = Some((scan::Filter::Unknown, true));
+            }
+        });
+        let result = self.emu.shared.scan.lock().unwrap().clone();
+        let live = result.target == Some(self.mem_target) && result.width == self.scan_width;
+        ui.horizontal(|ui| {
+            ui.label("narrow");
+            ui.add_enabled_ui(live, |ui| {
+                if ui.add_enabled(value.is_some(), egui::Button::new("= value")).clicked() {
+                    request = Some((scan::Filter::Exact(value.unwrap()), false));
+                }
+                for (label, filter) in [
+                    ("changed", scan::Filter::Changed),
+                    ("unchanged", scan::Filter::Unchanged),
+                    ("increased", scan::Filter::Increased),
+                    ("decreased", scan::Filter::Decreased),
+                ] {
+                    if ui.button(label).clicked() {
+                        request = Some((filter, false));
+                    }
+                }
+            });
+        });
+        if let Some((filter, restart)) = request {
+            self.emu.send(Command::Scan(scan::Request {
+                target: self.mem_target,
+                width: self.scan_width,
+                filter,
+                restart,
+            }));
+        }
+        if live {
+            ui.label(format!("{} candidate{}", result.count, if result.count == 1 { "" } else { "s" }));
+            let digits = usize::from(result.width) * 2;
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for &(addr, value) in &result.hits {
+                    let line = format!("{addr:08x}  {value:0digits$x}  {value}");
+                    if ui
+                        .add(egui::Label::new(egui::RichText::new(line).monospace()).sense(egui::Sense::click()))
+                        .on_hover_text("show in the viewer")
+                        .clicked()
+                    {
+                        self.mem_addr = format!("{:08x}", addr & !0xF);
+                    }
+                }
+                if result.count > result.hits.len() {
+                    ui.label(format!("... and {} more", result.count - result.hits.len()));
+                }
+            });
         }
     }
 
@@ -218,6 +367,21 @@ impl eframe::App for App {
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
         self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
         self.emu.shared.cheats.store(self.cheats, Ordering::Relaxed);
+        // The worker does the work behind a debug panel only while it is
+        // open; a closed one costs nothing but this store.
+        let chrome_now = !self.fullscreen;
+        let mut panels = 0;
+        if chrome_now && self.show_regs {
+            panels |= PANEL_REGS;
+        }
+        if chrome_now && self.show_mem {
+            panels |= PANEL_MEMORY;
+        }
+        self.emu.shared.panels.store(panels, Ordering::Relaxed);
+        if panels & PANEL_MEMORY != 0 {
+            let base = parse_addr(&self.mem_addr).unwrap_or(0);
+            self.emu.shared.view.store(crate::emu::pack_view(self.mem_target, base), Ordering::Relaxed);
+        }
         self.emu.shared.internal_2x.store(self.internal_2x, Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
@@ -351,6 +515,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.checkbox(&mut self.show_tty, "TTY panel");
                         ui.checkbox(&mut self.show_regs, "Registers panel");
+                        ui.checkbox(&mut self.show_mem, "Memory panel");
                     });
                     ui.menu_button("Audio", |ui| {
                         ui.add(
@@ -490,6 +655,12 @@ impl eframe::App for App {
                         });
                     });
                 });
+        }
+
+        if chrome && self.show_mem {
+            egui::SidePanel::right("memory")
+                .default_width(460.0)
+                .show(ctx, |ui| self.memory_panel(ui));
         }
 
         if chrome && self.show_tty {
