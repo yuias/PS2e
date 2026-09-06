@@ -33,6 +33,13 @@ volume = 0.5
 # multiple, then linear) or "lanczos".
 scaler = "sharp"
 
+# Display aspect ratio. PS2 pixels are not square -- a title renders into
+# whatever framebuffer it likes (512x448, 640x448, ...) and the CRT shows
+# it as 4:3 either way -- so "native", which presents the framebuffer at
+# 1:1, is a debugging aid rather than a correct picture. Use "16:9" only
+# for titles set to widescreen in their own options menu.
+aspect = "4:3"
+
 # Interlaced output: "weave" (both fields, combs on motion), "bob" (latest
 # field only, bobs by nature), "blend" (weave softened vertically),
 # "adaptive" (weave where still, bob where moving), "adaptivedebug"
@@ -116,6 +123,7 @@ pub struct Config {
     pub volume: f32,
     pub memcard: Option<PathBuf>,
     pub scaler: crate::display::ScaleMode,
+    pub aspect: AspectSetting,
     pub deinterlace: DeinterlaceSetting,
     pub swap_fields: bool,
     pub internal_2x: bool,
@@ -339,6 +347,44 @@ impl DeinterlaceSetting {
     }
 }
 
+/// Shape the display is presented in. The framebuffer's own pixel count
+/// says nothing about it: PS2 pixels are non-square and the CRT scans a
+/// 4:3 raster whatever the title renders into.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AspectSetting {
+    #[default]
+    #[serde(rename = "4:3")]
+    Ratio4x3,
+    #[serde(rename = "16:9")]
+    Ratio16x9,
+    /// Framebuffer pixels at 1:1 -- wrong on a TV, useful when reading
+    /// texel-level detail out of a screenshot.
+    #[serde(rename = "native")]
+    Native,
+}
+
+impl AspectSetting {
+    pub const ALL: [AspectSetting; 3] =
+        [AspectSetting::Ratio4x3, AspectSetting::Ratio16x9, AspectSetting::Native];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AspectSetting::Ratio4x3 => "4:3",
+            AspectSetting::Ratio16x9 => "16:9",
+            AspectSetting::Native => "Native (square pixels)",
+        }
+    }
+
+    /// Width/height to present `width x height` framebuffer pixels at.
+    pub fn ratio(self, width: u32, height: u32) -> f32 {
+        match self {
+            AspectSetting::Ratio4x3 => 4.0 / 3.0,
+            AspectSetting::Ratio16x9 => 16.0 / 9.0,
+            AspectSetting::Native => width.max(1) as f32 / height.max(1) as f32,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -347,6 +393,7 @@ impl Default for Config {
             volume: 0.5,
             memcard: None,
             scaler: crate::display::ScaleMode::Sharp,
+            aspect: AspectSetting::default(),
             deinterlace: DeinterlaceSetting::Bwdif,
             swap_fields: false,
             internal_2x: false,
@@ -479,6 +526,18 @@ mod tests {
         let cfg: Config = toml::from_str(r#"region = "pal""#).expect("parses");
         assert_eq!(cfg.region, Region::Pal);
         assert_eq!(Config::default().region, Region::Ntsc);
+    }
+
+    /// A 512x448 title and a 640x448 one fill the same 4:3 raster; only
+    /// "native" follows the framebuffer.
+    #[test]
+    fn aspect_reads_from_the_file_and_defaults_to_four_by_three() {
+        let cfg: Config = toml::from_str(r#"aspect = "16:9""#).expect("parses");
+        assert_eq!(cfg.aspect, AspectSetting::Ratio16x9);
+        assert_eq!(Config::default().aspect, AspectSetting::Ratio4x3);
+        assert_eq!(AspectSetting::Ratio4x3.ratio(512, 448), 4.0 / 3.0);
+        assert_eq!(AspectSetting::Ratio4x3.ratio(640, 448), 4.0 / 3.0);
+        assert_eq!(AspectSetting::Native.ratio(512, 448), 512.0 / 448.0);
     }
 
     #[test]

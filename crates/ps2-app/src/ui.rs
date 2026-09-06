@@ -92,6 +92,7 @@ const COP0_EPC: usize = 14;
 pub struct App {
     emu: Emu,
     scale_mode: crate::display::ScaleMode,
+    aspect: crate::config::AspectSetting,
     deinterlace: crate::config::DeinterlaceSetting,
     swap_fields: bool,
     cheats: bool,
@@ -134,6 +135,7 @@ impl App {
         Self {
             emu,
             scale_mode: config.scaler,
+            aspect: config.aspect,
             deinterlace: config.deinterlace,
             swap_fields: config.swap_fields,
             cheats: config.cheats,
@@ -328,6 +330,7 @@ impl Drop for App {
         if let Some(path) = &self.config_path
             && ((self.config.volume - self.volume).abs() > f32::EPSILON
                 || self.config.scaler != self.scale_mode
+                || self.config.aspect != self.aspect
                 || self.config.deinterlace != self.deinterlace
                 || self.config.swap_fields != self.swap_fields
                 || self.config.cheats != self.cheats
@@ -335,6 +338,7 @@ impl Drop for App {
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
+            self.config.aspect = self.aspect;
             self.config.deinterlace = self.deinterlace;
             self.config.swap_fields = self.swap_fields;
             self.config.cheats = self.cheats;
@@ -503,6 +507,11 @@ impl eframe::App for App {
                         ui.label("Scaler");
                         for mode in crate::display::ScaleMode::ALL {
                             ui.radio_value(&mut self.scale_mode, mode, mode.label());
+                        }
+                        ui.separator();
+                        ui.label("Aspect ratio");
+                        for mode in crate::config::AspectSetting::ALL {
+                            ui.radio_value(&mut self.aspect, mode, mode.label());
                         }
                         ui.separator();
                         ui.label("Deinterlace");
@@ -702,9 +711,11 @@ impl eframe::App for App {
                 ui.centered_and_justified(|ui| ui.label("waiting for a frame..."));
                 return;
             }
-            // Fit the panel while keeping the framebuffer's own aspect ratio.
+            // Fit the panel to the display aspect ratio. It is not the
+            // framebuffer's: PS2 pixels are non-square, so a 512x448 buffer
+            // and a 640x448 one both fill the same 4:3 raster.
             let avail = ui.available_size();
-            let aspect = width as f32 / height as f32;
+            let aspect = self.aspect.ratio(width, height);
             let scale = (avail.x / aspect).min(avail.y);
             let size = egui::Vec2::new(scale * aspect, scale);
             let rect = egui::Rect::from_center_size(ui.available_rect_before_wrap().center(), size);
