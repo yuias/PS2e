@@ -118,7 +118,7 @@ pane_width = 420.0
 #load_state = "F9"
 "#;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub bios: Option<PathBuf>,
@@ -146,7 +146,7 @@ pub struct Config {
 }
 
 /// Frontend shortcuts, same key names as [`KeyBindings`].
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct HotKeys {
     pub save_state: String,
@@ -161,7 +161,7 @@ impl Default for HotKeys {
 
 /// One egui key name per digital-pad button, as written in the config
 /// file. Resolved to [`egui::Key`] once at startup by the UI.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyBindings {
     pub up: String,
@@ -234,7 +234,7 @@ impl KeyBindings {
 /// One gilrs button name per digital-pad button, as written in the config
 /// file. Resolved to [`gilrs::Button`] once at startup by
 /// [`crate::gamepad::Gamepad`].
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct PadBindings {
     pub up: String,

@@ -486,29 +486,23 @@ impl App {
 
 impl Drop for App {
     /// Persist settings changed from the UI. (The worker flushes the memory
-    /// card itself when it stops.)
+    /// card itself when it stops.) Comparing whole configs rather than
+    /// field by field means a new setting only has to be copied in here,
+    /// not also added to a condition that is easy to forget.
     fn drop(&mut self) {
-        if let Some(path) = &self.config_path
-            && ((self.config.volume - self.volume).abs() > f32::EPSILON
-                || self.config.scaler != self.scale_mode
-                || self.config.aspect != self.aspect
-                || self.config.deinterlace != self.deinterlace
-                || self.config.swap_fields != self.swap_fields
-                || self.config.cheats != self.cheats
-                || self.config.internal_2x != self.internal_2x
-                || self.config.pane != self.show_pane
-                || self.config.pane_width != self.pane_width)
-        {
-            self.config.volume = self.volume;
-            self.config.scaler = self.scale_mode;
-            self.config.aspect = self.aspect;
-            self.config.deinterlace = self.deinterlace;
-            self.config.swap_fields = self.swap_fields;
-            self.config.cheats = self.cheats;
-            self.config.internal_2x = self.internal_2x;
-            self.config.pane = self.show_pane;
-            self.config.pane_width = self.pane_width;
-            self.config.save(path);
+        let Some(path) = &self.config_path else { return };
+        let mut cfg = self.config.clone();
+        cfg.volume = self.volume;
+        cfg.scaler = self.scale_mode;
+        cfg.aspect = self.aspect;
+        cfg.deinterlace = self.deinterlace;
+        cfg.swap_fields = self.swap_fields;
+        cfg.cheats = self.cheats;
+        cfg.internal_2x = self.internal_2x;
+        cfg.pane = self.show_pane;
+        cfg.pane_width = self.pane_width;
+        if cfg != self.config {
+            cfg.save(path);
         }
     }
 }
