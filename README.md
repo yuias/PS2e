@@ -43,7 +43,8 @@ The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
 disc, memory card and mechacon NVRAM stay in), the two disc commands,
 save/load state and screenshots; View toggles fullscreen, the side pane and
-the TTY console; Help lists the current key bindings.
+the TTY console, and sizes the window to a 720p or 1080p display; Help lists
+the current key bindings.
 
 Settings live in the side pane on the right, which has three pages behind a
 row of tabs: Settings (display scaler, aspect ratio, deinterlacer, internal
@@ -52,6 +53,12 @@ scanner) and Registers (both CPUs' register files). Only the page on screen
 is fed by the emulator, so the two behind it cost nothing, and the whole
 pane can be closed from the View menu. The pane's width and whether it
 opens are remembered in `config.toml`.
+
+View > Display size resizes the *window* until the display itself is 720 or
+1080 pixels tall, at whatever aspect ratio is selected, so a window dragged
+to some arbitrary size can be put back to a known one. The side pane and the
+TTY panel keep their size across it; only the display grows or shrinks. A
+window too big for the desktop is whatever the window manager makes of it.
 
 While a text field in the pane has focus it takes the keyboard, so typing an
 address does not also press the pad buttons those keys are bound to. Esc, or

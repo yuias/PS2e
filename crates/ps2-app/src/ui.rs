@@ -220,6 +220,15 @@ pub struct App {
     show_pane: bool,
     page: Page,
     pane_width: f32,
+    /// The display rect and its aspect, as the central panel last laid
+    /// them out. The window's chrome is whatever the window has that this
+    /// rect does not, which is how [`Self::resize_to`] is honoured without
+    /// having to know any panel's height.
+    central_size: egui::Vec2,
+    display_aspect: f32,
+    /// Pending "display size" request: the height in physical pixels the
+    /// display should be resized to.
+    resize_to: Option<u32>,
     /// Memory page state: the viewer's target and address (as typed),
     /// the scanner's width and value (as typed).
     mem_target: scan::Target,
@@ -265,6 +274,9 @@ impl App {
             show_pane,
             page: Page::Settings,
             pane_width,
+            central_size: egui::Vec2::ZERO,
+            display_aspect: 4.0 / 3.0,
+            resize_to: None,
             mem_target: scan::Target::Ee,
             mem_addr: "00100000".into(),
             scan_width: 4,
@@ -597,6 +609,19 @@ impl eframe::App for App {
         }
         let chrome = !self.fullscreen;
 
+        // Size the window so the display comes out exactly this tall,
+        // measured from the last frame: the pane and the TTY panel keep
+        // their own size, so the difference lands on the display. A window
+        // the desktop cannot fit is clamped by the window manager.
+        if let Some(height) = self.resize_to.take()
+            && self.central_size.x > 0.0
+        {
+            let ppp = ctx.pixels_per_point();
+            let display = egui::vec2(height as f32 * self.display_aspect, height as f32) / ppp;
+            let window_chrome = ctx.screen_rect().size() - self.central_size;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_chrome + display));
+        }
+
         if chrome {
             egui::TopBottomPanel::top("menu").show(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
@@ -673,6 +698,20 @@ impl eframe::App for App {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                             ui.close();
                         }
+                        ui.add_enabled_ui(!self.fullscreen, |ui| {
+                            ui.menu_button("Display size", |ui| {
+                                for (label, height) in [("720p", 720u32), ("1080p", 1080)] {
+                                    if ui
+                                        .button(label)
+                                        .on_hover_text("the pane and the TTY panel keep their size")
+                                        .clicked()
+                                    {
+                                        self.resize_to = Some(height);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
                         ui.separator();
                         ui.checkbox(&mut self.show_pane, "Side pane");
                         ui.checkbox(&mut self.show_tty, "TTY panel");
@@ -810,6 +849,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
         };
         central.show(ctx, |ui| {
+            self.central_size = ui.max_rect().size();
             let (width, height, rgba, seq) = {
                 let frame = self.emu.shared.frame.lock().unwrap();
                 (frame.width, frame.height, frame.rgba.clone(), frame.seq)
@@ -823,6 +863,7 @@ impl eframe::App for App {
             // and a 640x448 one both fill the same 4:3 raster.
             let avail = ui.available_size();
             let aspect = self.aspect.ratio(width, height);
+            self.display_aspect = aspect;
             let scale = (avail.x / aspect).min(avail.y);
             let size = egui::Vec2::new(scale * aspect, scale);
             let rect = egui::Rect::from_center_size(ui.available_rect_before_wrap().center(), size);
