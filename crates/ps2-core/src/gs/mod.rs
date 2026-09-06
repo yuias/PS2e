@@ -15,6 +15,7 @@ use tracing::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 
 mod canvas;
+pub mod clut;
 pub mod front;
 mod layout;
 
@@ -174,9 +175,9 @@ pub struct Gs {
     /// Not state: a load starts with it empty.
     #[serde(skip, default = "raster::ClutPool::default")]
     clut: raster::ClutPool,
-    /// VRAM changed by a transfer since the palettes were decoded.
-    #[serde(skip, default = "yes")]
-    clut_dirty: bool,
+    /// The texture unit's CLUT buffer, which TEX0's CLD loads and the
+    /// blocks above are decoded from.
+    clut_unit: clut::Unit,
 }
 
 /// Per-lane rasterizer scratch, as [`Gs::new`] builds it (a state load
@@ -187,10 +188,6 @@ fn raster_pool() -> Vec<raster::Scratch> {
     } else {
         Vec::new()
     }
-}
-
-fn yes() -> bool {
-    true
 }
 
 impl Default for Gs {
@@ -313,7 +310,7 @@ impl Gs {
             history: [Vec::new(), Vec::new()],
             woven_dims: (0, 0),
             clut: raster::ClutPool::default(),
-            clut_dirty: true,
+            clut_unit: clut::Unit::default(),
         }
     }
 
@@ -364,6 +361,7 @@ impl Gs {
             0x06 | 0x07 => {
                 self.ctx[(reg - 0x06) as usize].tex0 = v;
                 self.log_tex0(v);
+                self.clut_write(v);
             }
             0x08 => self.ctx[0].clamp = v,
             0x09 => self.ctx[1].clamp = v,
@@ -376,6 +374,7 @@ impl Gs {
                 const MASK: u64 = 0xFFFF_FFE0_03F0_0000;
                 self.ctx[i].tex0 = (self.ctx[i].tex0 & !MASK) | (v & MASK);
                 self.log_tex0(self.ctx[i].tex0);
+                self.clut_write(self.ctx[i].tex0);
             }
             0x18 => self.ctx[0].xyoffset = v,
             0x19 => self.ctx[1].xyoffset = v,
@@ -610,7 +609,7 @@ impl Gs {
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
         // Queued primitives may sample the region this transfer overwrites.
         self.flush_batch();
-        self.clut_dirty = true;
+        self.clut_memory_changing();
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
         let dsax = ((self.trxpos >> 32) & 0x7FF) as u32;
@@ -755,7 +754,7 @@ impl Gs {
         }
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
         self.flush_batch();
-        self.clut_dirty = true;
+        self.clut_memory_changing();
         let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
         let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
         let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
@@ -911,7 +910,7 @@ impl Gs {
     fn local_copy(&mut self) {
         let _p = crate::prof::scope(crate::prof::Slot::GsXfer);
         self.flush_batch();
-        self.clut_dirty = true;
+        self.clut_memory_changing();
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
         let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;
@@ -1762,6 +1761,67 @@ mod tests {
             eprintln!("{mode:?} 640x448: {per:?} per vblank");
             assert!(per.as_millis() < 16, "{mode:?}: {per:?}");
         }
+    }
+
+    /// TEX0's CLD: a palette loaded into the CLUT buffer stays there when
+    /// the memory it came from is overwritten, until a write with CLD set
+    /// loads again.
+    #[test]
+    fn a_palette_survives_its_memory_until_the_next_load() {
+        let mut gs = Gs::new();
+        // Palette image at block 0 (16x16 PSMCT32), every entry red.
+        for y in 0..16 {
+            for x in 0..16 {
+                gs.write_psmct32(0, 1, x, y, 0x8000_00FF);
+            }
+        }
+        // An 8x8 PSMT8 texture at block 64, all index 5.
+        for y in 0..8 {
+            for x in 0..8 {
+                gs.write_psmt8(64, 1, x, y, 5);
+            }
+        }
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 210 | (10 << 16)); // FRAME_1: 6720, fbw 10, PSMCT32
+        gs.write_reg(0x4E, 140 | (1 << 24) | (1 << 32)); // ZBUF_1: masked
+        gs.write_reg(0x47, 0x30000); // TEST_1: ZTE, ALWAYS
+        gs.write_reg(0x40, 639 << 16 | 223 << 48); // SCISSOR_1
+        gs.write_reg(0x18, (1728 * 16) | ((1936 * 16) << 32)); // XYOFFSET_1
+        // TEX0_1: tbp 64, tbw 1, PSMT8, 8x8, DECAL, cbp 0, PSMCT32, CSM1.
+        let tex0 = 64 | (1 << 14) | (0x13 << 20) | (3 << 26) | (3 << 30) | (1 << 35);
+        let draw = |gs: &mut Gs, x: u64| {
+            gs.write_reg(0x00, 0x116); // sprite, TME, FST
+            gs.write_reg(0x03, 8 | (8 << 16)); // UV 0.5, 0.5
+            gs.write_reg(0x05, ((1728 + x) * 16) | ((1936 * 16) << 16));
+            gs.write_reg(0x03, (7 * 16 + 8) | ((7 * 16 + 8) << 16));
+            gs.write_reg(0x05, ((1728 + x + 8) * 16) | (((1936 + 8) * 16) << 16));
+            gs.flush_pending();
+            gs.read_psmct32(6720, 10, x as u32 + 3, 3) & 0xFF_FFFF
+        };
+        gs.write_reg(0x06, tex0 | (1 << 61)); // CLD=1: load
+        assert_eq!(draw(&mut gs, 0), 0x0000FF);
+
+        // Overwrite the palette image with green through an IMAGE transfer.
+        gs.write_reg(0x50, 1 << 48); // BITBLTBUF: dbp 0, dbw 1, PSMCT32
+        gs.write_reg(0x51, 0);
+        gs.write_reg(0x52, 16 | (16 << 32)); // TRXREG 16x16
+        gs.write_reg(0x53, 0); // host -> local
+        gs.image(&[0x8000_FF00_8000_FF00u64; 128]);
+        assert_eq!(gs.read_psmct32(0, 1, 5, 0), 0x8000_FF00);
+
+        gs.write_reg(0x06, tex0); // CLD=0: the buffer keeps red
+        assert_eq!(draw(&mut gs, 16), 0x0000FF);
+        gs.write_reg(0x16, tex0 | (1 << 61)); // TEX2 with CLD=1 loads green
+        assert_eq!(draw(&mut gs, 32), 0x00FF00);
+        // CLD=4: CBP0 is unset, so this loads and remembers CBP 0; the
+        // second such write is quiet even though the memory changed.
+        gs.write_reg(0x06, tex0 | (4 << 61));
+        gs.write_reg(0x53, 0);
+        gs.image(&[0x80FF_0000_80FF_0000u64; 128]); // blue
+        gs.write_reg(0x06, tex0 | (4 << 61));
+        assert_eq!(draw(&mut gs, 48), 0x00FF00);
+        gs.write_reg(0x06, tex0 | (1 << 61));
+        assert_eq!(draw(&mut gs, 64), 0xFF0000);
     }
 
     /// Full-screen textured sprite copying one 640x224 buffer into another

@@ -840,6 +840,11 @@ impl Gs {
         if self.batch.queued.is_empty() {
             return;
         }
+        // A primitive queued after a recorded CLUT load may write the
+        // memory that load reads; the load came first, so read it now.
+        if self.clut_unit.pending() && self.batch.writes.iter().any(|w| self.clut_unit.pending_in(&(w.start..w.end))) {
+            self.materialise_clut();
+        }
         let queued = std::mem::take(&mut self.batch.queued);
         let px = std::mem::take(&mut self.batch.px);
         self.batch.writes.clear();
@@ -964,29 +969,54 @@ impl Gs {
         pipe
     }
 
-    /// Re-decode the CLUT cache when the palette setup changed or a
-    /// transfer touched VRAM. Real hardware only reloads on TEX0 writes
-    /// with CLD set; keying on the setup instead is a superset of that
-    /// (drawing primitives into CLUT memory is not tracked).
+    /// A TEX0/TEX2 write: record the CLUT load its CLD asks for.
+    pub(super) fn clut_write(&mut self, tex0: u64) {
+        let load = match self.clut_unit.request(tex0) {
+            clut::Request::Load(l) => l,
+            clut::Request::None => return,
+        };
+        // The load reads its memory as of now, so queued drawing into it
+        // lands first.
+        if self.batch.after_write(&load.blocks()) {
+            self.flush_batch();
+        }
+        if self.clut_unit.full() {
+            self.materialise_clut();
+        }
+        self.clut_unit.record(load);
+    }
+
+    /// Local memory is about to change: settle every recorded load's
+    /// bytes first, and stop matching palettes decoded from that memory.
+    pub(super) fn clut_memory_changing(&mut self) {
+        self.materialise_clut();
+        self.clut.forget_keys();
+    }
+
+    fn materialise_clut(&mut self) {
+        let canvas = &self.canvas;
+        self.clut_unit.materialise(|l, e| clut_raw(canvas, l, e));
+    }
+
     /// Make sure a decoded block exists for this palette setup and return
     /// its offset. The CSA window is part of the key, so a block only ever
     /// holds entries one texture actually reads.
     fn refresh_clut(&mut self, ti: &TexInfo) -> u32 {
-        let key = ti.clut_key() | ((ti.clut_base as u64) << 49);
-        if self.clut_dirty {
-            // A transfer has been through VRAM; nothing decoded before it
-            // may be matched again, though blocks already queued stay.
-            self.clut.forget_keys();
-            self.clut_dirty = false;
-        }
+        let entries = if ti.clut_bits == 8 { 256 } else { 16 };
+        let view = clut::View { cpsm: ((ti.tex0 >> 51) & 0xF) as u8, first: ti.clut_base as u16, count: entries as u16 };
+        let source = match self.clut_unit.source(&view) {
+            clut::Source::Mixed => {
+                self.materialise_clut();
+                clut::Source::Buffer
+            }
+            s => s,
+        };
+        let key = match source {
+            clut::Source::Load(l) => l.key_bits() | (ti.clut_view_bits() << 29),
+            _ => (1 << 63) | (self.clut_unit.epoch() as u64) | (ti.clut_view_bits() << 32),
+        };
         if let Some(off) = self.clut.find(key) {
             return off as u32;
-        }
-        // Decoding reads local memory, so a queue that writes this palette's
-        // own memory has to be drawn first.
-        let cbp = ((ti.tex0 >> 37) & 0x3FFF) as u32;
-        if self.batch.after_write(&(cbp..cbp + 4)) {
-            self.flush_batch();
         }
         let off = match self.clut.alloc(key) {
             Some(off) => off,
@@ -996,33 +1026,35 @@ impl Gs {
                 self.clut.alloc(key).expect("a drawn batch frees the pool")
             }
         };
-        let entries = if ti.clut_bits == 8 { 256 } else { 16 };
         for e in ti.clut_base..ti.clut_base + entries {
-            self.clut.data[off + e] = self.clut_lookup(ti.tex0, e as u32);
+            let raw = match source {
+                clut::Source::Load(l) => clut_raw(&self.canvas, &l, e as u32),
+                _ => self.clut_unit.entry(view.cpsm, e),
+            };
+            self.clut.data[off + e] = if view.cpsm == 0 { raw } else { expand16(raw as u16, ti.texa) };
         }
         off as u32
     }
+}
 
-    /// Read palette entry `e` (index plus CSA offset) from VRAM.
-    fn clut_lookup(&self, tex0: u64, e: u32) -> u32 {
-        let cbp = ((tex0 >> 37) & 0x3FFF) as u32;
-        let cpsm = ((tex0 >> 51) & 0xF) as u32;
-        let csm = (tex0 >> 55) & 1;
-        let (x, y) = if csm == 0 {
-            // CSM1 packs the CLUT as a 16x16 image whose entries sit in
-            // 8x2-entry tiles — equivalently, a linear 16x16 layout with
-            // bits 3 and 4 of the entry number swapped.
-            let e = (e & 0xE7) | ((e & 0x08) << 1) | ((e & 0x10) >> 1);
-            (e & 0xF, e >> 4)
-        } else {
-            // CSM2: linear row (TEXCLUT offset/width not modelled).
-            (e & 0xFF, e >> 8)
-        };
-        if cpsm == 0 {
-            self.canvas.read_psmct32(cbp, 1, x, y)
-        } else {
-            expand16(self.canvas.read_psmct16(cbp, 1, x, y, if cpsm == 0xA { PSMCT16S } else { PSMCT16 }), self.texa)
-        }
+/// Raw palette entry `e` (index plus CSA offset) of a load's image in
+/// local memory: a 32-bit word, or a 16-bit pixel in the low half.
+fn clut_raw(canvas: &Canvas, l: &clut::Load, e: u32) -> u32 {
+    let (x, y) = if l.csm == 0 {
+        // CSM1 packs the CLUT as a 16x16 image whose entries sit in
+        // 8x2-entry tiles — equivalently, a linear 16x16 layout with
+        // bits 3 and 4 of the entry number swapped.
+        let e = (e & 0xE7) | ((e & 0x08) << 1) | ((e & 0x10) >> 1);
+        (e & 0xF, e >> 4)
+    } else {
+        // CSM2: linear row (TEXCLUT offset/width not modelled).
+        (e & 0xFF, e >> 8)
+    };
+    let cbp = l.cbp as u32;
+    if l.cpsm == 0 {
+        canvas.read_psmct32(cbp, 1, x, y)
+    } else {
+        canvas.read_psmct16(cbp, 1, x, y, if l.cpsm == 0xA { PSMCT16S } else { PSMCT16 }) as u32
     }
 }
 
@@ -2717,14 +2749,16 @@ impl TexInfo {
         }
     }
 
-    /// Everything the decoded CLUT depends on: CBP/CPSM/CSM/CSA, the index
-    /// width, and the TEXA fields used to expand 16-bit entries.
-    fn clut_key(&self) -> u64 {
-        ((self.tex0 >> 37) & 0xFF_FFFF)
-            | ((self.clut_bits as u64) << 24)
-            | ((self.texa & 0xFF) << 32)
-            | (((self.texa >> 15) & 1) << 40)
-            | (((self.texa >> 32) & 0xFF) << 41)
+    /// How a decoded block depends on the reader rather than the palette
+    /// bytes: entry width, CSA window, index width, and the TEXA fields
+    /// that expand 16-bit entries. 24 bits.
+    fn clut_view_bits(&self) -> u64 {
+        (((self.tex0 >> 51) & 0xF != 0) as u64)
+            | (((self.tex0 >> 56) & 0x1F) << 1)
+            | (((self.clut_bits == 8) as u64) << 6)
+            | ((self.texa & 0xFF) << 7)
+            | (((self.texa >> 15) & 1) << 15)
+            | (((self.texa >> 32) & 0xFF) << 16)
     }
 }
 
