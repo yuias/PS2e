@@ -907,13 +907,55 @@ impl Gs {
         };
     }
 
+    /// TEX1's mipmap level for this primitive, and the filter that goes
+    /// with it.
+    ///
+    /// Only the fixed-LOD form is modelled. `LCM = 1` makes the LOD the K
+    /// field outright, so the level is constant over the primitive and can
+    /// be folded into [`TexInfo`] instead of costing anything per pixel --
+    /// which is how every mipmapped draw seen so far picks its distance
+    /// ring. `LCM = 0` derives the LOD from Q per pixel; nothing needs it
+    /// yet, so it stays at level 0.
+    fn mip_select(ctx: &Context) -> (u32, bool) {
+        let tex1 = ctx.tex1;
+        let mmag = (tex1 >> 5) & 1 != 0;
+        let mxl = ((tex1 >> 2) & 7) as i32;
+        let mmin = ((tex1 >> 6) & 7) as u32;
+        // Without a mipmap chain MMAG decides for every sample, as it did
+        // before levels existed: minification alone is not modelled.
+        if mxl == 0 || mmin < 2 {
+            return (0, mmag);
+        }
+        if tex1 & 1 == 0 {
+            warn_once(&MIP_LCM, "TEX1 LCM=0 (LOD computed from Q) is not modelled; sampling level 0");
+            return (0, mmag);
+        }
+        if tex1 & (1 << 9) == 0 {
+            warn_once(&MIP_MTBA, "TEX1 MTBA=0 (explicit MIPTBP1/2 bases) is not modelled; sampling level 0");
+            return (0, mmag);
+        }
+        // K is signed 12-bit in 1/16 LOD units. The MIPMAP_NEAREST filters
+        // round to a level; the MIPMAP_LINEAR ones blend two, and taking
+        // the lower of the pair is the approximation here.
+        let k = ((((tex1 >> 32) & 0xFFF) as i32) << 20) >> 20;
+        let level = if mmin == 2 || mmin == 4 { (k + 8) >> 4 } else { k >> 4 };
+        if mmin == 3 || mmin == 5 {
+            warn_once(&MIP_BLEND, "TEX1 MMIN blends two levels; sampling the lower one");
+        }
+        let level = level.clamp(0, mxl) as u32;
+        // MMAG applies where the texture is magnified, which for a fixed
+        // LOD means level 0; below it the MMIN filter decides.
+        (level, if level == 0 { mmag } else { matches!(mmin, 1 | 4 | 5) })
+    }
+
     /// Decode the drawing environment for the current context once per
     /// primitive; the per-pixel path only reads it.
     fn pixel_pipe(&mut self) -> PixelPipe {
         let attrs = self.attrs();
         let ctx = self.ctx[((attrs >> 9) & 1) as usize];
         let test = ctx.test;
-        let tex = TexInfo::new(&ctx, self.texa);
+        let (level, bilinear) = Self::mip_select(&ctx);
+        let tex = TexInfo::new(&ctx, self.texa, level);
         let clut_off =
             if attrs & (1 << 4) != 0 && tex.clut_bits != 0 { self.refresh_clut(&tex) } else { 0 };
 
@@ -930,7 +972,7 @@ impl Gs {
             fogcol: (self.fogcol & 0xFF_FFFF) as u32,
             tfx: ((ctx.tex0 >> 35) & 3) as u8,
             tcc: ctx.tex0 & (1 << 34) != 0,
-            bilinear: (ctx.tex1 >> 5) & 1 != 0,
+            bilinear,
             tex,
             ate: test & 1 != 0,
             atst: ((test >> 1) & 7) as u8,
@@ -2754,8 +2796,27 @@ struct TexInfo {
     clut_base: usize,
 }
 
+/// The TEX0 fields a mipmap level replaces: TBP0, TBW, TW and TH.
+const TEX0_GEOMETRY: u64 = 0x0000_0003_FC0F_FFFF;
+
+/// How far MTBA's automatic base advances past a `w` x `h` level, in
+/// 256-byte blocks. The paletted formats that live in the upper bits of a
+/// 32-bit buffer (PSMT8H, PSMT4HL, PSMT4HH) take that buffer's width.
+fn mip_blocks(psm: u32, w: u32, h: u32) -> u32 {
+    let bits = match psm {
+        PSMT4 => 4,
+        PSMT8 => 8,
+        PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => 16,
+        _ => 32,
+    };
+    (w * h * bits / 8 / 256).max(1)
+}
+
 impl TexInfo {
-    fn new(ctx: &Context, texa: u64) -> Self {
+    /// `level` is the mipmap level already chosen for the whole primitive
+    /// (see [`Gs::mip_select`]); the texture is described as if that level
+    /// were the only one.
+    fn new(ctx: &Context, texa: u64, level: u32) -> Self {
         let tex0 = ctx.tex0;
         let psm = ((tex0 >> 20) & 0x3F) as u32;
         let clut_bits = match psm {
@@ -2763,20 +2824,48 @@ impl TexInfo {
             PSMT4 | PSMT4HL | PSMT4HH => 4,
             _ => 0,
         };
+        let mut tbp = (tex0 & 0x3FFF) as u32;
+        let mut tbw = ((tex0 >> 14) & 0x3F) as u32;
+        let mut twl = ((tex0 >> 26) & 0xF).min(10) as u32;
+        let mut thl = ((tex0 >> 30) & 0xF).min(10) as u32;
+        // TEX1's MTBA: the levels sit end to end after level 0, each
+        // halving in both axes and in buffer width. Walking the chain
+        // keeps the rule in one place, and it is at most three steps.
+        for _ in 0..level {
+            tbp += mip_blocks(psm, 1 << twl, 1 << thl);
+            tbw = (tbw >> 1).max(1);
+            twl = twl.saturating_sub(1);
+            thl = thl.saturating_sub(1);
+        }
+        // The decoded-row and CLUT caches key on this TEX0, so the level
+        // has to be visible in it: two draws that differ only in K would
+        // otherwise share rows decoded from level 0.
+        let tex0 = if level == 0 {
+            tex0
+        } else {
+            (tex0 & !TEX0_GEOMETRY)
+                | u64::from(tbp)
+                | (u64::from(tbw) << 14)
+                | (u64::from(twl) << 26)
+                | (u64::from(thl) << 30)
+        };
         // CLAMP register: 0 repeat, 1 clamp, 2 region clamp, 3 region repeat.
+        // Its region is given in level-0 texels; scaling it down with the
+        // level is what the addressing implies, but no title here has been
+        // seen to region-clamp a mipmapped texture, so it is unconfirmed.
         Self {
             tex0,
-            tbp: (tex0 & 0x3FFF) as u32,
-            tbw: ((tex0 >> 14) & 0x3F) as u32,
+            tbp,
+            tbw,
             psm,
-            tw: 1u32 << ((tex0 >> 26) & 0xF).min(10),
-            th: 1u32 << ((tex0 >> 30) & 0xF).min(10),
+            tw: 1u32 << twl,
+            th: 1u32 << thl,
             wms: ctx.clamp & 3,
             wmt: (ctx.clamp >> 2) & 3,
-            minu: ((ctx.clamp >> 4) & 0x3FF) as i32,
-            maxu: ((ctx.clamp >> 14) & 0x3FF) as i32,
-            minv: ((ctx.clamp >> 24) & 0x3FF) as i32,
-            maxv: ((ctx.clamp >> 34) & 0x3FF) as i32,
+            minu: (((ctx.clamp >> 4) & 0x3FF) as i32) >> level,
+            maxu: (((ctx.clamp >> 14) & 0x3FF) as i32) >> level,
+            minv: (((ctx.clamp >> 24) & 0x3FF) as i32) >> level,
+            maxv: (((ctx.clamp >> 34) & 0x3FF) as i32) >> level,
             texa,
             clut_bits,
             clut_base: if clut_bits == 4 { ((tex0 >> 56) & 0x1F) as usize * 16 } else { 0 },
@@ -3016,4 +3105,97 @@ fn expand16(px: u16, texa: u64) -> u32 {
         ta0
     };
     r | (g << 8) | (b << 16) | (a << 24)
+}
+
+/// One-shot warnings for the TEX1 forms that are not modelled. A mipmapped
+/// draw happens thousands of times a frame, so the first one has to be the
+/// only one that speaks.
+static MIP_LCM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MIP_MTBA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MIP_BLEND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_once(told: &std::sync::atomic::AtomicBool, what: &str) {
+    if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(target: "ps2_core::gs::tex", "{what}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ace Combat 5's terrain atlas: 512x512 PSMT8 at block 9216, TBW 8,
+    /// with MTBA generating the chain. Each level takes a quarter of the
+    /// blocks of the one above, and the four of them end at 10576 -- the
+    /// block before the page where the next atlas starts.
+    #[test]
+    fn mtba_walks_the_terrain_atlas_chain() {
+        let ctx = Context {
+            tex0: 9216 | (8 << 14) | (0x13 << 20) | (9 << 26) | (9 << 30),
+            ..Context::default()
+        };
+        let levels: Vec<(u32, u32, u32, u32)> = (0..4)
+            .map(|l| {
+                let t = TexInfo::new(&ctx, 0, l);
+                (t.tbp, t.tbw, t.tw, t.th)
+            })
+            .collect();
+        assert_eq!(
+            levels,
+            vec![
+                (9216, 8, 512, 512),
+                (10240, 4, 256, 256),
+                (10496, 2, 128, 128),
+                (10560, 1, 64, 64),
+            ]
+        );
+        // The chain is 1024 + 256 + 64 + 16 blocks long.
+        assert_eq!(10560 + mip_blocks(PSMT8, 64, 64), 10576);
+    }
+
+    /// A level has to be visible in the TEX0 the row and CLUT caches key
+    /// on, or a level-2 draw is served rows decoded from level 0.
+    #[test]
+    fn each_level_keys_differently() {
+        let ctx = Context {
+            tex0: 9216 | (8 << 14) | (0x13 << 20) | (9 << 26) | (9 << 30),
+            ..Context::default()
+        };
+        let keys: Vec<u64> = (0..4).map(|l| TexInfo::new(&ctx, 0, l).tex0).collect();
+        for i in 0..keys.len() {
+            for j in i + 1..keys.len() {
+                assert_ne!(keys[i], keys[j], "levels {i} and {j} share a cache key");
+            }
+        }
+        // Only the geometry fields move: the CLUT and PSM halves survive.
+        for k in &keys {
+            assert_eq!(k & !TEX0_GEOMETRY, ctx.tex0 & !TEX0_GEOMETRY);
+        }
+    }
+
+    /// The three TEX1 values the mission draws its terrain with: LCM=1,
+    /// MXL=3, MMAG and MMIN=4 (LINEAR_MIPMAP_NEAREST), MTBA=1, and K
+    /// naming the level outright in 1/16 units.
+    #[test]
+    fn fixed_lod_picks_the_level_k_names() {
+        for (k, level) in [(0u64, 0u32), (16, 1), (32, 2)] {
+            let ctx = Context { tex1: 0x32D | (k << 32), ..Context::default() };
+            assert_eq!(Gs::mip_select(&ctx), (level, true), "K = {k}");
+        }
+        // Clamped to MXL, and a negative K magnifies rather than wrapping.
+        let over = Context { tex1: 0x32D | (0x100 << 32), ..Context::default() };
+        assert_eq!(Gs::mip_select(&over).0, 3);
+        let under = Context { tex1: 0x32D | (0xFF0 << 32), ..Context::default() };
+        assert_eq!(Gs::mip_select(&under).0, 0);
+    }
+
+    /// Without a chain nothing changes: MMAG still decides every sample,
+    /// which is what the rasterizer did before levels existed.
+    #[test]
+    fn no_chain_leaves_the_filter_alone() {
+        let linear = Context { tex1: 0x20, ..Context::default() };
+        assert_eq!(Gs::mip_select(&linear), (0, true));
+        let nearest = Context { tex1: 0, ..Context::default() };
+        assert_eq!(Gs::mip_select(&nearest), (0, false));
+    }
 }
