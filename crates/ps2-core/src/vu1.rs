@@ -407,7 +407,7 @@ impl Vu1 {
     /// gap is named once per opcode.
     fn unimplemented(&mut self, kind: &str, pc: u16, instr: u32) {
         let op = instr & 0x3F;
-        if self.warned_ops.insert((kind.len() as u8, op as u8)) {
+        if self.warned_ops.insert((kind.as_bytes()[0], op as u8)) {
             warn!(
                 target: "ps2_core::vu1",
                 pc,
