@@ -60,6 +60,9 @@ to some arbitrary size can be put back to a known one. The side pane and the
 TTY panel keep their size across it; only the display grows or shrinks. A
 window too big for the desktop is whatever the window manager makes of it.
 
+The window's own size is remembered across runs, so a display size picked
+here comes back on the next launch along with it. Fullscreen is not saved.
+
 While a text field in the pane has focus it takes the keyboard, so typing an
 address does not also press the pad buttons those keys are bound to. Esc, or
 a click on empty pane, hands the keyboard back.
@@ -112,6 +115,8 @@ swap_fields = false         # flip which rows each field lands on
 internal_2x = false         # true 2x edges on 3D geometry
 pane = true                 # open the side pane at startup
 pane_width = 420.0          # and the width it opens at
+window_width = 960.0        # window size at the last exit, in egui points
+window_height = 640.0
 
 [keys]                      # digital pad; egui key names
 cross = "Z"

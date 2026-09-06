@@ -226,6 +226,10 @@ pub struct App {
     /// having to know any panel's height.
     central_size: egui::Vec2,
     display_aspect: f32,
+    /// Window size as of the last windowed frame, for the config. Read
+    /// back from egui rather than tracked through resize events, and only
+    /// while not fullscreen, where it would be the whole monitor.
+    window_size: egui::Vec2,
     /// Pending "display size" request: the height in physical pixels the
     /// display should be resized to.
     resize_to: Option<u32>,
@@ -258,6 +262,7 @@ impl App {
         let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
         let show_pane = config.pane;
         let pane_width = config.pane_width;
+        let window_size = egui::vec2(config.window_width, config.window_height);
         Self {
             emu,
             scale_mode: config.scaler,
@@ -276,6 +281,7 @@ impl App {
             pane_width,
             central_size: egui::Vec2::ZERO,
             display_aspect: 4.0 / 3.0,
+            window_size,
             resize_to: None,
             mem_target: scan::Target::Ee,
             mem_addr: "00100000".into(),
@@ -513,6 +519,8 @@ impl Drop for App {
         cfg.internal_2x = self.internal_2x;
         cfg.pane = self.show_pane;
         cfg.pane_width = self.pane_width;
+        cfg.window_width = self.window_size.x;
+        cfg.window_height = self.window_size.y;
         if cfg != self.config {
             cfg.save(path);
         }
@@ -609,12 +617,18 @@ impl eframe::App for App {
         }
         let chrome = !self.fullscreen;
 
+        if chrome {
+            self.window_size = ctx.screen_rect().size();
+        }
+
         // Size the window so the display comes out exactly this tall,
         // measured from the last frame: the pane and the TTY panel keep
         // their own size, so the difference lands on the display. A window
-        // the desktop cannot fit is clamped by the window manager.
-        if let Some(height) = self.resize_to.take()
-            && self.central_size.x > 0.0
+        // the desktop cannot fit is clamped by the window manager. The
+        // request is only taken once a frame has been laid out, or it
+        // would be consumed with nothing to measure against.
+        if self.central_size.x > 0.0
+            && let Some(height) = self.resize_to.take()
         {
             let ppp = ctx.pixels_per_point();
             let display = egui::vec2(height as f32 * self.display_aspect, height as f32) / ppp;

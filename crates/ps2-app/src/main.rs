@@ -428,7 +428,7 @@ fn run_windowed(
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
+            .with_inner_size([cfg.window_width, cfg.window_height])
             .with_title(ui::WINDOW_TITLE),
         ..Default::default()
     };

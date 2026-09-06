@@ -63,6 +63,12 @@ internal_2x = false
 pane = true
 pane_width = 420.0
 
+# Window size at the last exit. With pane_width it decides how big the
+# display comes back: View > Display size sets the window, and the window
+# is what is saved here.
+window_width = 960.0
+window_height = 640.0
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -138,6 +144,11 @@ pub struct Config {
     /// own persistence is not compiled in, so the width lives here.
     pub pane: bool,
     pub pane_width: f32,
+    /// Window size at the last exit, in egui points. Restoring it along
+    /// with `pane_width` brings the display back to the size it was, which
+    /// is what makes a "Display size" pick outlive the session.
+    pub window_width: f32,
+    pub window_height: f32,
     pub keys: KeyBindings,
     pub pad: PadBindings,
     pub hotkeys: HotKeys,
@@ -409,6 +420,8 @@ impl Default for Config {
             cheats: false,
             pane: true,
             pane_width: 420.0,
+            window_width: 960.0,
+            window_height: 640.0,
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: HotKeys::default(),
@@ -544,6 +557,8 @@ mod tests {
         assert_eq!(back.pane_width, cfg.pane_width);
         let closed: Config = toml::from_str("pane = false").expect("parses");
         assert!(!closed.pane);
+        assert_eq!(back.window_width, cfg.window_width);
+        assert_eq!(back.window_height, cfg.window_height);
     }
 
     #[test]
