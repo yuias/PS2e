@@ -42,10 +42,16 @@ starting a disc over.
 The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
 disc, memory card and mechacon NVRAM stay in), the two disc commands,
-save/load state and screenshots; View toggles fullscreen, the display scaler, the deinterlacer,
-internal 2x rendering and the debug panels — TTY console and CPU registers,
-both hidden by default. Audio holds the master volume, and Help lists the
-current key bindings.
+save/load state and screenshots; View toggles fullscreen, the side pane and
+the TTY console; Help lists the current key bindings.
+
+Settings live in the side pane on the right, which has three pages behind a
+row of tabs: Settings (display scaler, aspect ratio, deinterlacer, internal
+2x rendering, master volume), Memory (a RAM viewer and the cheat-value
+scanner) and Registers (both CPUs' register files). Only the page on screen
+is fed by the emulator, so the two behind it cost nothing, and the whole
+pane can be closed from the View menu. The pane's width and whether it
+opens are remembered in `config.toml`.
 
 The status bar names the image in the drive, and the window title carries the
 disc's boot serial ("PS2e - SLPS-25418"): a PS2 disc has no printable game
@@ -89,9 +95,12 @@ region = "ntsc"             # video timing before SetGsCrt: ntsc | pal
 volume = 0.5                # master volume, 0.0..1.0
 memcard = "memcard0.ps2"    # created and formatted automatically
 scaler = "sharp"            # nearest | linear | sharp | lanczos
+aspect = "4:3"              # 4:3 | 16:9 | native
 deinterlace = "bwdif"       # weave | bob | blend | adaptive | bwdif
 swap_fields = false         # flip which rows each field lands on
 internal_2x = false         # true 2x edges on 3D geometry
+pane = true                 # open the side pane at startup
+pane_width = 420.0          # and the width it opens at
 
 [keys]                      # digital pad; egui key names
 cross = "Z"

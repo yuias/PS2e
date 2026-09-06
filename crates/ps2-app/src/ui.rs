@@ -5,7 +5,7 @@
 //! is deliberate — a wasm frontend could reuse the same snapshot types.
 
 use crate::config::Config;
-use crate::emu::{Command, DebuggerState, Disc, Emu, MemoryView, PANEL_MEMORY, PANEL_REGS};
+use crate::emu::{Command, DebuggerState, Disc, Emu, MemoryView, PANEL_MEMORY, PANEL_REGS, Status};
 use crate::scan;
 use eframe::egui;
 use crate::gamepad::Gamepad;
@@ -50,7 +50,7 @@ const REG_NAMES: [&str; 32] = [
 
 // Standard MIPS COP0 register numbers; identical on the EE (see
 // ps2_core::ee::cop0) and the IOP's private constants of the same values.
-/// An address as typed into the memory panel: always hex, with or
+/// An address as typed into the memory page: always hex, with or
 /// without a `0x` prefix.
 fn parse_addr(text: &str) -> Option<u32> {
     let t = text.trim();
@@ -89,6 +89,117 @@ const COP0_STATUS: usize = 12;
 const COP0_CAUSE: usize = 13;
 const COP0_EPC: usize = 14;
 
+/// One page of the side pane. Exactly one is drawn at a time, and only
+/// that one's data is published by the worker, so an inactive page costs
+/// as little as a closed panel used to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Settings,
+    Memory,
+    Registers,
+}
+
+impl Page {
+    const ALL: [Page; 3] = [Page::Settings, Page::Memory, Page::Registers];
+
+    fn label(self) -> &'static str {
+        match self {
+            Page::Settings => "Settings",
+            Page::Memory => "Memory",
+            Page::Registers => "Registers",
+        }
+    }
+
+    /// What the worker has to publish for this page, as `PANEL_*` bits.
+    fn panels(self) -> u8 {
+        match self {
+            Page::Settings => 0,
+            Page::Memory => PANEL_MEMORY,
+            Page::Registers => PANEL_REGS,
+        }
+    }
+}
+
+/// A settings dropdown over the fixed set of values a setting can take.
+fn combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &mut T,
+    all: &[T],
+    label: impl Fn(T) -> &'static str,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label(*current))
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            for &value in all {
+                ui.selectable_value(current, value, label(value));
+            }
+        });
+}
+
+/// Both register files, as last published by the worker. The snapshot is
+/// only refreshed while this page is the one showing.
+fn registers_page(ui: &mut egui::Ui, status: &Status) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("EE");
+        ui.monospace(format!("pc {:08x}", status.ee_pc));
+        egui::Grid::new("ee_regs").striped(true).show(ui, |ui| {
+            for (i, name) in REG_NAMES.iter().enumerate() {
+                let [lo, hi] = status.ee_gpr[i];
+                ui.monospace(format!("{name:>4}"));
+                ui.monospace(if hi != 0 {
+                    format!("{lo:016x}\n  hi:{hi:016x}")
+                } else {
+                    format!("{lo:016x}")
+                });
+                ui.end_row();
+            }
+            ui.monospace("  hi");
+            ui.monospace(format!("{:016x}:{:016x}", status.ee_hi[1], status.ee_hi[0]));
+            ui.end_row();
+            ui.monospace("  lo");
+            ui.monospace(format!("{:016x}:{:016x}", status.ee_lo[1], status.ee_lo[0]));
+            ui.end_row();
+            ui.monospace("status");
+            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_STATUS]));
+            ui.end_row();
+            ui.monospace(" cause");
+            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_CAUSE]));
+            ui.end_row();
+            ui.monospace("   epc");
+            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_EPC]));
+            ui.end_row();
+        });
+
+        ui.separator();
+        ui.heading("IOP");
+        ui.monospace(format!("pc {:08x}", status.iop_pc));
+        egui::Grid::new("iop_regs").striped(true).show(ui, |ui| {
+            for (i, name) in REG_NAMES.iter().enumerate() {
+                ui.monospace(format!("{name:>4}"));
+                ui.monospace(format!("{:08x}", status.iop_gpr[i]));
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+            ui.monospace("  hi");
+            ui.monospace(format!("{:08x}", status.iop_hi));
+            ui.monospace("  lo");
+            ui.monospace(format!("{:08x}", status.iop_lo));
+            ui.end_row();
+            ui.monospace("status");
+            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_STATUS]));
+            ui.monospace(" cause");
+            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_CAUSE]));
+            ui.end_row();
+            ui.monospace("   epc");
+            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_EPC]));
+            ui.end_row();
+        });
+    });
+}
+
 pub struct App {
     emu: Emu,
     scale_mode: crate::display::ScaleMode,
@@ -103,9 +214,13 @@ pub struct App {
     config_path: Option<PathBuf>,
     last_screenshot: Option<String>,
     show_tty: bool,
-    show_regs: bool,
-    show_mem: bool,
-    /// Memory panel state: the viewer's target and address (as typed),
+    /// The side pane, and which of its pages is showing. The width is kept
+    /// here rather than left to egui: the persistence feature is not
+    /// compiled in, so egui would forget it at exit.
+    show_pane: bool,
+    page: Page,
+    pane_width: f32,
+    /// Memory page state: the viewer's target and address (as typed),
     /// the scanner's width and value (as typed).
     mem_target: scan::Target,
     mem_addr: String,
@@ -132,6 +247,8 @@ impl App {
         let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
         let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
+        let show_pane = config.pane;
+        let pane_width = config.pane_width;
         Self {
             emu,
             scale_mode: config.scaler,
@@ -145,8 +262,9 @@ impl App {
             config_path,
             last_screenshot: None,
             show_tty: false,
-            show_regs: false,
-            show_mem: false,
+            show_pane,
+            page: Page::Settings,
+            pane_width,
             mem_target: scan::Target::Ee,
             mem_addr: "00100000".into(),
             scan_width: 4,
@@ -179,9 +297,45 @@ impl App {
         }
     }
 
+    /// Video and audio settings: what the View and Audio menus used to
+    /// carry. Dropdowns rather than radio lists so the seven deinterlacers
+    /// cost one row instead of seven.
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        use crate::config::{AspectSetting, DeinterlaceSetting};
+        use crate::display::ScaleMode;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Video");
+            egui::Grid::new("video").num_columns(2).show(ui, |ui| {
+                ui.label("Scaler");
+                combo(ui, "scaler", &mut self.scale_mode, &ScaleMode::ALL, ScaleMode::label);
+                ui.end_row();
+                ui.label("Aspect ratio");
+                combo(ui, "aspect", &mut self.aspect, &AspectSetting::ALL, AspectSetting::label);
+                ui.end_row();
+                ui.label("Deinterlace");
+                combo(ui, "deinterlace", &mut self.deinterlace, &DeinterlaceSetting::ALL, DeinterlaceSetting::label);
+                ui.end_row();
+            });
+            ui.checkbox(&mut self.swap_fields, "Swap field order")
+                .on_hover_text("for output that looks line-swapped, or bobs by a whole line");
+            ui.checkbox(&mut self.internal_2x, "Internal 2x resolution")
+                .on_hover_text("true 2x edges on 3D geometry; roughly 5x the GS pixel work");
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.heading("Audio");
+            ui.add(
+                egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                    .text("volume")
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+            );
+        });
+    }
+
     /// The memory viewer (one window of RAM, refreshed with the frame)
     /// and the scanner (find a value, narrow it down as it moves).
-    fn memory_panel(&mut self, ui: &mut egui::Ui) {
+    fn memory_page(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.mem_target, scan::Target::Ee, "EE");
             ui.radio_value(&mut self.mem_target, scan::Target::Iop, "IOP");
@@ -204,7 +358,14 @@ impl App {
                 text.extend(chunk.iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }));
                 text.push('\n');
             }
-            ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap_mode(egui::TextWrapMode::Extend));
+            // A 16-byte row is wider than the pane's default width, which
+            // is sized for the Settings page; let it scroll rather than clip.
+            egui::ScrollArea::horizontal().id_salt("hex").show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(text).monospace())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
         } else {
             ui.label("waiting for the worker");
         }
@@ -334,7 +495,9 @@ impl Drop for App {
                 || self.config.deinterlace != self.deinterlace
                 || self.config.swap_fields != self.swap_fields
                 || self.config.cheats != self.cheats
-                || self.config.internal_2x != self.internal_2x)
+                || self.config.internal_2x != self.internal_2x
+                || self.config.pane != self.show_pane
+                || self.config.pane_width != self.pane_width)
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
@@ -343,6 +506,8 @@ impl Drop for App {
             self.config.swap_fields = self.swap_fields;
             self.config.cheats = self.cheats;
             self.config.internal_2x = self.internal_2x;
+            self.config.pane = self.show_pane;
+            self.config.pane_width = self.pane_width;
             self.config.save(path);
         }
     }
@@ -371,16 +536,12 @@ impl eframe::App for App {
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
         self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
         self.emu.shared.cheats.store(self.cheats, Ordering::Relaxed);
-        // The worker does the work behind a debug panel only while it is
-        // open; a closed one costs nothing but this store.
+        // The worker does the work behind a page only while that page is
+        // the one showing; every other page costs nothing but this store.
+        // A tab switch reaches the worker on the next frame, so the new
+        // page draws one frame of stale data before it catches up.
         let chrome_now = !self.fullscreen;
-        let mut panels = 0;
-        if chrome_now && self.show_regs {
-            panels |= PANEL_REGS;
-        }
-        if chrome_now && self.show_mem {
-            panels |= PANEL_MEMORY;
-        }
+        let panels = if chrome_now && self.show_pane { self.page.panels() } else { 0 };
         self.emu.shared.panels.store(panels, Ordering::Relaxed);
         if panels & PANEL_MEMORY != 0 {
             let base = parse_addr(&self.mem_addr).unwrap_or(0);
@@ -497,6 +658,8 @@ impl eframe::App for App {
                             ui.close();
                         }
                     });
+                    // Nothing but visibility lives here: the settings the
+                    // menu used to carry are pages of the side pane now.
                     ui.menu_button("View", |ui| {
                         if ui.button("Fullscreen	F11").clicked() {
                             self.fullscreen = true;
@@ -504,34 +667,8 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        ui.label("Scaler");
-                        for mode in crate::display::ScaleMode::ALL {
-                            ui.radio_value(&mut self.scale_mode, mode, mode.label());
-                        }
-                        ui.separator();
-                        ui.label("Aspect ratio");
-                        for mode in crate::config::AspectSetting::ALL {
-                            ui.radio_value(&mut self.aspect, mode, mode.label());
-                        }
-                        ui.separator();
-                        ui.label("Deinterlace");
-                        for mode in crate::config::DeinterlaceSetting::ALL {
-                            ui.radio_value(&mut self.deinterlace, mode, mode.label());
-                        }
-                        ui.checkbox(&mut self.swap_fields, "Swap field order");
-                        ui.separator();
-                        ui.checkbox(&mut self.internal_2x, "Internal 2x resolution");
-                        ui.separator();
+                        ui.checkbox(&mut self.show_pane, "Side pane");
                         ui.checkbox(&mut self.show_tty, "TTY panel");
-                        ui.checkbox(&mut self.show_regs, "Registers panel");
-                        ui.checkbox(&mut self.show_mem, "Memory panel");
-                    });
-                    ui.menu_button("Audio", |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                                .text("volume")
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                        );
                     });
                     ui.menu_button("Help", |ui| {
                         ui.label("Pad, as bound in the config file:");
@@ -602,74 +739,26 @@ impl eframe::App for App {
             });
         }
 
-        if chrome && self.show_regs {
-            egui::SidePanel::right("registers")
-                .default_width(280.0)
+        if chrome && self.show_pane {
+            let pane = egui::SidePanel::right("pane")
+                .resizable(true)
+                .min_width(240.0)
+                .default_width(self.pane_width)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading("EE");
-                        ui.monospace(format!("pc {:08x}", status.ee_pc));
-                        egui::Grid::new("ee_regs").striped(true).show(ui, |ui| {
-                            for (i, name) in REG_NAMES.iter().enumerate() {
-                                let [lo, hi] = status.ee_gpr[i];
-                                ui.monospace(format!("{name:>4}"));
-                                ui.monospace(if hi != 0 {
-                                    format!("{lo:016x}\n  hi:{hi:016x}")
-                                } else {
-                                    format!("{lo:016x}")
-                                });
-                                ui.end_row();
-                            }
-                            ui.monospace("  hi");
-                            ui.monospace(format!("{:016x}:{:016x}", status.ee_hi[1], status.ee_hi[0]));
-                            ui.end_row();
-                            ui.monospace("  lo");
-                            ui.monospace(format!("{:016x}:{:016x}", status.ee_lo[1], status.ee_lo[0]));
-                            ui.end_row();
-                            ui.monospace("status");
-                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_STATUS]));
-                            ui.end_row();
-                            ui.monospace(" cause");
-                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_CAUSE]));
-                            ui.end_row();
-                            ui.monospace("   epc");
-                            ui.monospace(format!("{:08x}", status.ee_cop0[COP0_EPC]));
-                            ui.end_row();
-                        });
-
-                        ui.separator();
-                        ui.heading("IOP");
-                        ui.monospace(format!("pc {:08x}", status.iop_pc));
-                        egui::Grid::new("iop_regs").striped(true).show(ui, |ui| {
-                            for (i, name) in REG_NAMES.iter().enumerate() {
-                                ui.monospace(format!("{name:>4}"));
-                                ui.monospace(format!("{:08x}", status.iop_gpr[i]));
-                                if i % 2 == 1 {
-                                    ui.end_row();
-                                }
-                            }
-                            ui.monospace("  hi");
-                            ui.monospace(format!("{:08x}", status.iop_hi));
-                            ui.monospace("  lo");
-                            ui.monospace(format!("{:08x}", status.iop_lo));
-                            ui.end_row();
-                            ui.monospace("status");
-                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_STATUS]));
-                            ui.monospace(" cause");
-                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_CAUSE]));
-                            ui.end_row();
-                            ui.monospace("   epc");
-                            ui.monospace(format!("{:08x}", status.iop_cop0[COP0_EPC]));
-                            ui.end_row();
-                        });
+                    ui.horizontal(|ui| {
+                        for page in Page::ALL {
+                            ui.selectable_value(&mut self.page, page, page.label());
+                        }
                     });
+                    ui.separator();
+                    match self.page {
+                        Page::Settings => self.settings_page(ui),
+                        Page::Memory => self.memory_page(ui),
+                        Page::Registers => registers_page(ui, &status),
+                    }
                 });
-        }
-
-        if chrome && self.show_mem {
-            egui::SidePanel::right("memory")
-                .default_width(460.0)
-                .show(ctx, |ui| self.memory_panel(ui));
+            // Follow the drag handle so the width survives to the config.
+            self.pane_width = pane.response.rect.width();
         }
 
         if chrome && self.show_tty {

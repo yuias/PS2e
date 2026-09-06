@@ -58,6 +58,11 @@ swap_fields = false
 # pixel work.
 internal_2x = false
 
+# Side pane on the right (Settings / Memory / Registers), and the width
+# it opens at. The View menu toggles it; the width follows the last drag.
+pane = true
+pane_width = 420.0
+
 # Memory card image (created and formatted automatically).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
@@ -129,6 +134,10 @@ pub struct Config {
     pub internal_2x: bool,
     /// Apply the cheats found next to the disc image (`<image>.pnach`).
     pub cheats: bool,
+    /// Show the side pane at startup, and the width it opens at. egui's
+    /// own persistence is not compiled in, so the width lives here.
+    pub pane: bool,
+    pub pane_width: f32,
     pub keys: KeyBindings,
     pub pad: PadBindings,
     pub hotkeys: HotKeys,
@@ -398,6 +407,8 @@ impl Default for Config {
             swap_fields: false,
             internal_2x: false,
             cheats: false,
+            pane: true,
+            pane_width: 420.0,
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: HotKeys::default(),
@@ -519,6 +530,20 @@ mod tests {
         let back: Config = toml::from_str(&text).expect("parses back");
         assert_eq!(back.pad.circle, cfg.pad.circle);
         assert_eq!(back.state, cfg.state);
+    }
+
+    /// The pane fields are scalars, so they have to sit ahead of the
+    /// `[keys]`/`[pad]`/`[hotkeys]` tables for `Config::save` to emit them.
+    #[test]
+    fn pane_state_round_trips_and_defaults_to_open() {
+        let cfg = Config::default();
+        assert!(cfg.pane);
+        let text = toml::to_string_pretty(&cfg).expect("serializes");
+        let back: Config = toml::from_str(&text).expect("parses back");
+        assert_eq!(back.pane, cfg.pane);
+        assert_eq!(back.pane_width, cfg.pane_width);
+        let closed: Config = toml::from_str("pane = false").expect("parses");
+        assert!(!closed.pane);
     }
 
     #[test]
