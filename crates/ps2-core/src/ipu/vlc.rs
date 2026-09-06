@@ -20,13 +20,16 @@ pub struct Code {
 }
 
 pub struct Table {
+    /// The table's name in the standard, for the warning a failed decode
+    /// prints.
+    pub name: &'static str,
     /// Bits of lookahead the array is indexed by; the longest code.
     pub bits: u32,
     entries: Box<[Code]>,
 }
 
 impl Table {
-    fn build(bits: u32, rows: &[(u16, u8, u16)]) -> Table {
+    fn build(name: &'static str, bits: u32, rows: &[(u16, u8, u16)]) -> Table {
         let mut entries = vec![Code::default(); 1 << bits].into_boxed_slice();
         for &(code, len, val) in rows {
             let shift = bits - u32::from(len);
@@ -36,7 +39,7 @@ impl Table {
                 *e = Code { len, val };
             }
         }
-        Table { bits, entries }
+        Table { name, bits, entries }
     }
 
     /// Decode from `peeked`, the next `bits` bits of the stream.
@@ -61,7 +64,7 @@ pub const MBA_ESCAPE: u16 = 35;
 
 /// Table B.1, `macroblock_address_increment`.
 pub static MBA: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(11, &[
+    Table::build("B.1", 11, &[
         (0b1, 1, 1),
         (0b011, 3, 2),
         (0b010, 3, 3),
@@ -109,12 +112,12 @@ pub const MB_QUANT: u16 = 16;
 
 /// Table B.2, `macroblock_type` in I-pictures.
 pub static MBT_I: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(2, &[(0b1, 1, MB_INTRA), (0b01, 2, MB_QUANT | MB_INTRA)])
+    Table::build("B.2", 2, &[(0b1, 1, MB_INTRA), (0b01, 2, MB_QUANT | MB_INTRA)])
 });
 
 /// Table B.3, `macroblock_type` in P-pictures.
 pub static MBT_P: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(6, &[
+    Table::build("B.3", 6, &[
         (0b1, 1, MB_FORWARD | MB_PATTERN),
         (0b01, 2, MB_PATTERN),
         (0b001, 3, MB_FORWARD),
@@ -127,7 +130,7 @@ pub static MBT_P: LazyLock<Table> = LazyLock::new(|| {
 
 /// Table B.4, `macroblock_type` in B-pictures.
 pub static MBT_B: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(6, &[
+    Table::build("B.4", 6, &[
         (0b10, 2, MB_FORWARD | MB_BACKWARD),
         (0b11, 2, MB_FORWARD | MB_BACKWARD | MB_PATTERN),
         (0b010, 3, MB_BACKWARD),
@@ -143,16 +146,16 @@ pub static MBT_B: LazyLock<Table> = LazyLock::new(|| {
 });
 
 /// Table B.5, `macroblock_type` in D-pictures.
-pub static MBT_D: LazyLock<Table> = LazyLock::new(|| Table::build(1, &[(0b1, 1, MB_INTRA)]));
+pub static MBT_D: LazyLock<Table> = LazyLock::new(|| Table::build("B.5", 1, &[(0b1, 1, MB_INTRA)]));
 
 /// Table B.11, `dmvector`, as the signed value plus one.
 pub static DMV: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(2, &[(0b0, 1, 1), (0b10, 2, 2), (0b11, 2, 0)])
+    Table::build("B.11", 2, &[(0b0, 1, 1), (0b10, 2, 2), (0b11, 2, 0)])
 });
 
 /// Table B.9, `coded_block_pattern` (the 4:2:0 rows).
 pub static CBP: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(9, &[
+    Table::build("B.9", 9, &[
         (0b111, 3, 60),
         (0b1101, 4, 4),
         (0b1100, 4, 8),
@@ -224,7 +227,7 @@ pub static CBP: LazyLock<Table> = LazyLock::new(|| {
 
 /// Table B.12, `dct_dc_size_luminance`.
 pub static DC_LUMA: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(9, &[
+    Table::build("B.12", 9, &[
         (0b100, 3, 0),
         (0b00, 2, 1),
         (0b01, 2, 2),
@@ -242,7 +245,7 @@ pub static DC_LUMA: LazyLock<Table> = LazyLock::new(|| {
 
 /// Table B.13, `dct_dc_size_chrominance`.
 pub static DC_CHROMA: LazyLock<Table> = LazyLock::new(|| {
-    Table::build(10, &[
+    Table::build("B.13", 10, &[
         (0b00, 2, 0),
         (0b01, 2, 1),
         (0b10, 2, 2),
@@ -391,6 +394,12 @@ static DCT_B14_ROWS: &[(u16, u8, u16)] = &[
 /// Table B.14. Every code of 12 bits or more is shared between the two
 /// tables, so those come from B.14 unless the run/level pair was given a
 /// shorter code here.
+///
+/// `0011 0` is run 1 level 2 and `0001 10` is run 4 level 1 — the opposite
+/// of Table B.14, where the same two patterns carry run 4 and run 1. The
+/// two are the same length either way, so a mix-up never desynchronises
+/// the reader; it only puts coefficients at the wrong frequency, and shows
+/// up as a coefficient index past the end of the block.
 static DCT_B15_ROWS: &[(u16, u8, u16)] = &[
     (0b0110, 4, DCT_EOB),
     (0b10, 2, rl(0, 1)),
@@ -409,7 +418,7 @@ static DCT_B15_ROWS: &[(u16, u8, u16)] = &[
     (0b1111_1110, 8, rl(0, 14)),
     (0b1111_1111, 8, rl(0, 15)),
     (0b010, 3, rl(1, 1)),
-    (0b0001_10, 6, rl(1, 2)),
+    (0b0011_0, 5, rl(1, 2)),
     (0b1111_001, 7, rl(1, 3)),
     (0b0010_0111, 8, rl(1, 4)),
     (0b0010_0000, 8, rl(1, 5)),
@@ -419,7 +428,7 @@ static DCT_B15_ROWS: &[(u16, u8, u16)] = &[
     (0b0000_0011_00, 10, rl(2, 4)),
     (0b0011_1, 5, rl(3, 1)),
     (0b0010_0110, 8, rl(3, 2)),
-    (0b0011_0, 5, rl(4, 1)),
+    (0b0001_10, 6, rl(4, 1)),
     (0b1111_1101, 8, rl(4, 2)),
     (0b0001_11, 6, rl(5, 1)),
     (0b0000_0010_0, 9, rl(5, 2)),
@@ -437,14 +446,14 @@ static DCT_B15_ROWS: &[(u16, u8, u16)] = &[
     (0b0000_01, 6, DCT_ESCAPE),
 ];
 
-pub static DCT_B14: LazyLock<Table> = LazyLock::new(|| Table::build(16, DCT_B14_ROWS));
+pub static DCT_B14: LazyLock<Table> = LazyLock::new(|| Table::build("B.14", 16, DCT_B14_ROWS));
 
 pub static DCT_B15: LazyLock<Table> = LazyLock::new(|| {
     let mut rows = DCT_B15_ROWS.to_vec();
     rows.extend(DCT_B14_ROWS.iter().filter(|(_, len, val)| {
         *len >= 12 && !DCT_B15_ROWS.iter().any(|(_, _, v)| v == val)
     }));
-    Table::build(16, &rows)
+    Table::build("B.15", 16, &rows)
 });
 
 #[cfg(test)]
@@ -469,6 +478,13 @@ mod tests {
         assert_eq!(DCT_B14.holes(), 16);
         // B.15: those, plus six 12-bit and four 13-bit codes vacated.
         assert_eq!(DCT_B15.holes(), 16 + 6 * 16 + 4 * 8);
+        // The two patterns B.15 gives the opposite meaning to B.14's. Hole
+        // counts and code lengths are the same either way, so nothing else
+        // in this test would notice them being exchanged.
+        assert_eq!(DCT_B15.lookup(0b0011_0 << 11).val, rl(1, 2));
+        assert_eq!(DCT_B15.lookup(0b0001_10 << 10).val, rl(4, 1));
+        assert_eq!(DCT_B14.lookup(0b0011_0 << 11).val, rl(4, 1));
+        assert_eq!(DCT_B14.lookup(0b0001_10 << 10).val, rl(1, 2));
         // Both hold every run/level pair exactly once.
         for t in [&*DCT_B14, &*DCT_B15] {
             let mut seen = std::collections::HashSet::new();

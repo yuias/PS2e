@@ -49,6 +49,19 @@ const EE_CHCR_STR: u32 = 1 << 8;
 const EE_CHCR_TTE: u32 = 1 << 6;
 const EE_CHCR_TIE: u32 = 1 << 7;
 
+/// Apply a `CHCR` write to a channel that may be running. While `STR` is
+/// set the DMAC owns the rest of the register and only `STR` reaches it,
+/// so a running channel can be stopped but not reconfigured.
+///
+/// Software leans on this: Ace Combat 5's movie player suspends channel 4
+/// with a plain `CHCR = 1`, reads the register straight back as its saved
+/// context and later restores it with `STR` set. If the mode bits took the
+/// write, the saved context would say "normal transfer" and the source
+/// chain feeding the IPU would end at its first tag's last quadword.
+fn chcr_write(old: u32, v: u32) -> u32 {
+    if old & EE_CHCR_STR != 0 { (old & !EE_CHCR_STR) | (v & EE_CHCR_STR) } else { v }
+}
+
 #[derive(Serialize, Deserialize)]
 /// IOP DMA channel (SIF0 = ch9, SIF1 = ch10).
 #[derive(Default)]
@@ -2377,7 +2390,7 @@ impl Bus {
             // IPU_FROM (ch3): normal mode only; it runs as far as the
             // output FIFO allows and finishes as decoding refills it.
             0x1000_B000 => {
-                self.dma_ipu_from.chcr = v as u32;
+                self.dma_ipu_from.chcr = chcr_write(self.dma_ipu_from.chcr, v as u32);
                 if v as u32 & EE_CHCR_STR != 0 {
                     self.pump_ipu_from();
                 }
@@ -2471,6 +2484,7 @@ impl Bus {
                     self.ipu.write32(addr, v as u32)
                 };
                 self.ipu_ran(done);
+                self.ipu_refill();
                 return;
             }
             // IPU input FIFO written by programmed I/O: assembled in the
@@ -2484,14 +2498,32 @@ impl Bus {
                     q.copy_from_slice(&self.mmio[base..base + 16]);
                     let done = self.ipu.push_in(q);
                     self.ipu_ran(done);
+                    self.ipu_refill();
                 }
                 return;
             }
             // IPU_TO (ch4): feed the decoder's input FIFO.
             0x1000_B400 => {
-                self.dma_ipu_to.chcr = v as u32;
-                if v as u32 & EE_CHCR_STR != 0 {
-                    self.pump_ipu_to();
+                self.dma_ipu_to.chcr = chcr_write(self.dma_ipu_to.chcr, v as u32);
+                debug!(target: "ps2_core::bus::dma", chcr = format_args!("{:#010x}", self.dma_ipu_to.chcr),
+                    madr = format_args!("{:#010x}", self.dma_ipu_to.madr),
+                    qwc = self.dma_ipu_to.qwc,
+                    tadr = format_args!("{:#010x}", self.dma_ipu_to.tadr),
+                    tag_end = self.dma_ipu_to.tag_end, "IPU_TO CHCR");
+                if self.dma_ipu_to.chcr & EE_CHCR_STR != 0 {
+                    // A chain armed with QWC = 0 begins by fetching a tag, so
+                    // it cannot already be sitting at the end of one. The
+                    // player stops channel 4 between movies and arms a fresh
+                    // chain at a new TADR; an `tag_end` left over from the
+                    // previous chain would retire that transfer before it
+                    // read a single tag, and the next movie never starts.
+                    // A restart with QWC > 0 is the movie player resuming
+                    // mid-chain from its saved context and must keep the
+                    // flag: the end marker came from a tag it already read.
+                    if self.dma_ipu_to.qwc == 0 {
+                        self.dma_ipu_to.tag_end = false;
+                    }
+                    self.ipu_refill();
                 }
                 return;
             }
@@ -3065,8 +3097,9 @@ impl Bus {
     /// Channel 4: move quadwords from memory into the IPU's input FIFO,
     /// letting each one wake a command that ran out of bitstream. Supports
     /// the source-chain tags the MPEG players build their streams from.
-    fn pump_ipu_to(&mut self) {
+    fn pump_ipu_to(&mut self) -> bool {
         let mut irq = false;
+        let mut moved = false;
         let mut guard = 0u32;
         while self.dma_ipu_to.chcr & EE_CHCR_STR != 0 {
             guard += 1;
@@ -3075,12 +3108,37 @@ impl Bus {
                 break;
             }
             if self.dma_ipu_to.qwc > 0 {
+                // Stall on a full input FIFO, leaving STR set and
+                // MADR/QWC/TADR where the stream really is; `ipu_refill`
+                // starts the channel again once the IPU has consumed
+                // something. A starved command is fed past the depth
+                // anyway -- see `Ipu::starved`.
+                if self.ipu.in_full() {
+                    if !self.ipu.starved() {
+                        break;
+                    }
+                    // A decode unit wider than the FIFO. `IFC` saturates at
+                    // the hardware depth, so a player that rewinds `MADR` by
+                    // `IFC + FP` cannot re-feed whatever we hold beyond it --
+                    // it would lose bitstream and see a bogus code. AC5's
+                    // movie player reaches this on every `CSC` (a macroblock
+                    // of samples is 24 quadwords) and is unharmed: it saves
+                    // its stream position before the converter borrows the
+                    // channel, not during. Say so once in case a title that
+                    // does rewind mid-command turns up.
+                    static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!(target: "ps2_core::bus::dma",
+                            "IPU input FIFO fed past its depth for a starved unit; a BCLR here loses bitstream");
+                    }
+                }
                 let w = self.ee_dma_read128(self.dma_ipu_to.madr);
                 let mut q = [0u8; 16];
                 for (i, word) in w.iter().enumerate() {
                     q[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
                 irq |= self.ipu.push_in(q);
+                moved = true;
                 self.dma_ipu_to.madr = self.dma_ipu_to.madr.wrapping_add(16);
                 self.dma_ipu_to.qwc -= 1;
                 continue;
@@ -3088,7 +3146,12 @@ impl Bus {
             let chain = (self.dma_ipu_to.chcr >> 2) & 3 == 1;
             if !chain || self.dma_ipu_to.tag_end {
                 self.dma_ipu_to.chcr &= !EE_CHCR_STR;
-                self.dma_ipu_to.tag_end = false;
+                // Only a chain that reached its last tag clears the flag.
+                // The DMAC keeps the tag it read in `CHCR`, so a normal
+                // transfer borrowing the channel leaves it alone -- and
+                // AC5's movie player borrows channel 4 for the CSC source
+                // between two halves of the chain that feeds the decoder.
+                self.dma_ipu_to.tag_end &= !chain;
                 self.ee_dma_irq(4);
                 debug!(target: "ps2_core::bus::dma", "IPU_TO DMA done");
                 break;
@@ -3097,6 +3160,9 @@ impl Bus {
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let addr = tag[1] & 0xFFFF_FFF0;
+            debug!(target: "ps2_core::bus::dma", id, qwc,
+                tadr = format_args!("{:#010x}", self.dma_ipu_to.tadr),
+                addr = format_args!("{:#010x}", addr), "IPU_TO tag");
             match id {
                 0 => {
                     self.dma_ipu_to.madr = addr;
@@ -3149,8 +3215,28 @@ impl Bus {
                 }
             }
             self.dma_ipu_to.qwc = qwc;
+            moved = true;
         }
         self.ipu_ran(irq);
+        moved
+    }
+
+    /// Restart a channel-4 transfer that stalled on a full input FIFO.
+    /// Called after the register writes that can make the IPU consume;
+    /// deliberately not part of [`Bus::ipu_ran`], which `pump_ipu_to`
+    /// itself ends with.
+    fn ipu_refill(&mut self) {
+        // One pass fills the input FIFO, `ipu_ran` then drains the output
+        // through channel 3, and that can free the decoder to eat the input
+        // again -- so keep going while anything moves. The three of them
+        // are driven from here rather than calling into each other, which
+        // is what keeps the recursion out.
+        for _ in 0..1024 {
+            if self.dma_ipu_to.chcr & EE_CHCR_STR == 0 || !self.pump_ipu_to() {
+                return;
+            }
+        }
+        warn!(target: "ps2_core::bus::dma", "IPU refill did not settle");
     }
 
     /// After the IPU has run: raise its interrupt if a command finished,
@@ -3169,12 +3255,26 @@ impl Bus {
     /// stops short when the FIFO is empty and resumes from `ipu_ran`; the
     /// transfer ends, with its interrupt, when QWC is exhausted.
     fn pump_ipu_from(&mut self) {
+        let mut short = false;
         while self.dma_ipu_from.qwc > 0 {
-            let Some(q) = self.ipu.pop_out() else { return };
+            let Some(q) = self.ipu.pop_out() else {
+                short = true;
+                break;
+            };
             let words = std::array::from_fn(|i| u32::from_le_bytes(q[i * 4..i * 4 + 4].try_into().unwrap()));
             self.ee_dma_write128(self.dma_ipu_from.madr, words);
             self.dma_ipu_from.madr = self.dma_ipu_from.madr.wrapping_add(16);
             self.dma_ipu_from.qwc -= 1;
+        }
+        // Draining can restart a command that was parked on a full output
+        // FIFO; if that command finished, its interrupt is ours to raise
+        // (`ipu_ran` is above us on the stack and has already been past).
+        if self.ipu.took_done() {
+            self.intc_stat |= 1 << 8;
+            self.intc_changed();
+        }
+        if short {
+            return;
         }
         self.dma_ipu_from.chcr &= !EE_CHCR_STR;
         debug!(target: "ps2_core::bus::dma", "IPU_FROM DMA done");
@@ -3830,6 +3930,7 @@ impl Bus {
                         target: "ps2_core::bus::sifcmd",
                         cid = format_args!("{cid:#010x}"),
                         payload = format_args!("{payload:08x?}"),
+                        cycle = self.now,
                         "EE->IOP command"
                     );
                 }
@@ -3891,6 +3992,28 @@ impl Bus {
                     end = ch.tag_end,
                     "IOP SIF0 tag"
                 );
+                // The IOP answers down this channel, so log a block that
+                // starts with a plausible sceSifCmdHeader the same way the
+                // EE's side is logged. An RPC whose end packet never comes
+                // is invisible with only half the conversation on the log.
+                let src = (ch.madr & 0x1F_FFFC) as usize;
+                let hdr = read_le::<4>(&self.iop_ram, src) as u32;
+                if hdr & 0xFF >= 16 {
+                    let cid = read_le::<4>(&self.iop_ram, (src + 8) & 0x1F_FFFC) as u32;
+                    if cid & 0x8000_0000 != 0 {
+                        let words = (((hdr & 0xFF) as usize).saturating_sub(16) / 4).min(6);
+                        let payload: Vec<u32> = (0..words)
+                            .map(|i| read_le::<4>(&self.iop_ram, (src + 16 + i * 4) & 0x1F_FFFC) as u32)
+                            .collect();
+                        debug!(
+                            target: "ps2_core::bus::sifcmd",
+                            cid = format_args!("{cid:#010x}"),
+                            payload = format_args!("{payload:08x?}"),
+                            cycle = self.now,
+                            "IOP->EE command"
+                        );
+                    }
+                }
                 if ch.words_left == 0 && ch.tag_end {
                     ch.chcr &= !IOP_CHCR_BUSY;
                     ch.tag_end = false;
@@ -4549,6 +4672,88 @@ mod tests {
         // The IPU interrupt and the channel's own both raised.
         assert_ne!(b.intc_stat & 1 << 8, 0);
         assert!(b.dma_irq_queue.iter().any(|&(ch, _)| ch == 1 << 3));
+    }
+
+    /// Lay a two-tag channel-4 source chain out at `0x00100000`: `ref` of
+    /// `first` quadwords at `0x00110000`, then `refe` of `last` at
+    /// `0x00120000`.
+    fn ipu_chain(b: &mut Bus, first: u32, last: u32) {
+        b.write32(0x0010_0000, 3 << 28 | first);
+        b.write32(0x0010_0004, 0x0011_0000);
+        b.write32(0x0010_0010, last);
+        b.write32(0x0010_0014, 0x0012_0000);
+    }
+
+    /// `BCLR` empties the input FIFO, which is how the movie player makes
+    /// room before it feeds the channel something else.
+    fn ipu_bclr(b: &mut Bus) {
+        b.write32(0x1000_2000, 0);
+    }
+
+    /// While `STR` is set only `STR` reaches `CHCR`, so a player that stops
+    /// channel 4 with a bare `CHCR = 1` and reads the register back as its
+    /// saved context still sees chain mode -- and the chain it restores
+    /// crosses into the next tag instead of ending at this one.
+    #[test]
+    fn stopping_a_running_channel_leaves_its_transfer_mode_alone() {
+        let mut b = bus();
+        ipu_chain(&mut b, 16, 4);
+        b.write32(0x1000_B430, 0x0010_0000); // TADR
+        b.write32(0x1000_B420, 0); // QWC
+        b.write32(0x1000_B400, 0x105); // chain, to device, start
+        // The input FIFO is eight quadwords deep, so the channel is still
+        // inside the first tag with its start bit set.
+        assert_eq!(b.read32(0x1000_B400), 0x105);
+        assert_eq!(b.read32(0x1000_B410), 0x0011_0080);
+        assert_eq!(b.read32(0x1000_B420), 8);
+        b.write32(0x1000_B400, 1);
+        assert_eq!(b.read32(0x1000_B400), 0x5);
+        // Restore the saved context and let the decoder drain: the chain
+        // picks the `refe` tag up and ends there, one tag past where it
+        // stopped.
+        ipu_bclr(&mut b);
+        b.write32(0x1000_B410, 0x0011_0080);
+        b.write32(0x1000_B420, 8);
+        b.write32(0x1000_B400, 0x5 | EE_CHCR_STR);
+        assert_eq!(b.read32(0x1000_B430), 0x0010_0020);
+        assert_eq!(b.read32(0x1000_B410), 0x0012_0000);
+        ipu_bclr(&mut b);
+        assert_eq!(b.read32(0x1000_B400) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_B430), 0x0010_0020);
+    }
+
+    /// A normal transfer borrowing channel 4 -- the movie player feeds the
+    /// colour-space converter that way, between two halves of the chain
+    /// that feeds the decoder -- must not clear the chain's end-of-tag
+    /// state, or the restored chain walks past its last tag.
+    #[test]
+    fn a_normal_transfer_does_not_end_the_chain_it_borrows() {
+        let mut b = bus();
+        ipu_chain(&mut b, 4, 12);
+        b.write32(0x1000_B430, 0x0010_0000);
+        b.write32(0x1000_B420, 0);
+        b.write32(0x1000_B400, 0x105);
+        // Four quadwords from the first tag and four from the `refe` one,
+        // which is where the FIFO fills up.
+        assert!(b.dma_ipu_to.tag_end);
+        assert_eq!(b.read32(0x1000_B430), 0x0010_0020);
+        b.write32(0x1000_B400, 1);
+        ipu_bclr(&mut b);
+        // Borrow the channel for a two-quadword normal transfer.
+        b.write32(0x1000_B410, 0x0013_0000);
+        b.write32(0x1000_B420, 2);
+        b.write32(0x1000_B400, 0x101);
+        assert_eq!(b.read32(0x1000_B400) & EE_CHCR_STR, 0);
+        assert!(b.dma_ipu_to.tag_end);
+        // Back to the chain: it ends on the tag it had already read rather
+        // than fetching whatever follows it.
+        ipu_bclr(&mut b);
+        b.write32(0x1000_B410, 0x0012_0040);
+        b.write32(0x1000_B420, 8);
+        b.write32(0x1000_B400, 0x5 | EE_CHCR_STR);
+        ipu_bclr(&mut b);
+        assert_eq!(b.read32(0x1000_B400) & EE_CHCR_STR, 0);
+        assert_eq!(b.read32(0x1000_B430), 0x0010_0020);
     }
 
     /// A poll in analog mode carries the four stick bytes after the button

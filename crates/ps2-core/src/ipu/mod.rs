@@ -95,7 +95,30 @@ enum Halt {
     Error,
 }
 
+/// What a [`Halt::Error`] was decoding when it gave up. A failed VLC decode
+/// is nearly always a mistyped table row or a lost bit, and neither can be
+/// told from the other without the table, the position and the bits, so
+/// every error path records them for the warning [`Ipu::stepped`] prints.
+#[derive(Clone, Copy, Default)]
+struct Fault {
+    /// The table whose lookup failed, or the rule that rejected the value.
+    what: &'static str,
+    /// Bit pointer into the window, and bits consumed since power-on.
+    bp: u32,
+    at: u64,
+    /// The bits under the pointer, right-aligned, and how many are real
+    /// (the FIFO may hold fewer than the 32 wanted).
+    next: u32,
+    have: u32,
+}
+
 type Step<T> = Result<T, Halt>;
+
+/// Whether a command writes to the output FIFO: IDEC, BDEC, CSC, PACK.
+/// The others (BCLR, VDEC, FDEC and the setup commands) only read.
+fn emits(val: u32) -> bool {
+    matches!(val >> 28, 0x1 | 0x2 | 0x7 | 0x8)
+}
 
 /// The reader state a rolled-back unit restores.
 #[derive(Clone, Default)]
@@ -154,6 +177,13 @@ pub struct Ipu {
     taken: Vec<[u8; 16]>,
     #[serde(skip)]
     tx: bool,
+    /// Where the last [`Halt::Error`] came from. Diagnostic only.
+    #[serde(skip)]
+    fault: Option<Fault>,
+    /// A command that finished inside `pop_out`, waiting to be reported.
+    /// Never live across a bus access, so save states need not carry it.
+    #[serde(skip)]
+    drained_done: bool,
 }
 
 impl Ipu {
@@ -272,10 +302,23 @@ impl Ipu {
     fn vlc(&mut self, t: &vlc::Table) -> Step<u16> {
         let c = t.lookup(self.look(t.bits)?);
         if c.len == 0 {
-            return Err(Halt::Error);
+            return Err(self.fail(t.name));
         }
         self.advance(u32::from(c.len));
         Ok(c.val)
+    }
+
+    /// Note where the bitstream stopped making sense and hand back the
+    /// error to propagate. Peeking cannot move the bit pointer, so this is
+    /// safe to call from anywhere inside a unit.
+    fn fail(&mut self, what: &'static str) -> Halt {
+        let mut have = 32;
+        while have > 0 && self.peek(have).is_none() {
+            have -= 8;
+        }
+        let next = self.peek(have).unwrap_or(0);
+        self.fault = Some(Fault { what, bp: self.bp, at: self.advanced, next, have });
+        Halt::Error
     }
 
     // --- transactions ----------------------------------------------------
@@ -321,6 +364,20 @@ impl Ipu {
             self.ctrl &= !(CTRL_ECD | CTRL_SCD);
         }
         loop {
+            // The output FIFO is eight quadwords deep on hardware and a
+            // full one holds the decoder until channel 3 (or a programmed
+            // read) drains it. Without that back-pressure a CSC of a
+            // thousand macroblocks finishes inside the write that starts
+            // it, and a player that paces itself on the drain swallows the
+            // whole stream in one burst. A unit is emitted whole, so the
+            // check is between units, not inside one -- and only for the
+            // commands that emit at all: VDEC produces no output, so
+            // parking it on a full FIFO would deadlock a decode that
+            // hardware lets straight through.
+            if emits(val) && self.fifo_out.len() >= FIFO_DEPTH {
+                self.stall(val, progress);
+                return false;
+            }
             self.begin();
             match unit(self, val, progress) {
                 Ok(last) => {
@@ -338,8 +395,13 @@ impl Ipu {
                 Err(Halt::Error) => {
                     self.commit();
                     self.ctrl |= CTRL_ECD;
+                    let f = self.fault.take().unwrap_or_default();
                     warn!(target: "ps2_core::bus::ipu",
-                        cmd = format_args!("{:#x}", val >> 28), unit = progress,
+                        cmd = format_args!("{:#x}", val >> 28),
+                        word = format_args!("{val:#010x}"), unit = progress,
+                        table = f.what, bp = f.bp, at = f.at,
+                        next = format_args!("{:0width$b}", f.next, width = f.have as usize),
+                        ctrl = format_args!("{:#010x}", self.ctrl),
                         "no valid code in the bitstream");
                     return true;
                 }
@@ -376,7 +438,18 @@ impl Ipu {
         match addr & 0x3C {
             0x00 => return self.command(v),
             0x10 => {
-                self.ctrl = (v & CTRL_WRITE) | (self.ctrl & CTRL_KEEP);
+                // RST is a strobe: it acts on the write and does not stay
+                // set. Players read `IPU_CTRL` back and write it again to
+                // change one field, so a stored RST would soft-reset the
+                // IPU on every such write and throw the bitstream away in
+                // the middle of a picture.
+                self.ctrl = (v & CTRL_WRITE & !CTRL_RESET) | (self.ctrl & CTRL_KEEP);
+                // The picture parameters the decoder runs on arrive here and
+                // nowhere else, so a stream that decodes to garbage is
+                // diagnosed from this line first.
+                debug!(target: "ps2_core::bus::ipu",
+                    write = format_args!("{v:#010x}"),
+                    ctrl = format_args!("{:#010x}", self.ctrl), "IPU_CTRL");
                 if v & CTRL_RESET != 0 {
                     self.reset();
                 }
@@ -411,6 +484,24 @@ impl Ipu {
 
     // --- FIFOs -----------------------------------------------------------
 
+    /// Whether the input FIFO holds its full hardware depth. Channel 4
+    /// stalls here rather than running the whole source chain into it:
+    /// MPEG players read `D4_MADR`/`D4_QWC` back as their position in the
+    /// stream and rewind it by `IFC + FP` quadwords to re-feed what a
+    /// `BCLR` threw away, so a channel that has already swallowed the
+    /// file tells them the stream ended.
+    pub fn in_full(&self) -> bool {
+        self.fifo_in.len() >= FIFO_DEPTH
+    }
+
+    /// Whether a command is waiting for more bitstream. A unit runs in a
+    /// transaction and a starved one rolls back, so a unit wider than the
+    /// FIFO would deadlock against [`Ipu::in_full`]; channel 4 keeps
+    /// feeding while this holds.
+    pub fn starved(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Feed one quadword to the input FIFO, from DMA channel 4 or a
     /// programmed write. Returns true when it let a stalled command finish.
     pub fn push_in(&mut self, q: [u8; 16]) -> bool {
@@ -421,7 +512,20 @@ impl Ipu {
     /// Take the oldest decoded quadword, for DMA channel 3 or a programmed
     /// read of the output FIFO.
     pub fn pop_out(&mut self) -> Option<[u8; 16]> {
-        self.fifo_out.pop_front()
+        let was_full = self.fifo_out.len() >= FIFO_DEPTH;
+        let q = self.fifo_out.pop_front();
+        // Room again: a decoder parked on a full FIFO carries on, which is
+        // what keeps a long command producing while channel 3 consumes.
+        if was_full && q.is_some() && self.pending.is_some() {
+            self.drained_done |= self.resume();
+        }
+        q
+    }
+
+    /// Whether a command completed inside [`Ipu::pop_out`] since this was
+    /// last asked. The caller raises the interrupt; the FIFO cannot.
+    pub fn took_done(&mut self) -> bool {
+        std::mem::take(&mut self.drained_done)
     }
 
     /// Queue decoded data, a whole number of quadwords.
@@ -521,9 +625,10 @@ impl Ipu {
         };
         if done {
             debug!(target: "ps2_core::bus::ipu",
-                cmd = format_args!("{op:#x}"),
+                cmd = format_args!("{op:#x}"), word = format_args!("{val:#010x}"),
                 data = format_args!("{:#010x}", self.cmd_data),
-                bp = self.bp, ifc = self.ifc(), ofc = self.fifo_out.len(), "command done");
+                bp = self.bp, at = self.advanced,
+                ifc = self.ifc(), ofc = self.fifo_out.len(), "command done");
             self.pending = None;
             self.cmd_busy = false;
             self.top_busy = false;
@@ -548,7 +653,23 @@ impl Ipu {
         self.skip(val & 0x3F)?;
         let start = self.advanced;
         let v = match (val >> 26) & 3 {
-            0 => u32::from(self.vlc(&vlc::MBA)?),
+            0 => {
+                // A slice ends where the next `macroblock_address_increment`
+                // would start. No code in any table is 23 zeros, so that
+                // pattern is the zero padding and prefix of the next start
+                // code (ISO/IEC 13818-2 6.2.4) rather than a bad code: the
+                // pointer stays on it and `SCD` reports it, not `ECD`.
+                // Players read this back to end the slice, and one told the
+                // code was invalid instead rescans byte-wise from here and
+                // walks straight past the start code, losing a whole slice.
+                if self.look(23)? == 0 {
+                    self.ctrl |= CTRL_SCD;
+                    self.cmd_data = 0;
+                    self.top = self.look(32)?;
+                    return Ok(true);
+                }
+                u32::from(self.vlc(&vlc::MBA)?)
+            }
             1 => {
                 // PCT 0 is treated as an I-picture, as the hardware does
                 // for software that never set it.
@@ -557,7 +678,7 @@ impl Ipu {
                     2 => &*vlc::MBT_P,
                     3 => &*vlc::MBT_B,
                     4 => &*vlc::MBT_D,
-                    _ => return Err(Halt::Error),
+                    _ => return Err(self.fail("picture coding type")),
                 };
                 u32::from(self.vlc(t)?)
             }
@@ -566,7 +687,7 @@ impl Ipu {
                 // increment 2m+1 is +m, 2m is -m, and 1 is zero.
                 let n = i32::from(self.vlc(&vlc::MBA)?);
                 if n > 33 {
-                    return Err(Halt::Error);
+                    return Err(self.fail("B.10 escape"));
                 }
                 let m = if n % 2 == 1 { n / 2 } else { -(n / 2) };
                 m as u16 as u32
@@ -810,7 +931,7 @@ impl Ipu {
             first = false;
             i += run;
             if i >= 64 {
-                return Err(Halt::Error);
+                return Err(self.fail("coefficient run past the block"));
             }
             let j = scan[i];
             let (w, mag) = (weight(j), level.abs());
@@ -1042,10 +1163,30 @@ mod tests {
 
     #[test]
     fn vdec_flags_a_pattern_no_code_claims() {
-        // Eleven zeros: a start code prefix, not an address increment.
-        let mut ipu = fed("00000000000 00000000000000000000000000000000");
+        // `0000 0010 000` is one of the gaps Table B.1 leaves, and it is
+        // not a run of zeros, so it is a bad code rather than a slice end.
+        let mut ipu = fed("00000010000 1111111111111111 0000000000000000");
         assert!(ipu.write32(0, 0x3000_0000));
         assert_ne!(ipu.read32(0x10) & CTRL_ECD, 0);
+        assert_eq!(ipu.read32(0x10) & CTRL_SCD, 0);
+    }
+
+    #[test]
+    fn vdec_ends_a_slice_on_the_start_code_rather_than_erroring() {
+        // A slice ends with padding to the byte and then a start code. The
+        // address increment that runs into it is a slice end, so `SCD` is
+        // raised, `ECD` is not, and the pointer stays on the start code for
+        // the player to read.
+        let mut ipu = fed("1 0000000 00000000 00000000 00000001 00000001 11111111");
+        // Consume the first increment so the pointer sits on the padding.
+        assert!(ipu.write32(0, 0x3000_0000));
+        assert_eq!(ipu.read32(0) & 0xFFFF, 1);
+        assert!(ipu.write32(0, 0x3000_0000));
+        assert_ne!(ipu.read32(0x10) & CTRL_SCD, 0);
+        assert_eq!(ipu.read32(0x10) & CTRL_ECD, 0);
+        assert_eq!(ipu.read32(0x20) & 0x7F, 1);
+        assert!(ipu.write32(0, 0x4000_0007));
+        assert_eq!(ipu.read32(0), 0x0000_0101);
     }
 
     /// An intra macroblock whose six blocks carry only DC: luma
@@ -1119,6 +1260,50 @@ mod tests {
         assert!(y[..8].iter().all(|&s| s == y[0]));
     }
 
+    /// `intra_vlc_format = 1` swaps in Table B.15, where `0011 0` is run 1
+    /// level 2 rather than B.14's run 4 level 1. Run 1 lands the
+    /// coefficient at scan position 2, natural index 8: the first vertical
+    /// frequency, so the block shades top to bottom and its rows stay flat.
+    /// Run 4 would land it at natural index 2 and shade left to right.
+    #[test]
+    fn table_b15_puts_a_coefficient_where_b14_would_not() {
+        let mb = "100 00110 0 0110  100 0110  100 0110  100 0110  00 0110  00 0110";
+        let mut ipu = fed(mb);
+        flat_matrices(&mut ipu);
+        ipu.write32(0x10, CTRL_IVF);
+        assert!(ipu.write32(0, 0x2000_0000 | 1 << 27 | 1 << 26 | 31 << 16));
+        assert_eq!(ipu.read32(0x10) & CTRL_ECD, 0);
+        let y = samples16(&drain(&mut ipu)[..512]);
+        // Mismatch control moves F[63], which is worth a unit either way,
+        // so a flat row is flat to within one.
+        let row = &y[..8];
+        assert!(row.iter().max().unwrap() - row.iter().min().unwrap() <= 1, "{row:?}");
+        let column: Vec<i16> = (0..8).map(|r| y[r * 16]).collect();
+        assert!(column.windows(2).all(|w| w[0] > w[1]), "{column:?}");
+        assert!(column[0] > 128 && column[7] < 128);
+    }
+
+    /// A player changes one field of `IPU_CTRL` by reading it back and
+    /// writing it again. `RST` is a strobe and reads as clear, so that
+    /// round trip must leave the bitstream and the bit pointer alone.
+    #[test]
+    fn writing_ctrl_back_after_a_reset_does_not_reset_again() {
+        let mut ipu = Ipu::new();
+        ipu.push_in(qw(0));
+        ipu.write32(0x10, CTRL_RESET | CTRL_IVF);
+        assert_eq!(ipu.ifc(), 0, "the reset itself still empties the FIFO");
+        ipu.push_in(qw(0));
+        assert!(ipu.write32(0, 0x4000_0008));
+        let ctrl = ipu.read32(0x10);
+        assert_eq!(ctrl & CTRL_RESET, 0);
+        ipu.write32(0x10, ctrl);
+        // Bit pointer, window and picture parameters all survive.
+        assert_eq!(ipu.read32(0x20) & 0x7F, 8);
+        assert_ne!(ipu.read32(0x10) & CTRL_IVF, 0);
+        assert!(ipu.write32(0, 0x4000_0000));
+        assert_eq!(ipu.read32(0), 0x0102_0304);
+    }
+
     #[test]
     fn a_field_dct_interleaves_the_luma_blocks() {
         let mut ipu = fed(&dc_macroblock(["110 1000", "100", "110 0111", "100"]));
@@ -1163,9 +1348,12 @@ mod tests {
         let mut ipu = fed(&format!("{bits} {} 00000000 00000000 00000001 10110111 11111111",
             "0".repeat((8 - bits.replace(' ', "").len() % 8) % 8)));
         flat_matrices(&mut ipu);
-        assert!(ipu.write32(0, 0x1000_0000 | 1 << 16));
+        // Two macroblocks are 128 quadwords and the FIFO holds eight, so
+        // the command parks and the drain is what carries it to the end.
+        assert!(!ipu.write32(0, 0x1000_0000 | 1 << 16));
         let out = drain(&mut ipu);
         assert_eq!(out.len(), 2 * 1024);
+        assert_eq!(ipu.read32(0x10) & CTRL_BUSY, 0);
         // Y 128, Cb/Cr 128 is (149 * 112 + 64) >> 7 = 130 on every channel.
         for p in out.chunks(4) {
             assert_eq!(p, [130, 130, 130, 0x80]);
@@ -1186,7 +1374,7 @@ mod tests {
         let mut ipu = fed(&format!("{bits} {} 00000000 00000000 00000001 00000000 00000000",
             "0".repeat((8 - bits.replace(' ', "").len() % 8) % 8)));
         flat_matrices(&mut ipu);
-        assert!(ipu.write32(0, 0x1000_0000 | 1 << 27 | 1 << 16));
+        assert!(!ipu.write32(0, 0x1000_0000 | 1 << 27 | 1 << 16));
         assert_eq!(ipu.qsc, 3);
         let out = drain(&mut ipu);
         assert_eq!(out.len(), 512);
@@ -1210,7 +1398,7 @@ mod tests {
         for _ in 0..8 {
             ipu.push_in([128; 16]);
         }
-        assert!(ipu.write32(0, 0x7000_0000 | 2));
+        assert!(!ipu.write32(0, 0x7000_0000 | 2));
         let out = drain(&mut ipu);
         assert_eq!(out.len(), 2048);
         assert!(out[..1024].chunks(4).all(|p| p == [0, 0, 0, 0x80]));
@@ -1226,8 +1414,12 @@ mod tests {
         }
         assert!(!ipu.write32(0, 0x7000_0000 | 1));
         assert!(ipu.fifo_out.is_empty());
-        assert!(ipu.push_in([128; 16]));
+        // The macroblock converts as soon as its last quadword lands,
+        // but the command only retires once its output has been taken.
+        assert!(!ipu.push_in([128; 16]));
         assert_eq!(ipu.fifo_out.len(), 64);
+        assert_eq!(drain(&mut ipu).len(), 1024);
+        assert_eq!(ipu.read32(0x10) & CTRL_BUSY, 0);
     }
 
     #[test]
@@ -1237,10 +1429,46 @@ mod tests {
         for _ in 0..64 {
             ipu.push_in(std::array::from_fn(|i| px[i % 4]));
         }
-        assert!(ipu.write32(0, 0x8000_0000 | 1 << 27 | 1));
+        assert!(!ipu.write32(0, 0x8000_0000 | 1 << 27 | 1));
         let out = drain(&mut ipu);
         assert_eq!(out.len(), 512);
         assert!(out.chunks(2).all(|p| u16::from_le_bytes([p[0], p[1]]) == 1 << 15 | 31 << 10 | 16 << 5));
+    }
+
+    /// The output FIFO is eight quadwords deep and holds the decoder when
+    /// it is full. Without this a long CSC finishes inside the write that
+    /// starts it and a player pacing itself on channel 3 eats its whole
+    /// stream at once.
+    #[test]
+    fn a_full_output_fifo_holds_the_decoder_until_it_is_drained() {
+        let mut ipu = Ipu::new();
+        for _ in 0..48 {
+            ipu.push_in([16; 16]);
+        }
+        // Two macroblocks; only the first can be converted before the FIFO
+        // is full, and the second waits for room.
+        assert!(!ipu.write32(0, 0x7000_0000 | 2));
+        assert_eq!(ipu.fifo_out.len(), 64);
+        assert_ne!(ipu.read32(0x10) & CTRL_BUSY, 0);
+        for _ in 0..64 {
+            ipu.pop_out().expect("the first macroblock is there");
+        }
+        // Taking it restarted the command, which converted the second.
+        assert_eq!(ipu.fifo_out.len(), 64);
+        assert_eq!(drain(&mut ipu).len(), 1024);
+        assert_eq!(ipu.read32(0x10) & CTRL_BUSY, 0);
+    }
+
+    /// VDEC writes nothing, so a full output FIFO must not hold it: on
+    /// hardware the decode goes straight through, and parking it here
+    /// would deadlock a player that reads a header between macroblocks.
+    #[test]
+    fn a_full_output_fifo_does_not_hold_a_vdec() {
+        let mut ipu = fed("00000000 00000000 00000001 00000011 1 0000000");
+        ipu.fifo_out.extend(std::iter::repeat_n([0u8; 16], FIFO_DEPTH * 4));
+        // Skip the start code, then read one macroblock_address_increment.
+        assert!(ipu.write32(0, 0x3000_0000 | 32));
+        assert_eq!(ipu.read32(0) & 0xFFFF, 1);
     }
 
     #[test]
