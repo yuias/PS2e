@@ -119,6 +119,8 @@ pub struct Config {
     pub deinterlace: DeinterlaceSetting,
     pub swap_fields: bool,
     pub internal_2x: bool,
+    /// Apply the cheats found next to the disc image (`<image>.pnach`).
+    pub cheats: bool,
     pub keys: KeyBindings,
     pub pad: PadBindings,
     pub hotkeys: HotKeys,
@@ -348,6 +350,7 @@ impl Default for Config {
             deinterlace: DeinterlaceSetting::Bwdif,
             swap_fields: false,
             internal_2x: false,
+            cheats: false,
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: HotKeys::default(),

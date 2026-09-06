@@ -53,6 +53,9 @@ struct Args {
     gs_inline: bool,
     /// Interpret the EE instead of recompiling it.
     no_jit: bool,
+    /// Headless: apply the pnach next to `--disc`. The window has a
+    /// checkbox for this instead, so a stray file cannot change a run.
+    cheats: bool,
     /// Render internally at 2x and scan out the overlay.
     internal_2x: bool,
     /// Video timing region before software programs the CRTC; overrides the
@@ -125,6 +128,7 @@ fn parse_args() -> Result<Args, String> {
         wait_debugger: false,
         gs_inline: false,
         no_jit: false,
+        cheats: false,
         internal_2x: false,
         region: None,
         presses: Vec::new(),
@@ -173,6 +177,7 @@ fn parse_args() -> Result<Args, String> {
                 .push(parse_watch(&it.next().ok_or("--watch needs <ee|iop>:<addr>[,<len>]")?)?),
             "--gs-inline" => args.gs_inline = true,
             "--no-jit" => args.no_jit = true,
+            "--cheats" => args.cheats = true,
             "--internal-2x" => args.internal_2x = true,
             "--region" => {
                 args.region = Some(it.next().ok_or("--region needs ntsc or pal")?.parse()?)
@@ -223,6 +228,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
                      --disc           disc image (2048-byte-sector ISO), streamed\n\
+                     --cheats         apply <disc>.pnach next to the image (headless;\n\
+                     \x20                the window has an Emulation menu checkbox)\n\
                      --insert         open the drive and close it on a new image,\n\
                      \x20                <path>@<cycle> (headless)\n\
                      --save-state     write a save state, <path>@<cycle> (headless)\n\
@@ -343,6 +350,7 @@ fn main() -> ExitCode {
             }
         }
     }
+    let mut cheats = Vec::new();
     if let Some(path) = &args.disc {
         match std::fs::File::open(path) {
             Ok(f) => {
@@ -352,6 +360,7 @@ fn main() -> ExitCode {
                     serial = sys.bus.cdvd.boot_serial().unwrap_or_default(),
                     "disc image attached"
                 );
+                cheats = emu::load_cheats(Path::new(path));
             }
             Err(e) => {
                 eprintln!("error: cannot open disc '{path}': {e}");
@@ -397,9 +406,9 @@ fn main() -> ExitCode {
 
     if windowed {
         let nvram_path = std::path::Path::new(&bios_path).with_extension("nvm");
-        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path, nvram_path)
+        run_windowed(sys, bios, args, cfg, cfg_path, debugger, memcard_path, nvram_path, cheats)
     } else {
-        run_headless(sys, &args, debugger, memcard_path)
+        run_headless(sys, &args, debugger, memcard_path, cheats)
     }
 }
 
@@ -412,6 +421,7 @@ fn run_windowed(
     debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
     nvram_path: PathBuf,
+    cheats: Vec<ps2_core::cheats::Cheat>,
 ) -> ExitCode {
     let region = sys.region();
     let options = eframe::NativeOptions {
@@ -424,6 +434,7 @@ fn run_windowed(
     let wait_debugger = args.wait_debugger;
     let disc_name = args.disc.as_deref().map(|p| emu::disc_name(Path::new(p)));
     let state_path = cfg.state_path(cfg_path.as_ref());
+
     let result = eframe::run_native(
         ui::WINDOW_TITLE,
         options,
@@ -434,6 +445,7 @@ fn run_windowed(
                 memcard_path,
                 state_path,
                 disc_name,
+                cheats,
                 debugger,
                 wait_debugger,
                 region,
@@ -459,9 +471,14 @@ fn run_headless(
     args: &Args,
     mut debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
+    cheats: Vec<ps2_core::cheats::Cheat>,
 ) -> ExitCode {
     let cycles = args.cycles.expect("headless mode requires --cycles");
     tracing::info!(bios = ?args.bios, cycles, "booting");
+    if args.cheats {
+        sys.set_cheats(cheats);
+        sys.set_cheats_enabled(true);
+    }
     // Debug aid: PS2E_SHOT_WOVEN=1 makes the periodic screenshots go
     // through the same vblank-composited path the window shows.
     let shot_woven = std::env::var_os("PS2E_SHOT_WOVEN").is_some();

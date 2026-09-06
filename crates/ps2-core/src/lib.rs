@@ -5,6 +5,7 @@
 //! this crate through [`Ps2System`].
 
 pub mod bus;
+pub mod cheats;
 pub mod ee;
 pub mod gif;
 pub mod gs;
@@ -135,6 +136,10 @@ pub struct Ps2System {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[serde(skip)]
     iop_jit: Option<iop::jit::Jit>,
+    /// Cheats applied at each vertical blank: host configuration, not
+    /// machine state, so a save state does not carry them.
+    #[serde(skip)]
+    cheats: cheats::Table,
 }
 
 impl Ps2System {
@@ -184,6 +189,7 @@ impl Ps2System {
             iop_jit: Some(
                 iop::jit::Jit::new().map_err(|e| format!("cannot allocate JIT arena: {e}"))?,
             ),
+            cheats: cheats::Table::default(),
         };
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         sys.bus.vu1.set_jit(true)?;
@@ -430,6 +436,7 @@ impl Ps2System {
         // Counted rather than derived with `%`: this runs per instruction.
         if self.frame_pos == self.vblank_start() {
             self.bus.vblank(true);
+            self.apply_cheats();
             event = true;
         } else if self.frame_pos == 0 && self.cycles != 0 {
             self.bus.vblank(false);
@@ -539,6 +546,7 @@ impl Ps2System {
             }
             if self.frame_pos == self.vblank_start() {
                 self.bus.vblank(true);
+                self.apply_cheats();
                 self.wake_idle_ee();
             } else if self.frame_pos == 0 && self.cycles != 0 {
                 self.bus.vblank(false);
@@ -862,6 +870,35 @@ mod state_tests {
         assert_eq!(a.ee.pc, b.ee.pc);
         assert_eq!(a.cycles, b.cycles);
         assert_eq!(a.bus.ram, b.bus.ram);
+    }
+
+    /// Cheats land at the vertical blank, through both CPUs' RAM, and a
+    /// one-shot entry fires on the first frame only.
+    #[test]
+    fn cheats_are_applied_at_vblank() {
+        use cheats::{Cheat, Target};
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        sys.set_cheats(vec![
+            Cheat { target: Target::Ee, addr: 0x0010_0000, data: vec![0x34, 0x12], once: false },
+            Cheat { target: Target::Iop, addr: 0x0000_2000, data: vec![0x5A], once: false },
+            Cheat { target: Target::Ee, addr: 0x0010_0010, data: vec![0x77], once: true },
+        ]);
+        let frame = sys.frame_cycles();
+        // Disabled: a whole frame passes and nothing is written.
+        sys.run(frame);
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0));
+        sys.set_cheats_enabled(true);
+        sys.run(frame);
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
+        assert_eq!(sys.bus.peek8(0x0010_0001), Some(0x12));
+        assert_eq!(sys.bus.iop_peek8(0x2000), Some(0x5A));
+        assert_eq!(sys.bus.peek8(0x0010_0010), Some(0x77));
+        // Undo both; only the per-frame one comes back.
+        sys.bus.poke8(0x0010_0000, 0);
+        sys.bus.poke8(0x0010_0010, 0);
+        sys.run(frame);
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
+        assert_eq!(sys.bus.peek8(0x0010_0010), Some(0));
     }
 
     #[test]

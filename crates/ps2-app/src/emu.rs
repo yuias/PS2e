@@ -8,6 +8,7 @@
 //! a wasm build driving the same snapshots single-threaded).
 
 use crate::audio::Audio;
+use ps2_core::cheats::Cheat;
 use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -34,16 +35,41 @@ const TTY_CAP: usize = 64 * 1024;
 pub struct Disc {
     pub file: std::fs::File,
     pub name: String,
+    /// Cheats from the pnach file next to the image, if there is one.
+    pub cheats: Vec<Cheat>,
 }
 
 impl Disc {
-    /// Open an image, labelling it with its file name.
+    /// Open an image, labelling it with its file name and picking up
+    /// `<image>.pnach` beside it.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
         Ok(Self {
             file: std::fs::File::open(path)?,
             name: disc_name(path),
+            cheats: load_cheats(path),
         })
     }
+}
+
+/// Read and parse the pnach file that goes with a disc image: the image's
+/// path with its extension replaced by `pnach`. Absent is normal and
+/// silent; unreadable or partly invalid is logged.
+pub fn load_cheats(disc: &std::path::Path) -> Vec<Cheat> {
+    let path = disc.with_extension("pnach");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "cannot read the cheat file: {e}");
+            return Vec::new();
+        }
+    };
+    let (cheats, warnings) = ps2_core::cheats::parse(&text);
+    for w in &warnings {
+        tracing::warn!(path = %path.display(), "cheat file: {w}");
+    }
+    tracing::info!(path = %path.display(), count = cheats.len(), skipped = warnings.len(), "cheat file loaded");
+    cheats
 }
 
 /// The label shown for an image: its file name, falling back to the whole
@@ -59,6 +85,8 @@ pub struct DiscInfo {
     pub name: String,
     /// Boot serial read off the disc, e.g. `SLPS-25418`.
     pub serial: Option<String>,
+    /// Cheats loaded for it; the UI's checkbox is greyed out at zero.
+    pub cheats: usize,
 }
 
 pub enum Command {
@@ -147,6 +175,8 @@ pub struct Shared {
     pub deinterlace: std::sync::atomic::AtomicU8,
     /// Flip which rows each field lands on (UI -> worker).
     pub swap_fields: AtomicBool,
+    /// Whether the disc's cheats are applied (UI -> worker).
+    pub cheats: AtomicBool,
     /// Render internally at 2x (UI -> worker).
     pub internal_2x: AtomicBool,
     /// Debugger attached/halted (set by the worker) drives UI enablement.
@@ -195,8 +225,10 @@ pub struct WorkerConfig {
     pub memcard_path: Option<PathBuf>,
     /// Where the window's save state lives.
     pub state_path: PathBuf,
-    /// Name of the image already in `sys`'s drive (from `--disc`), if any.
+    /// Name of the image already in `sys`'s drive (from `--disc`), if any,
+    /// and the cheats that came with it.
     pub disc_name: Option<String>,
+    pub cheats: Vec<Cheat>,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
     /// Video timing region the machine starts in; re-applied on reset.
@@ -258,6 +290,8 @@ struct Worker {
     /// Disc taken out while the drive is open, put back if the pick that
     /// opened it is cancelled.
     removed: Option<Disc>,
+    /// The cheat table of the disc in the drive, kept across power cycles.
+    cheats: Vec<Cheat>,
     /// File name of the disc in the drive; mirrors `Shared::disc` so the
     /// worker can restore it across a power cycle without reading it back.
     disc_name: Option<String>,
@@ -290,6 +324,7 @@ impl Worker {
             running: true,
             debugger_seen: false,
             removed: None,
+            cheats: Vec::new(),
             disc_name: None,
             clock: now,
             deficit: 0.0,
@@ -297,8 +332,17 @@ impl Worker {
             speed_window_start: now,
             speed_window_cycles: 0,
         };
+        let cheats = std::mem::take(&mut worker.cfg.cheats);
+        worker.install_cheats(cheats);
         worker.publish_disc(worker.cfg.disc_name.clone());
         worker
+    }
+
+    /// Adopt a disc's cheat table. The table outlives the machine: a
+    /// power cycle rebuilds `sys`, so it is pushed in again there.
+    fn install_cheats(&mut self, cheats: Vec<Cheat>) {
+        self.cheats = cheats;
+        self.sys.set_cheats(self.cheats.clone());
     }
 
     /// Refresh the disc shown by the UI. `name` is the image's file name,
@@ -308,6 +352,7 @@ impl Worker {
         let info = name.map(|name| DiscInfo {
             name,
             serial: self.sys.bus.cdvd.boot_serial(),
+            cheats: self.cheats.len(),
         });
         *self.shared.disc.lock().unwrap() = info;
     }
@@ -331,6 +376,7 @@ impl Worker {
             self.sys.bus.sio2.sticks = sticks;
             self.sys.bus.gs.deinterlace = deinterlace_mode(self.shared.deinterlace.load(Ordering::Relaxed));
             self.sys.bus.gs.swap_fields = self.shared.swap_fields.load(Ordering::Relaxed);
+            self.sys.set_cheats_enabled(self.shared.cheats.load(Ordering::Relaxed));
             self.sys.bus.gs.set_internal_2x(self.shared.internal_2x.load(Ordering::Relaxed));
 
             // While a debugger is attached (or awaited) it owns execution.
@@ -379,10 +425,15 @@ impl Worker {
                 Command::OpenTray if !debugger_active => {
                     let name = self.disc_name.clone().unwrap_or_default();
                     self.removed =
-                        self.sys.bus.cdvd.open_tray().map(|file| Disc { file, name });
+                        self.sys.bus.cdvd.open_tray().map(|file| Disc { file, name, cheats: self.cheats.clone() });
                     self.publish_disc(None);
                 }
                 Command::CloseTray(disc) if !debugger_active => {
+                    // A new image brings its own cheats; the one that came
+                    // out and went back in keeps the table it had.
+                    if let Some(d) = &disc {
+                        self.install_cheats(d.cheats.clone());
+                    }
                     let disc = disc.or_else(|| self.removed.take());
                     let name = disc.as_ref().map(|d| d.name.clone());
                     self.sys.bus.cdvd.close_tray(disc.map(|d| d.file), self.sys.cycles);
@@ -391,7 +442,9 @@ impl Worker {
                 }
                 Command::BootDisc(disc) if !debugger_active => {
                     let name = disc.as_ref().map(|d| d.name.clone());
+                    let cheats = disc.as_ref().map(|d| d.cheats.clone()).unwrap_or_default();
                     self.power_cycle(disc.map(|d| d.file));
+                    self.install_cheats(cheats);
                     self.publish_disc(name);
                     self.running = true;
                 }
@@ -459,6 +512,7 @@ impl Worker {
         }
         self.sys.bus.cdvd.disc = disc;
         self.sys.bus.sio2.memcard = memcard;
+        self.sys.set_cheats(self.cheats.clone());
     }
 
     /// Run one slice if the pacer allows it. With an audio device the SPU2's

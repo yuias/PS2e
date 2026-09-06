@@ -58,6 +58,7 @@ pub struct App {
     scale_mode: crate::display::ScaleMode,
     deinterlace: crate::config::DeinterlaceSetting,
     swap_fields: bool,
+    cheats: bool,
     internal_2x: bool,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
@@ -92,6 +93,7 @@ impl App {
             scale_mode: config.scaler,
             deinterlace: config.deinterlace,
             swap_fields: config.swap_fields,
+            cheats: config.cheats,
             internal_2x: config.internal_2x,
             volume,
             config,
@@ -179,12 +181,14 @@ impl Drop for App {
                 || self.config.scaler != self.scale_mode
                 || self.config.deinterlace != self.deinterlace
                 || self.config.swap_fields != self.swap_fields
+                || self.config.cheats != self.cheats
                 || self.config.internal_2x != self.internal_2x)
         {
             self.config.volume = self.volume;
             self.config.scaler = self.scale_mode;
             self.config.deinterlace = self.deinterlace;
             self.config.swap_fields = self.swap_fields;
+            self.config.cheats = self.cheats;
             self.config.internal_2x = self.internal_2x;
             self.config.save(path);
         }
@@ -213,6 +217,7 @@ impl eframe::App for App {
             .store(self.volume.to_bits(), Ordering::Relaxed);
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
         self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
+        self.emu.shared.cheats.store(self.cheats, Ordering::Relaxed);
         self.emu.shared.internal_2x.store(self.internal_2x, Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
@@ -292,6 +297,9 @@ impl eframe::App for App {
                                 self.insert_disc();
                                 ui.close();
                             }
+                            let count = disc.as_ref().map_or(0, |d| d.cheats);
+                            ui.add_enabled(count > 0, egui::Checkbox::new(&mut self.cheats, format!("Cheats ({count})")))
+                                .on_hover_text("apply the patches in <image>.pnach next to the disc image");
                             ui.separator();
                             let save = &self.config.hotkeys.save_state;
                             if ui.button(format!("Save state	{save}")).clicked() {
