@@ -514,7 +514,8 @@ impl Gs {
         let v1 = self.vq[1];
         let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
         let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
-        // Pixel centers in 12.4: draw [x0, x1) rounding up from the left.
+        // 12.4 in, pixels out: draw [x0, x1) rounding up from the left, so
+        // a pixel is covered when its own coordinate is inside the sprite.
         let px0 = (x0 + 15) >> 4;
         let px1 = (x1 + 15) >> 4;
         let py0 = (y0 + 15) >> 4;
@@ -547,7 +548,8 @@ impl Gs {
     fn sprite_prim(pipe: &PixelPipe, v0: Vertex, v1: Vertex) -> (SpriteGeom, i32, i32, i64, (f32, f32)) {
         let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
         let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
-        // Pixel centers in 12.4: draw [x0, x1) rounding up from the left.
+        // 12.4 in, pixels out: draw [x0, x1) rounding up from the left, so
+        // a pixel is covered when its own coordinate is inside the sprite.
         let px0 = (x0 + 15) >> 4;
         let px1 = (x1 + 15) >> 4;
         let py0 = (y0 + 15) >> 4;
@@ -1135,9 +1137,13 @@ impl Painter<'_> {
         let tw = pipe.tex.tw as f32;
         let th = pipe.tex.th as f32;
         // Texel-space u for a pixel column, exactly as `sample` derives it
-        // from the fragment (same operations, same rounding).
+        // from the fragment (same operations, same rounding). A pixel is
+        // sampled at its own coordinate, not half a pixel into it: that is
+        // the point the coverage rule above rounds up to, and interpolating
+        // anywhere else drifts the texture off a sprite whose edge does not
+        // sit on a pixel boundary.
         let fu_at = |px: i32| -> f32 {
-            let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * g.inv_wid;
+            let fx = ((px << 4) - x0) as f32 * g.inv_wid;
             if pipe.fst {
                 (g.u0 as f32 + (g.u1 - g.u0) as f32 * fx) / 16.0
             } else {
@@ -1145,7 +1151,7 @@ impl Painter<'_> {
             }
         };
         for py in rows.iter() {
-            let fy = ((py << 4) as f32 + 8.0 - y0 as f32) * g.inv_hei;
+            let fy = ((py << 4) - y0) as f32 * g.inv_hei;
             let frag = Frag {
                 r: v1.r as f32,
                 g: v1.g as f32,
@@ -1237,7 +1243,7 @@ impl Painter<'_> {
             }
             let _p = crate::prof::scope(crate::prof::Slot::GsGeneric);
             for px in pxa..pxb {
-                let fx = ((px << 4) as f32 + 8.0 - x0 as f32) * g.inv_wid;
+                let fx = ((px << 4) - x0) as f32 * g.inv_wid;
                 let frag = Frag {
                     s: g.s0 + (g.s1 - g.s0) * fx,
                     u: (g.u0 as f32 + (g.u1 - g.u0) as f32 * fx) / 16.0,

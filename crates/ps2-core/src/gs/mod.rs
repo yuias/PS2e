@@ -1880,6 +1880,38 @@ mod tests {
         assert_eq!(gs.read_psmct32(8960, 10, 320, 100) & 0xFF_FFFF, 0x60_7080);
     }
 
+    /// A 1:1 textured sprite whose left edge sits one sixteenth of a pixel
+    /// inside the pixel grid still maps texel n to pixel n. Sampling half a
+    /// pixel in instead cost the sprite its first texel column and pulled in
+    /// the one past its last, which is what turned AC5's target labels into
+    /// overlapping glyphs -- their quads are offset by exactly 1/16.
+    #[test]
+    fn a_sprite_off_the_pixel_grid_still_maps_one_texel_to_one_pixel() {
+        let mut gs = Gs::new();
+        for y in 0..8 {
+            for x in 0..40 {
+                gs.write_psmct32(2240, 10, x, y, 0x8000_0000 | x);
+            }
+        }
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 210 | (10 << 16)); // FRAME_1: 6720, fbw 10, PSMCT32
+        gs.write_reg(0x47, 0x30000); // TEST_1: ZTE, ALWAYS
+        gs.write_reg(0x40, 639 << 16 | 223 << 48); // SCISSOR_1
+        gs.write_reg(0x18, 0); // XYOFFSET_1
+        gs.write_reg(0x06, 0x6_2802_88c0); // TEX0_1: 2240, tbw 10, PSMCT32, 1024x256
+        gs.write_reg(0x00, 0x116); // sprite, TME, FST
+        gs.write_reg(0x01, 0x8080_8080); // RGBAQ: unity modulate
+        // Texels 16..23 across pixels 101..108, the quad starting at 100+1/16.
+        gs.write_reg(0x03, 256);
+        gs.write_reg(0x05, (100 * 16 + 1) | (0 << 16));
+        gs.write_reg(0x03, 384 | (64 << 16));
+        gs.write_reg(0x05, (108 * 16 + 1) | ((4 * 16) << 16));
+        gs.flush_pending();
+        assert_eq!(gs.prims_drawn, 1);
+        let row: Vec<u32> = (101..109).map(|x| gs.read_psmct32(6720, 10, x, 0) & 0xFF).collect();
+        assert_eq!(row, (16..24).collect::<Vec<u32>>());
+    }
+
     /// An S so large that S/Q * TW overflows f32 saturates the texel
     /// coordinate to i32's end. The row cache must still be able to hold
     /// that texel rather than decoding an empty row.
