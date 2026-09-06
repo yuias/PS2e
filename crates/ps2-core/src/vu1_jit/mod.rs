@@ -218,17 +218,33 @@ fn compile(jit: &mut Vu1Jit, vu: &Vu1, pc: u16) -> Entry {
     let mask = vu.pc_mask;
     let mut cur = pc;
     let mut n = 0u32;
+    // What the previously emitted pair's lower wrote, for the branch
+    // hazard; `None` at the block's first pair, which checks at run time.
+    let mut prev_dest: Option<u32> = None;
+    let dest_of = |lower: u32, upper: u32| {
+        if upper & (1 << 31) != 0 { None } else { emit::lower_vi_dest(lower) }
+    };
     loop {
         let (lower, upper) = fetch(vu, cur);
         let ibit = upper & (1 << 31) != 0;
         let ebit = upper & (1 << 30) != 0;
         let branchy = !ibit && emit::is_branch(lower);
+        let first = n == 0;
 
         if !ebit && !branchy {
-            emit::pair(&mut ops, cur, upper, lower);
+            // Copy the old value aside when the pair after this one
+            // branches on what this one writes.
+            let dest = dest_of(lower, upper);
+            let (nl, nu) = fetch(vu, (cur + 1) & mask);
+            let next_reads = if nu & (1 << 31) != 0 { [None, None] } else { emit::branch_vi_reads(nl) };
+            let set = dest.filter(|d| next_reads.contains(&Some(*d)));
+            let hz = emit::Hazard { set, clear_before: first, ..Default::default() };
+            emit::pair(&mut ops, cur, upper, lower, hz);
+            prev_dest = dest;
             n += 1;
             cur = (cur + 1) & mask;
             if n >= MAX_PAIRS {
+                exit_hazard(&mut ops, set.is_some());
                 exit(&mut ops, mask, cur, false, 0);
                 break;
             }
@@ -245,12 +261,29 @@ fn compile(jit: &mut Vu1Jit, vu: &Vu1, pc: u16) -> Entry {
         let (dl, du) = fetch(vu, d);
         let d_ibit = du & (1 << 31) != 0;
         if !ebit && (du & (1 << 30) != 0 || (!d_ibit && emit::is_branch(dl))) {
+            // The interpreter takes over from `cur`. Its end-of-pair shift
+            // would promote whatever an earlier fallback recorded, so
+            // clear that; the hazard record itself may be this pair's.
+            emit::clear_written(&mut ops);
             exit(&mut ops, mask, cur, false, ST_BAIL);
             break;
         }
 
-        emit::pair(&mut ops, cur, upper, lower);
-        emit::pair(&mut ops, d, du, dl);
+        let reads = if branchy { emit::branch_vi_reads(lower) } else { [None, None] };
+        let reading = reads.iter().any(Option::is_some);
+        let hz = emit::Hazard {
+            set: None,
+            read: prev_dest.filter(|d| reads.contains(&Some(*d))),
+            dynamic: first && reading,
+            clear_before: first && !reading,
+        };
+        emit::pair(&mut ops, cur, upper, lower, hz);
+        // The delay pair's write is what the next block's first pair may
+        // branch on, and that pair checks at run time, so record it
+        // whether or not anything reads it.
+        let delay_set = dest_of(dl, du);
+        emit::pair(&mut ops, d, du, dl, emit::Hazard { set: delay_set, ..Default::default() });
+        exit_hazard(&mut ops, delay_set.is_some());
         exit(&mut ops, mask, (d + 1) & mask, branchy, if ebit { ST_END } else { 0 });
         break;
     }
@@ -264,6 +297,10 @@ fn compile(jit: &mut Vu1Jit, vu: &Vu1, pc: u16) -> Entry {
     jit.images[jit.cur].lookup[pc as usize] = Some(entry);
     jit.blocks_compiled += 1;
     entry
+}
+
+fn exit_hazard(ops: &mut Ops, delay_set: bool) {
+    emit::exit_hazard(ops, delay_set);
 }
 
 fn fetch(vu: &Vu1, pc: u16) -> (u32, u32) {

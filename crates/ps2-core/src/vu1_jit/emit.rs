@@ -47,6 +47,18 @@ fn vi_off(r: u32) -> i32 {
     (offset_of!(Vu1, vi) + (r as usize & 0xF) * 2) as i32
 }
 
+fn vi_written_reg_off() -> i32 {
+    offset_of!(Vu1, vi_written_reg) as i32
+}
+
+fn vi_hazard_reg_off() -> i32 {
+    offset_of!(Vu1, vi_hazard_reg) as i32
+}
+
+fn vi_hazard_val_off() -> i32 {
+    offset_of!(Vu1, vi_hazard_val) as i32
+}
+
 /// Bring-up bisection knob, the EE recompiler's `PS2E_JIT_NATIVE` for VU1.
 /// Unset translates everything it can; otherwise only the named groups are
 /// emitted natively and the rest fall back to the interpreter, which is how
@@ -103,12 +115,113 @@ fn lower_reads_flags(instr: u32) -> bool {
     (0x10..=0x1F).contains(&(instr >> 25))
 }
 
+/// The VI register a lower instruction writes with ALU timing, if any:
+/// the write a branch straight after it does not yet see. vi00 and a
+/// field of 16, which the register file discards, count as none, and so
+/// do the loads (ILW, ILWR, which the branch waits for) and the flag
+/// readers (FSAND, FMAND, FCAND ..., whose result the branch does see, as
+/// the BIOS's own microcode relies on).
+pub fn lower_vi_dest(lower: u32) -> Option<u32> {
+    let it = (lower >> 16) & 0xF;
+    let is = (lower >> 11) & 0xF;
+    let id = (lower >> 6) & 0xF;
+    let r = match lower >> 25 {
+        0x08 | 0x09 => it, // IADDIU, ISUBIU
+        0x21 | 0x25 => it, // BAL, JALR
+        0x40 => match lower & 0x3F {
+            0x30 | 0x31 | 0x34 | 0x35 => id, // IADD, ISUB, IAND, IOR
+            0x32 => it,                      // IADDI
+            0x3C..=0x3F => match op2(lower) {
+                0x34 | 0x36 => is,               // LQI, LQD
+                0x35 | 0x37 => it,               // SQI, SQD
+                0x3C | 0x68 | 0x69 => it,        // MTIR, XTOP, XITOP
+                _ => 0,
+            },
+            _ => 0,
+        },
+        _ => 0,
+    };
+    (r != 0).then_some(r)
+}
+
+/// The VI registers a branch reads, masked to the file: `is` for the
+/// jumps and the compares against zero, `it` too for IBEQ/IBNE.
+pub fn branch_vi_reads(lower: u32) -> [Option<u32>; 2] {
+    let it = (lower >> 16) & 0xF;
+    let is = (lower >> 11) & 0xF;
+    let some = |r: u32| (r != 0).then_some(r);
+    match lower >> 25 {
+        0x24 | 0x25 | 0x2C..=0x2F => [some(is), None],
+        0x28 | 0x29 => [some(it), some(is)],
+        _ => [None, None],
+    }
+}
+
+/// How a pair takes part in the integer branch hazard (see the fields on
+/// [`Vu1`]). The translator decides statically: a pair whose lower writes
+/// the register the next lower branches on copies the old value aside
+/// (`set`); the branch then reads that copy (`read`). A block's first pair
+/// cannot know what ran before it, so its branch checks at run time
+/// (`dynamic`) against what the previous block's exit left; a first pair
+/// that is not a branch clears that instead (`clear_before`).
+#[derive(Clone, Copy, Default)]
+pub struct Hazard {
+    pub set: Option<u32>,
+    pub read: Option<u32>,
+    pub dynamic: bool,
+    pub clear_before: bool,
+}
+
+/// Leave the hazard record clean at a block's exit: the delay pair's
+/// `set` has already spoken for the next block's first pair, or there was
+/// nothing to say.
+pub fn exit_hazard(ops: &mut Ops, delay_set: bool) {
+    if !delay_set {
+        dynasm!(ops ; .arch x64 ; mov BYTE [rbx + vi_hazard_reg_off()], 0);
+    }
+    clear_written(ops);
+}
+
+/// Interpreter fallbacks record their writes in `vi_written_*`; nothing
+/// native shifts the record, so it must not outlive the block.
+pub fn clear_written(ops: &mut Ops) {
+    dynasm!(ops ; .arch x64 ; mov BYTE [rbx + vi_written_reg_off()], 0);
+}
+
+/// Load VI register `r` into eax as a branch sees it.
+fn load_vi_for_branch(ops: &mut Ops, r: u32, hz: Hazard) {
+    let r = r & 0xF;
+    if hz.read == Some(r) {
+        dynasm!(ops ; .arch x64 ; movzx eax, WORD [rbx + vi_hazard_val_off()]);
+    } else if hz.dynamic && r != 0 {
+        dynasm!(ops ; .arch x64
+            ; movzx eax, WORD [rbx + vi_off(r)]
+            ; cmp BYTE [rbx + vi_hazard_reg_off()], r as i8
+            ; jne >current
+            ; movzx eax, WORD [rbx + vi_hazard_val_off()]
+            ; current:
+        );
+    } else {
+        dynasm!(ops ; .arch x64 ; movzx eax, WORD [rbx + vi_off(r)]);
+    }
+}
+
 // --- per-pair emission ---------------------------------------------------
 
 /// One instruction pair, in the order the interpreter runs it: age the flag
 /// pipeline, take the I bit's constant, upper, then lower.
-pub fn pair(ops: &mut Ops, pc: u16, upper: u32, lower: u32) {
+pub fn pair(ops: &mut Ops, pc: u16, upper: u32, lower: u32, hz: Hazard) {
     let ibit = upper & (1 << 31) != 0;
+    if hz.clear_before {
+        dynasm!(ops ; .arch x64 ; mov BYTE [rbx + vi_hazard_reg_off()], 0);
+    }
+    if let Some(r) = hz.set {
+        dynasm!(ops ; .arch x64
+            ; movzx eax, WORD [rbx + vi_off(r)]
+            ; mov WORD [rbx + vi_hazard_val_off()], ax
+            ; mov BYTE [rbx + vi_hazard_reg_off()], r as i8
+        );
+    }
     if !ibit && lower_reads_flags(lower) {
         flag_load(ops);
     }
@@ -119,7 +232,7 @@ pub fn pair(ops: &mut Ops, pc: u16, upper: u32, lower: u32) {
     if !upper_is_nop(upper) && !upper_native(ops, upper) {
         call_upper(ops, pc, upper);
     }
-    if !ibit && !lower_is_nop(lower) && !lower_native(ops, pc, lower) {
+    if !ibit && !lower_is_nop(lower) && !lower_native(ops, pc, lower, hz) {
         call_lower(ops, pc, lower);
         if is_branch(lower) {
             // Latch the target before the delay pair can overwrite it: an
@@ -127,6 +240,9 @@ pub fn pair(ops: &mut Ops, pc: u16, upper: u32, lower: u32) {
             // the interpreter discards.
             dynasm!(ops ; .arch x64 ; mov r14d, DWORD [rbx + jit_target_off()]);
         }
+    }
+    if hz.read.is_some() || hz.dynamic {
+        dynasm!(ops ; .arch x64 ; mov BYTE [rbx + vi_hazard_reg_off()], 0);
     }
     flag_store(ops);
     dynasm!(ops ; .arch x64 ; add r15d, 1);
@@ -202,7 +318,7 @@ fn call_lower(ops: &mut Ops, pc: u16, instr: u32) {
 ///
 /// A branch leaves its target in r14d (or leaves the prologue's `NO_BRANCH`
 /// alone when it is not taken), which is where the block's exit reads it.
-fn lower_native(ops: &mut Ops, pc: u16, instr: u32) -> bool {
+fn lower_native(ops: &mut Ops, pc: u16, instr: u32, hz: Hazard) -> bool {
     let opcode = instr >> 25;
     let it = (instr >> 16) & 0x1F;
     let is = (instr >> 11) & 0x1F;
@@ -214,7 +330,7 @@ fn lower_native(ops: &mut Ops, pc: u16, instr: u32) -> bool {
     match opcode {
         // IADDIU / ISUBIU
         0x08 | 0x09 if native("int") => {
-            if it == 0 {
+            if it & 0xF == 0 {
                 return true; // the write goes to vi00 and is discarded
             }
             let imm15 = ((instr & 0x7FF) | ((instr >> 10) & 0x7800)) as i32;
@@ -233,25 +349,27 @@ fn lower_native(ops: &mut Ops, pc: u16, instr: u32) -> bool {
         }
         0x21 if native("branch") => {
             // BAL: the link points past the delay pair.
-            if it != 0 {
+            if it & 0xF != 0 {
                 dynasm!(ops ; .arch x64 ; mov WORD [rbx + vi_off(it)], link as i16);
             }
             dynasm!(ops ; .arch x64 ; mov r14d, target);
             true
         }
         0x24 | 0x25 if native("branch") => {
-            if opcode == 0x25 && it != 0 {
+            // JR / JALR: the target is read before the link is written.
+            load_vi_for_branch(ops, is, hz);
+            dynasm!(ops ; .arch x64 ; mov r14d, eax);
+            if opcode == 0x25 && it & 0xF != 0 {
                 dynasm!(ops ; .arch x64 ; mov WORD [rbx + vi_off(it)], link as i16);
             }
-            dynasm!(ops ; .arch x64 ; movzx r14d, WORD [rbx + vi_off(is)]); // JR / JALR
             true
         }
         // IBEQ / IBNE
         0x28 | 0x29 if native("branch") => {
-            dynasm!(ops ; .arch x64
-                ; movzx eax, WORD [rbx + vi_off(it)]
-                ; cmp ax, WORD [rbx + vi_off(is)]
-            );
+            load_vi_for_branch(ops, is, hz);
+            dynasm!(ops ; .arch x64 ; mov ecx, eax);
+            load_vi_for_branch(ops, it, hz);
+            dynasm!(ops ; .arch x64 ; cmp ax, cx);
             if opcode == 0x28 {
                 dynasm!(ops ; .arch x64 ; jne >skip);
             } else {
@@ -262,8 +380,9 @@ fn lower_native(ops: &mut Ops, pc: u16, instr: u32) -> bool {
         }
         // IBLTZ / IBGTZ / IBLEZ / IBGEZ, all against zero and all signed.
         0x2C..=0x2F if native("branch") => {
+            load_vi_for_branch(ops, is, hz);
             dynasm!(ops ; .arch x64
-                ; movsx eax, WORD [rbx + vi_off(is)]
+                ; movsx eax, ax
                 ; test eax, eax
             );
             match opcode {
@@ -289,7 +408,7 @@ fn lower_special_native(ops: &mut Ops, instr: u32) -> bool {
     match instr & 0x3F {
         // IADD / ISUB / IAND / IOR, all writing the `id` register.
         funct @ (0x30 | 0x31 | 0x34 | 0x35) => {
-            if id == 0 {
+            if id & 0xF == 0 {
                 return true;
             }
             dynasm!(ops ; .arch x64
@@ -307,7 +426,7 @@ fn lower_special_native(ops: &mut Ops, instr: u32) -> bool {
         }
         // IADDI: a 5-bit signed immediate sits in the `id` slot.
         0x32 => {
-            if it == 0 {
+            if it & 0xF == 0 {
                 return true;
             }
             let imm5 = ((id as i32) << 27) >> 27;
@@ -651,7 +770,7 @@ fn data_addr_pre_dec(ops: &mut Ops, r: u32) {
         ; movzx eax, WORD [rbx + vi_off(r)]
         ; sub eax, 1
     );
-    if r != 0 {
+    if r & 0xF != 0 {
         dynasm!(ops ; .arch x64 ; mov WORD [rbx + vi_off(r)], ax);
     }
     dynasm!(ops ; .arch x64
@@ -663,7 +782,7 @@ fn data_addr_pre_dec(ops: &mut Ops, r: u32) {
 
 /// Add `delta` to an integer register, discarding a write to vi00.
 fn vi_bump(ops: &mut Ops, r: u32, delta: i32) {
-    if r == 0 {
+    if r & 0xF == 0 {
         return;
     }
     dynasm!(ops ; .arch x64 ; add WORD [rbx + vi_off(r)], delta as i16);
@@ -701,7 +820,7 @@ fn lower_mem_native(ops: &mut Ops, instr: u32) -> bool {
         }
         0x04 => {
             // ILW: the low half of the named field.
-            if it == 0 {
+            if it & 0xF == 0 {
                 return true;
             }
             data_addr(ops, is, imm11);
@@ -780,7 +899,7 @@ fn lower_mem_special(ops: &mut Ops, instr: u32, dest: u32, it: u32, is: u32) -> 
         }
         0x3E => {
             // ILWR
-            if it == 0 {
+            if it & 0xF == 0 {
                 return true;
             }
             data_addr(ops, is, 0);
@@ -801,7 +920,7 @@ fn lower_mem_special(ops: &mut Ops, instr: u32, dest: u32, it: u32, is: u32) -> 
         }
         // XTOP / XITOP
         id2 @ (0x68 | 0x69) => {
-            if it == 0 {
+            if it & 0xF == 0 {
                 return true;
             }
             let src = if id2 == 0x68 {

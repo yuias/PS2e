@@ -197,10 +197,13 @@ fn a_counted_loop_agrees() {
     let iaddiu = (0x08 << 25) | (5 << 16) | (0 << 11) | 4;
     let iaddi = 0x8000_0000 | ((-1i32 as u32 & 0x1F) << 6) | (5 << 16) | (5 << 11) | 0x32;
     let ibne = (0x29 << 25) | (0 << 16) | (5 << 11) | ((-2i32 as u32) & 0x7FF);
+    // A pair sits between the decrement and the branch that reads it,
+    // as real loops do: the branch would otherwise see the old count.
     agree(&[
         (NOP_UPPER, iaddiu),
         (upper(0x28, 0xF, 2, 3, 4), iaddi),
-        (upper(0x2A, 0xF, 4, 4, 4), ibne),
+        (upper(0x2A, 0xF, 4, 4, 4), NOP_LOWER),
+        (upper(0x2A, 0xF, 4, 4, 5), ibne),
         (upper(0x28, 0xF, 2, 3, 7), NOP_LOWER), // delay pair
         END,
     ]);
@@ -209,14 +212,15 @@ fn a_counted_loop_agrees() {
 #[test]
 fn jr_takes_its_target_from_an_integer_register() {
     // vi06 = 4; JR vi06.
-    let iaddiu = (0x08 << 25) | (6 << 16) | (0 << 11) | 4;
+    let iaddiu = (0x08 << 25) | (6 << 16) | (0 << 11) | 5;
     let jr = (0x24 << 25) | (6 << 11);
     agree(&[
         (NOP_UPPER, iaddiu),
-        (upper(0x28, 0xF, 2, 3, 4), jr),
-        (upper(0x28, 0xF, 2, 3, 5), NOP_LOWER), // delay pair
-        (upper(0x28, 0xF, 2, 3, 6), NOP_LOWER), // skipped
-        (upper(0x28, 0xF, 2, 3, 7), NOP_LOWER), // target
+        (upper(0x28, 0xF, 2, 3, 4), NOP_LOWER), // lets the write land
+        (upper(0x28, 0xF, 2, 3, 5), jr),
+        (upper(0x28, 0xF, 2, 3, 6), NOP_LOWER), // delay pair
+        (upper(0x28, 0xF, 2, 3, 7), NOP_LOWER), // skipped
+        (upper(0x28, 0xF, 2, 3, 8), NOP_LOWER), // target
         END,
     ]);
 }
@@ -439,4 +443,172 @@ fn the_walking_loads_and_stores_agree() {
         (NOP_UPPER, lq(0x3F, 0x2, 10, 3)), // ISWR vi10, (vi03)
         END,
     ]);
+}
+
+// --- the integer branch hazard ------------------------------------------
+
+/// The register the seeding gives vi[r].
+fn seeded(r: u16) -> u16 {
+    r * 7
+}
+
+/// Whether a run's vf10 differs from the seeding, i.e. the `mark` pair
+/// (vf10 = vf2 + vf3) was executed.
+fn marked(s: &Snapshot) -> bool {
+    s.vf[10] != run(&[END, END], false).vf[10]
+}
+
+fn mark() -> u32 {
+    upper(0x28, 0xF, 2, 3, 10)
+}
+
+/// A program that writes vi01 with `writer`, branches on it in the very
+/// next pair, and marks only on the fall-through path. Both cores must
+/// agree; returns whether they fell through.
+fn hazard_program(writer: u32, branch: u32) -> bool {
+    let pairs = [
+        (NOP_UPPER, writer),
+        (NOP_UPPER, branch),
+        (NOP_UPPER, NOP_LOWER), // delay pair
+        (mark(), NOP_LOWER),    // fall-through only
+        END,                    // branch target
+        END,
+    ];
+    let a = run(&pairs, false);
+    assert_eq!(a, run(&pairs, true));
+    marked(&a)
+}
+
+#[test]
+fn a_branch_reads_the_register_as_it_was_before_the_previous_pair_wrote_it() {
+    // vi01 = vi02 (14), then IBEQ vi01, vi02: with the new value it is
+    // taken; the hardware sees the old 7 and falls through.
+    let iaddiu = (0x08 << 25) | (1 << 16) | (2 << 11);
+    let ibeq = (0x28 << 25) | (1 << 16) | (2 << 11) | 2;
+    assert!(hazard_program(iaddiu, ibeq), "IBEQ saw the new value");
+    // The same with a writer the recompiler hands to the interpreter:
+    // MTIR vi01, vf02.x (1.0, whose low half is zero) then IBEQ vi01, vi00.
+    let mtir = 0x8000_0000 | (1 << 16) | (2 << 11) | (0xF << 6) | 0x3C;
+    let ibeq0 = (0x28 << 25) | (1 << 16) | 2;
+    assert!(hazard_program(mtir, ibeq0), "IBEQ after MTIR saw the new value");
+    // A compare against zero: ISUBIU vi01, vi00, 1 makes it -1, on which
+    // IBGEZ falls through; the old 7 takes the branch.
+    let isubiu = (0x09 << 25) | (1 << 16) | 1;
+    let ibgez = (0x2F << 25) | (1 << 11) | 2;
+    assert!(!hazard_program(isubiu, ibgez), "IBGEZ saw the new value");
+}
+
+#[test]
+fn the_hazard_crosses_a_block_boundary_through_the_delay_pair() {
+    // B over one pair; the delay pair writes vi03 = 0 (was 21); the target
+    // starts a new block with IBEQ vi03, vi00, which the hardware does not
+    // take because it still sees 21.
+    let b = (0x20 << 25) | 1;
+    let iaddiu = (0x08 << 25) | (3 << 16);
+    let ibeq = (0x28 << 25) | (3 << 16) | 2;
+    let pairs = [
+        (NOP_UPPER, b),
+        (NOP_UPPER, iaddiu),    // delay pair
+        (NOP_UPPER, ibeq),      // branch target: a new block
+        (NOP_UPPER, NOP_LOWER), // delay pair
+        (mark(), NOP_LOWER),    // fall-through only
+        END,                    // IBEQ target
+        END,
+    ];
+    let a = run(&pairs, false);
+    assert!(marked(&a));
+    assert_eq!(a, run(&pairs, true));
+}
+
+#[test]
+fn a_jump_reads_its_target_register_before_the_previous_write() {
+    // vi06 = 3, then JR vi06: the jump goes to the old 42, where an END
+    // waits; 3 holds a mark that must not run.
+    let iaddiu = (0x08 << 25) | (6 << 16) | 3;
+    let jr = (0x24 << 25) | (6 << 11);
+    let mut pairs = vec![(NOP_UPPER, NOP_LOWER); 44];
+    pairs[0] = (NOP_UPPER, iaddiu);
+    pairs[1] = (NOP_UPPER, jr);
+    pairs[3] = (mark(), NOP_LOWER);
+    pairs[4] = END;
+    pairs[seeded(6) as usize] = END;
+    let a = run(&pairs, false);
+    assert!(!marked(&a));
+    assert_eq!(a.next_pc, seeded(6) + 2);
+    assert_eq!(a, run(&pairs, true));
+}
+
+#[test]
+fn a_register_field_of_sixteen_is_vi00_and_its_write_is_dropped() {
+    let iaddiu = (0x08 << 25) | (16 << 16) | 9;
+    let iadd = 0x8000_0000 | (16 << 6) | (1 << 16) | (2 << 11) | 0x30;
+    let pairs = [(NOP_UPPER, iaddiu), (NOP_UPPER, iadd), END, END];
+    for jit in [false, true] {
+        let s = run(&pairs, jit);
+        assert_eq!(s.vi[0], 0, "jit={jit}");
+    }
+}
+
+#[test]
+fn loads_and_flag_readers_are_seen_by_the_next_branch() {
+    // ILW vi01 <- data (nonzero at every address the seeding writes),
+    // then IBEQ vi01, vi00: the branch waits for the load, so it is not
+    // taken and the mark runs. With a hazard it would see the old 7 and
+    // ... also fall through, so compare against zero the other way:
+    // IBNE takes the branch on the loaded value and on 7 alike, so use
+    // a load of a known zero. Data quadword 0 field x is seeded 7; ISW
+    // first stores vi00 there.
+    let isw = (0x05 << 25) | (0x8 << 21); // ISW vi00.x, 0(vi00)
+    let ilw = (0x04 << 25) | (0x8 << 21) | (1 << 16); // ILW vi01.x, 0(vi00)
+    let ibeq = (0x28 << 25) | (1 << 16) | 2; // IBEQ vi01, vi00
+    let pairs = [
+        (NOP_UPPER, isw),
+        (NOP_UPPER, ilw),
+        (NOP_UPPER, ibeq),
+        (NOP_UPPER, NOP_LOWER),
+        (mark(), NOP_LOWER), // fall-through only
+        END,
+        END,
+    ];
+    let a = run(&pairs, false);
+    assert!(!marked(&a), "IBEQ saw the value from before the load");
+    assert_eq!(a, run(&pairs, true));
+    // FMAND vi01, vi01 with no MAC flags set gives 0; IBEQ vi01, vi00
+    // straight after sees that 0 and is taken.
+    let fmand = (0x1A << 25) | (1 << 16) | (1 << 11);
+    let pairs = [
+        (NOP_UPPER, fmand),
+        (NOP_UPPER, ibeq),
+        (NOP_UPPER, NOP_LOWER),
+        (mark(), NOP_LOWER),
+        END,
+        END,
+    ];
+    let a = run(&pairs, false);
+    assert!(!marked(&a), "IBEQ saw the value from before FMAND");
+    assert_eq!(a, run(&pairs, true));
+}
+
+#[test]
+fn a_bail_to_the_interpreter_does_not_carry_a_stale_write_record() {
+    // MTIR vi05 (a fallback writer: 35 becomes 0) two pairs before a
+    // branch whose delay pair is itself a branch, so the block bails to
+    // the interpreter at the B. The IBEQ in the delay pair must see 0 and
+    // be taken; a stale record would show it the 35 from two pairs back.
+    let mtir = 0x8000_0000 | (5 << 16) | (2 << 11) | (0xF << 6) | 0x3C;
+    let b = (0x20 << 25) | 1; // B to the pair after the delay pair
+    let ibeq = (0x28 << 25) | (5 << 16) | 2;
+    let pairs = [
+        (NOP_UPPER, mtir),
+        (NOP_UPPER, NOP_LOWER),
+        (NOP_UPPER, b),
+        (NOP_UPPER, ibeq),      // delay pair, and a branch
+        (NOP_UPPER, NOP_LOWER), // its delay pair
+        (mark(), NOP_LOWER),    // fall-through only
+        END,                    // IBEQ target
+        END,
+    ];
+    let a = run(&pairs, false);
+    assert!(!marked(&a));
+    assert_eq!(a, run(&pairs, true));
 }

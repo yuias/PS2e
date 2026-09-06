@@ -78,6 +78,22 @@ pub struct Vu1 {
     /// Target a compiled JR/JALR left for the exit after its delay pair.
     #[serde(skip)]
     pub(crate) jit_target: u32,
+    /// The integer branch hazard: a branch reads a VI register the lower
+    /// instruction immediately before it wrote as it was *before* that
+    /// write. Loads (ILW, ILWR) and the flag readers are exempt: a branch
+    /// straight after those sees what they wrote. `vi_written_*` is what this pair's lower wrote (register and
+    /// the value it replaced, register 0 for none); at the end of the pair
+    /// it becomes `vi_hazard_*`, which the next pair's branch consults.
+    /// The recompiler keeps the same fields by hand, so its fallbacks and
+    /// the interpreter agree. In flight for one pair only, so not saved.
+    #[serde(skip)]
+    pub(crate) vi_written_reg: u8,
+    #[serde(skip)]
+    pub(crate) vi_written_val: u16,
+    #[serde(skip)]
+    pub(crate) vi_hazard_reg: u8,
+    #[serde(skip)]
+    pub(crate) vi_hazard_val: u16,
     /// Data memory's base address, so translated loads and stores reach it
     /// without unpacking a slice. Refreshed at every program entry, since
     /// deserializing moves the allocation.
@@ -126,6 +142,10 @@ impl Vu1 {
             next_pc: 0,
             micro_gen: 0,
             jit_target: 0,
+            vi_written_reg: 0,
+            vi_written_val: 0,
+            vi_hazard_reg: 0,
+            vi_hazard_val: 0,
             data_ptr: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: None,
@@ -316,9 +336,32 @@ impl Vu1 {
 
     #[inline]
     fn vi_write(&mut self, r: usize, v: u16) {
+        let r = r & 0xF;
         if r != 0 {
-            self.vi[r & 0xF] = v;
+            self.vi_written_reg = r as u8;
+            self.vi_written_val = self.vi[r];
+            self.vi[r] = v;
         }
+    }
+
+    /// A VI write a branch straight after it does see: the loads (ILW,
+    /// ILWR), which take long enough that the branch waits for the value,
+    /// and the flag readers (FSAND, FMAND, FCAND ...), for which the BIOS's
+    /// own `FMAND vi13 / IBNE vi13` shows the new value is what is read.
+    fn vi_write_seen(&mut self, r: usize, v: u16) {
+        let r = r & 0xF;
+        if r != 0 {
+            self.vi[r] = v;
+        }
+    }
+
+    /// A VI register as a branch sees it: the value from before the
+    /// previous lower instruction's write, if that is what it wrote.
+    fn vi_for_branch(&self, r: usize) -> u16 {
+        let r = r & 0xF;
+        // Register 0 in the record means "nothing in flight", so vi00
+        // itself must never match it.
+        if r != 0 && usize::from(self.vi_hazard_reg) == r { self.vi_hazard_val } else { self.vi[r] }
     }
 
     fn data_qword(&mut self, qw: u32) -> [u32; 4] {
@@ -383,6 +426,8 @@ impl Vu1 {
         // vf00/vi00 are architectural constants.
         self.vf[0] = [0, 0, 0, f32::to_bits(1.0)];
         self.vi[0] = 0;
+        self.vi_written_reg = 0;
+        self.vi_hazard_reg = 0;
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if self.jit.is_some() {
             crate::vu1_jit::run(self, gs, gif, start);
@@ -424,6 +469,9 @@ impl Vu1 {
             }
             self.flag_pipe[slot] = [self.mac, self.status];
             self.flag_cycle = self.flag_cycle.wrapping_add(1);
+            self.vi_hazard_reg = self.vi_written_reg;
+            self.vi_hazard_val = self.vi_written_val;
+            self.vi_written_reg = 0;
             pc = match next {
                 Some(t) => t & self.pc_mask,
                 None => (pc + 1) & self.pc_mask,
@@ -748,7 +796,7 @@ impl Vu1 {
                 let qw = (vi_s as i32 + imm11) as u32;
                 let v = self.data_qword(qw);
                 let f = field_index(dest);
-                self.vi_write(it, v[f] as u16);
+                self.vi_write_seen(it, v[f] as u16);
             }
             0x05 => {
                 // ISW: like ILW, the address comes from `is` and the
@@ -771,26 +819,26 @@ impl Vu1 {
             0x11 => self.clip = instr & 0xFF_FFFF, // FCSET
             0x12 => {
                 // FCAND
-                self.vi_write(1, (self.clip & (instr & 0xFF_FFFF) != 0) as u16);
+                self.vi_write_seen(1, (self.clip & (instr & 0xFF_FFFF) != 0) as u16);
             }
             0x13 => {
                 // FCOR
                 let all = (self.clip | (instr & 0xFF_FFFF)) == 0xFF_FFFF;
-                self.vi_write(1, all as u16);
+                self.vi_write_seen(1, all as u16);
             }
             0x16 => {
                 // FSAND
                 // FSAND's 12-bit immediate keeps its top bit in bit 21.
                 let imm12 = (instr & 0x7FF) | ((instr >> 10) & 0x800);
-                self.vi_write(it, self.status_seen & imm12 as u16);
+                self.vi_write_seen(it, self.status_seen & imm12 as u16);
             }
             0x1A => {
                 // FMAND
-                self.vi_write(it, self.mac_seen & self.vi[is & 0xF]);
+                self.vi_write_seen(it, self.mac_seen & self.vi[is & 0xF]);
             }
             0x1C => {
                 // FCGET
-                self.vi_write(it, (self.clip & 0xFFF) as u16);
+                self.vi_write_seen(it, (self.clip & 0xFFF) as u16);
             }
             0x20 => take(branch, true), // B
             0x21 => {
@@ -798,17 +846,18 @@ impl Vu1 {
                 self.vi_write(it, pc + 2);
                 take(branch, true);
             }
-            0x24 => *branch = Some(self.vi[is & 0xF]), // JR
+            0x24 => *branch = Some(self.vi_for_branch(is)), // JR
             0x25 => {
+                let target = self.vi_for_branch(is);
                 self.vi_write(it, pc + 2);
-                *branch = Some(self.vi[is & 0xF]); // JALR
+                *branch = Some(target); // JALR
             }
-            0x28 => take(branch, vi_t == vi_s),
-            0x29 => take(branch, vi_t != vi_s),
-            0x2C => take(branch, vi_s < 0),
-            0x2D => take(branch, vi_s > 0),
-            0x2E => take(branch, vi_s <= 0),
-            0x2F => take(branch, vi_s >= 0),
+            0x28 => take(branch, self.vi_for_branch(it) == self.vi_for_branch(is)),
+            0x29 => take(branch, self.vi_for_branch(it) != self.vi_for_branch(is)),
+            0x2C => take(branch, (self.vi_for_branch(is) as i16) < 0),
+            0x2D => take(branch, (self.vi_for_branch(is) as i16) > 0),
+            0x2E => take(branch, (self.vi_for_branch(is) as i16) <= 0),
+            0x2F => take(branch, (self.vi_for_branch(is) as i16) >= 0),
             0x40 => self.exec_lower_special(gs, gif, pc, instr),
             _ => self.unimplemented("lower", pc, instr),
         }
@@ -943,7 +992,7 @@ impl Vu1 {
                 // ILWR
                 let v = self.data_qword(self.vi[is & 0xF] as u32);
                 let f = field_index(dest);
-                self.vi_write(it, v[f] as u16);
+                self.vi_write_seen(it, v[f] as u16);
             }
             0x3F => {
                 // ISWR
