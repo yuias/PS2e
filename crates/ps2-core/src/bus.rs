@@ -266,14 +266,7 @@ impl Cdvd {
                 self.read_pos = 0;
                 // Latency: a distance-graded seek and ~4x-DVD streaming
                 // (0.4 ms/sector); the spin-up is in `CDVD_READY_AT`.
-                let dist = u64::from(lsn.abs_diff(self.last_lsn));
-                let seek = match dist {
-                    0 => CDVD_MS / 4,
-                    1..16 => CDVD_MS,
-                    16..4096 => 10 * CDVD_MS,
-                    4096..65536 => 30 * CDVD_MS,
-                    _ => 80 * CDVD_MS,
-                };
+                let seek = self.seek_time(lsn);
                 let xfer = u64::from(count.min(4096)) * (2 * CDVD_MS / 5);
                 self.last_lsn = lsn.wrapping_add(count);
                 let latency = seek + xfer;
@@ -369,6 +362,18 @@ impl Cdvd {
                 // first check costs a whole extra round of black screen.
                 CDVD_MS / 8
             }
+            // Seek: the head really moves, and the read that follows
+            // starts from where it stopped. Charging the move here and
+            // leaving `last_lsn` at the target is what keeps a seek/read
+            // pair from paying the same long seek twice -- doubled up, it
+            // held the drive busy long enough that a second thread's
+            // non-blocking N command was refused mid-FMV.
+            0x05 => {
+                let seek = self.seek_time(lsn);
+                self.last_lsn = lsn;
+                debug!(target: "ps2_core::iop::cdvd", lsn, "seek");
+                seek
+            }
             _ => {
                 debug!(target: "ps2_core::iop::cdvd",
                     cmd = format_args!("{cmd:#04x}"),
@@ -376,6 +381,18 @@ impl Cdvd {
                     "N command (quick)");
                 CDVD_MS / 8
             }
+        }
+    }
+
+    /// Head-move time (EE cycles) from where the last command left the
+    /// head to `lsn`, graded by distance the way a real drive is.
+    fn seek_time(&self, lsn: u32) -> u64 {
+        match u64::from(lsn.abs_diff(self.last_lsn)) {
+            0 => CDVD_MS / 4,
+            1..16 => CDVD_MS,
+            16..4096 => 10 * CDVD_MS,
+            4096..65536 => 30 * CDVD_MS,
+            _ => 80 * CDVD_MS,
         }
     }
 
@@ -4871,6 +4888,31 @@ mod tests {
         b.write32(0x1000, 0x1234_5678);
         b.deci2_kputs(0x1000);
         assert_eq!(b.tty_buffer, "Grow two:256\n??");
+    }
+
+    /// Issue an N command with an LSN/count parameter block and return the
+    /// drive latency the model charges for it.
+    fn n_command(c: &mut Cdvd, cmd: u32, lsn: u32, count: u32) -> u64 {
+        for b in lsn.to_le_bytes().iter().chain(count.to_le_bytes().iter()) {
+            c.write(0x1F40_2005, u32::from(*b));
+        }
+        c.write(0x1F40_2004, cmd).expect("an N command returns a latency")
+    }
+
+    #[test]
+    fn a_seek_moves_the_head_so_the_read_after_it_pays_no_second_seek() {
+        let mut b = bus();
+        // Park the head far away, then seek back and read from where the
+        // seek left it. Charging the distance to the seek and again to the
+        // read held the drive busy for twice as long as the game expects,
+        // and AC5's briefing FMV lost its next chunk to that: cdvdman
+        // turns a busy drive into a failed non-blocking read, and the
+        // module that asked has no retry of its own.
+        n_command(&mut b.cdvd, 0x08, 500_000, 1);
+        let seek = n_command(&mut b.cdvd, 0x05, 0, 0);
+        let read = n_command(&mut b.cdvd, 0x08, 0, 1);
+        assert_eq!(seek, 80 * CDVD_MS);
+        assert_eq!(read, CDVD_MS / 4 + 2 * CDVD_MS / 5);
     }
 
     #[test]
