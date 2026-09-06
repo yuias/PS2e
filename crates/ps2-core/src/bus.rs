@@ -133,10 +133,11 @@ pub struct Cdvd {
     /// including the "initialized" flag that decides whether the boot runs
     /// the first-time setup (PS logo, PS2 logo, language wizard) — plus
     /// region parameters and the i.Link id. Persisted to `nvram_path`.
-    nvram: Vec<u8>,
-    /// Frontend-owned; re-attached after a state load, not part of one.
+    pub(crate) nvram: Vec<u8>,
+    /// Frontend-owned, like the EEPROM image itself: guest writes reach the
+    /// host file, so a rebuilt machine keeps both (see [`crate::Ambient`]).
     #[serde(skip)]
-    nvram_path: Option<std::path::PathBuf>,
+    pub(crate) nvram_path: Option<std::path::PathBuf>,
     /// Disc image (2048-byte sectors), read on demand.
     #[serde(skip)]
     pub disc: Option<std::fs::File>,
@@ -228,14 +229,6 @@ impl Cdvd {
         let s = self.disc_serial()?;
         let text = std::str::from_utf8(&s).ok()?;
         Some(format!("{}-{}", &text[..4], &text[4..]))
-    }
-
-    /// Take the disc and the NVRAM file location from `live`: a save state
-    /// does not carry either, so a restored drive keeps what is physically
-    /// in it.
-    pub(crate) fn carry_over(&mut self, live: &mut Cdvd) {
-        self.disc = live.disc.take();
-        self.nvram_path = live.nvram_path.take();
     }
 
     /// Execute an N command. CdRead (0x06) and DvdRead (0x08) stage the

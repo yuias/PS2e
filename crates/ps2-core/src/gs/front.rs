@@ -109,7 +109,7 @@ pub struct GsState {
     intc_pending: bool,
     internal_2x: bool,
     /// The renderer, serialized where it lives.
-    renderer: Vec<u8>,
+    pub(crate) renderer: Vec<u8>,
 }
 
 /// Flush a batch to the worker once it holds this many commands.
@@ -522,7 +522,15 @@ impl GsFront {
     }
 
     /// Put back a [`GsFront::snapshot`], keeping the renderer where it is.
+    /// Everything that can fail happens first, so a rejected blob leaves
+    /// the front exactly as it was.
     pub fn restore(&mut self, state: GsState) -> Result<(), String> {
+        let decoded = match &self.inline {
+            Some(_) => Some(
+                postcard::from_bytes::<Gs>(&state.renderer).map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        };
         self.batch.clear();
         self.image.clear();
         self.pmode = state.pmode;
@@ -538,11 +546,9 @@ impl GsFront {
         self.priv_shadow = state.priv_shadow;
         self.intc_pending = state.intc_pending;
         self.internal_2x = state.internal_2x;
-        match &mut self.inline {
-            Some(gs) => {
-                *gs = postcard::from_bytes(&state.renderer).map_err(|e| e.to_string())?;
-            }
-            None => {
+        match (&mut self.inline, decoded) {
+            (Some(gs), Some(new)) => *gs = new,
+            _ => {
                 self.push(Cmd::Restore(state.renderer));
                 self.flush();
             }

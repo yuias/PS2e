@@ -117,6 +117,36 @@ fn bios_fingerprint(bios: &[u8]) -> u32 {
     bios.iter().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(*b)).wrapping_mul(0x0100_0193))
 }
 
+/// The host-owned assets a machine runs on. None of it is machine state:
+/// the frontend supplies it, the guest cannot invent it, and it must
+/// survive every rebuild of the machine — a save-state load, a power
+/// cycle. [`Ps2System::take_ambient`] and [`Ps2System::set_ambient`] are
+/// the single carry path, so anything added here is carried everywhere by
+/// construction.
+///
+/// A save state deliberately holds none of it: the BIOS and disc are the
+/// frontend's to choose, and rolling the memory card or the mechacon
+/// EEPROM back would corrupt storage the guest has already written
+/// through to the host.
+pub struct Ambient {
+    pub bios: Box<[u8]>,
+    pub disc: Option<std::fs::File>,
+    /// Mechacon EEPROM, and the file it is persisted to.
+    pub nvram: Vec<u8>,
+    pub nvram_path: Option<std::path::PathBuf>,
+    pub memcard: bus::MemCard,
+    /// The live renderer, its host-side display switches included; on a
+    /// threaded build this owns the GS worker thread.
+    pub gs: gs::front::GsFront,
+    /// Cheat table, master switch included.
+    pub cheats: cheats::Table,
+    /// Console capture, drained by the frontend rather than the guest.
+    pub tty: String,
+    pub iop_tty: String,
+    /// DMA ranges the debugger has armed.
+    pub dma_watch: Vec<bus::DmaWatch>,
+}
+
 /// Top-level system: owns every component, mirrors the real console.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ps2System {
@@ -136,9 +166,9 @@ pub struct Ps2System {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[serde(skip)]
     iop_jit: Option<iop::jit::Jit>,
-    /// Cheats applied at each vertical blank: host configuration, not
-    /// machine state, so the file does not carry them — the running
-    /// table survives a load instead, like the other ambient assets.
+    /// Cheats applied at each vertical blank. Host configuration rather
+    /// than machine state, so it rides in [`Ambient`] and the file holds
+    /// none of it.
     #[serde(skip)]
     cheats: cheats::Table,
 }
@@ -219,11 +249,45 @@ impl Ps2System {
         }
     }
 
-    /// Serialize the complete machine state. The BIOS image, disc and
-    /// memory card are *not* included: they are ambient assets the
-    /// frontend owns (and rolling a memory card back would corrupt real
-    /// saves). The display side follows the machine, because its renderer
-    /// may have to be asked across a thread for it.
+    /// Detach the [`Ambient`] assets, leaving inert placeholders behind.
+    /// Pair with [`Ps2System::set_ambient`] around anything that replaces
+    /// the machine.
+    pub fn take_ambient(&mut self) -> Ambient {
+        Ambient {
+            bios: std::mem::take(&mut self.bus.bios),
+            disc: self.bus.cdvd.disc.take(),
+            nvram: std::mem::take(&mut self.bus.cdvd.nvram),
+            nvram_path: self.bus.cdvd.nvram_path.take(),
+            memcard: std::mem::take(&mut self.bus.sio2.memcard),
+            // Not the `Default` renderer: that one starts a worker thread
+            // on a threaded build, only to be dropped again.
+            gs: std::mem::replace(&mut self.bus.gs, gs::front::GsFront::inline()),
+            cheats: std::mem::take(&mut self.cheats),
+            tty: std::mem::take(&mut self.bus.tty_buffer),
+            iop_tty: std::mem::take(&mut self.bus.iop_tty_buffer),
+            dma_watch: std::mem::take(&mut self.bus.dma_watch),
+        }
+    }
+
+    /// Install the [`Ambient`] assets, discarding whatever stood in for
+    /// them. Infallible by design: it runs after the last step that can
+    /// fail, so no failure can strand the assets half-installed.
+    pub fn set_ambient(&mut self, ambient: Ambient) {
+        self.bus.bios = ambient.bios;
+        self.bus.cdvd.disc = ambient.disc;
+        self.bus.cdvd.nvram = ambient.nvram;
+        self.bus.cdvd.nvram_path = ambient.nvram_path;
+        self.bus.sio2.memcard = ambient.memcard;
+        self.bus.gs = ambient.gs;
+        self.cheats = ambient.cheats;
+        self.bus.tty_buffer = ambient.tty;
+        self.bus.iop_tty_buffer = ambient.iop_tty;
+        self.bus.dma_watch = ambient.dma_watch;
+    }
+
+    /// Serialize the complete machine state. The [`Ambient`] assets are
+    /// *not* included. The display side is, because its renderer may have
+    /// to be asked across a thread for it.
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
         let gs = self.bus.gs.snapshot()?;
         let mut out = Vec::with_capacity(48 << 20);
@@ -235,7 +299,8 @@ impl Ps2System {
     }
 
     /// Restore a state from [`Ps2System::save_state`], carrying over the
-    /// BIOS, disc, memory card, cheat table and the running renderer.
+    /// [`Ambient`] assets. A file this rejects leaves the running machine
+    /// untouched.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         let (header, body) = data.split_at_checked(10).ok_or("state file too short")?;
         if &header[..4] != STATE_MAGIC {
@@ -256,15 +321,13 @@ impl Ps2System {
             .map_err(|e| format!("deserialize failed: {e}"))?;
         let gs: gs::front::GsState =
             postcard::from_bytes(rest).map_err(|e| format!("deserialize failed: {e}"))?;
-        // Ambient assets and the live renderer come from the running
-        // machine, not from the file.
-        sys.bus.bios = std::mem::take(&mut self.bus.bios);
-        sys.bus.gs = std::mem::replace(&mut self.bus.gs, gs::front::GsFront::inline());
-        sys.bus.cdvd.carry_over(&mut self.bus.cdvd);
-        sys.bus.sio2.memcard = std::mem::take(&mut self.bus.sio2.memcard);
-        // Carried as it stands, one-shots included: a load is not a boot,
-        // so an entry that has already fired stays spent.
-        sys.cheats = std::mem::take(&mut self.cheats);
+        // The last step that can fail, and it runs on the machine that is
+        // still whole: a file rejected here costs nothing.
+        self.bus.gs.restore(gs)?;
+        // The assets come from the running machine, never from the file —
+        // the cheat table as it stands, one-shots included, because a load
+        // is not a boot and an entry that has fired stays spent.
+        sys.set_ambient(self.take_ambient());
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             sys.jit = self.jit.take();
@@ -276,7 +339,6 @@ impl Ps2System {
             sys.bus.vu1.flush_jit();
         }
         sys.bus.after_load();
-        sys.bus.gs.restore(gs)?;
         *self = sys;
         Ok(())
     }
@@ -930,6 +992,59 @@ mod state_tests {
         let mut b = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
         b.load_state(&blob).unwrap();
         assert!(b.cheats().is_empty());
+    }
+
+    /// Every [`Ambient`] asset rides across a load, not just the ones the
+    /// machine happens to need to keep running.
+    #[test]
+    fn a_state_load_keeps_the_ambient_assets() {
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        let watch = bus::DmaWatch { iop: false, start: 0x1000, len: 16 };
+        sys.bus.cdvd.nvram[0] = 0x5A;
+        sys.bus.dma_watch.push(watch);
+        sys.bus.iop_tty_buffer.push_str("iop says hello");
+        let blob = sys.save_state().unwrap();
+        sys.bus.cdvd.nvram[0] = 0xA5;
+        sys.load_state(&blob).unwrap();
+        // The EEPROM is written through to the host file, so the live
+        // bytes win over the file's, as the memory card's do.
+        assert_eq!(sys.bus.cdvd.nvram[0], 0xA5);
+        assert_eq!(sys.bus.dma_watch, [watch]);
+        assert_eq!(sys.bus.iop_tty_buffer, "iop says hello");
+    }
+
+    /// A file the loader rejects must leave the running machine whole.
+    /// The renderer blob is the last thing checked, so a bad one is the
+    /// case that proves the order.
+    #[test]
+    fn a_rejected_state_leaves_the_machine_whole() {
+        use cheats::{Cheat, Op, Target};
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        sys.set_cheats(vec![Cheat {
+            target: Target::Ee,
+            once: false,
+            op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
+        }]);
+        sys.set_cheats_enabled(true);
+        sys.bus.cdvd.nvram[0] = 0x5A;
+
+        // A state whose renderer payload is junk: the outer decode passes,
+        // the renderer's own does not.
+        let mut gs = sys.bus.gs.snapshot().unwrap();
+        gs.renderer = vec![0xFF; 8];
+        let mut blob = Vec::from(STATE_MAGIC.as_slice());
+        blob.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        blob.extend_from_slice(&bios_fingerprint(&sys.bus.bios).to_le_bytes());
+        let blob = postcard::to_extend(&sys, blob).unwrap();
+        let blob = postcard::to_extend(&gs, blob).unwrap();
+        assert!(sys.load_state(&blob).is_err());
+
+        assert_eq!(sys.cheats().len(), 1);
+        assert_eq!(sys.bus.bios.len(), bus::BIOS_SIZE);
+        assert_eq!(sys.bus.cdvd.nvram[0], 0x5A);
+        // And it still runs: the cheat lands at the next frame boundary.
+        sys.run(sys.frame_cycles());
+        assert_eq!(sys.bus.peek8(0x0010_0000), Some(0x34));
     }
 
     #[test]
