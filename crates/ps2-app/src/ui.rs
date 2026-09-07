@@ -529,12 +529,15 @@ impl Drop for App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Everything the emulator thread reads. eframe calls this before every
+    /// `ui`, and also while the window is hidden, so a minimised window keeps
+    /// feeding the pad and the volume.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // A text field in the pane (an address, a scan value) owns the
         // keyboard while it has focus: without this, typing "1000" also
         // presses whatever pad buttons those keys are bound to. The
         // frontend's own function keys below stay live either way.
-        let typing = ctx.wants_keyboard_input();
+        let typing = ctx.egui_wants_keyboard_input();
         let buttons = if typing {
             0
         } else {
@@ -572,6 +575,12 @@ impl eframe::App for App {
             self.emu.shared.view.store(crate::emu::pack_view(self.mem_target, base), Ordering::Relaxed);
         }
         self.emu.shared.internal_2x.store(self.internal_2x, Ordering::Relaxed);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The panels below need `ui` mutably, so take an owned handle to the
+        // context (an Arc clone) rather than borrowing it out of `ui`.
+        let ctx = &ui.ctx().clone();
 
         let status = self.emu.shared.status.lock().unwrap().clone();
         let disc = self.emu.shared.disc.lock().unwrap().clone();
@@ -619,7 +628,7 @@ impl eframe::App for App {
         let chrome = !self.fullscreen;
 
         if chrome {
-            self.window_size = ctx.screen_rect().size();
+            self.window_size = ctx.viewport_rect().size();
         }
 
         // Size the window so the display comes out exactly this tall,
@@ -633,12 +642,12 @@ impl eframe::App for App {
         {
             let ppp = ctx.pixels_per_point();
             let display = egui::vec2(height as f32 * self.display_aspect, height as f32) / ppp;
-            let window_chrome = ctx.screen_rect().size() - self.central_size;
+            let window_chrome = ctx.viewport_rect().size() - self.central_size;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_chrome + display));
         }
 
         if chrome {
-            egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::Panel::top("menu").show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("Emulation", |ui| {
                         // The debugger owns run control while attached.
@@ -751,7 +760,7 @@ impl eframe::App for App {
                 });
             });
 
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::bottom("status").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let state = match status.debugger {
                         DebuggerState::Halted => "debugger: halted",
@@ -803,11 +812,11 @@ impl eframe::App for App {
         }
 
         if chrome && self.show_pane {
-            let pane = egui::SidePanel::right("pane")
+            let pane = egui::Panel::right("pane")
                 .resizable(true)
-                .min_width(240.0)
-                .default_width(self.pane_width)
-                .show(ctx, |ui| {
+                .min_size(240.0)
+                .default_size(self.pane_width)
+                .show(ui, |ui| {
                     // Claimed before the content so the pages' own widgets
                     // sit on top of it: a click that lands here is a click
                     // on empty pane, which drops text focus and gives the
@@ -834,10 +843,10 @@ impl eframe::App for App {
         }
 
         if chrome && self.show_tty {
-            egui::TopBottomPanel::bottom("tty")
+            egui::Panel::bottom("tty")
                 .resizable(true)
-                .default_height(160.0)
-                .show(ctx, |ui| {
+                .default_size(160.0)
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("TTY");
                         if ui.button("Clear").clicked() {
@@ -863,7 +872,7 @@ impl eframe::App for App {
         } else {
             egui::CentralPanel::default()
         };
-        central.show(ctx, |ui| {
+        central.show(ui, |ui| {
             self.central_size = ui.max_rect().size();
             let (width, height, rgba, seq) = {
                 let frame = self.emu.shared.frame.lock().unwrap();

@@ -206,8 +206,8 @@ pub fn init(render_state: &egui_wgpu::RenderState) {
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ps2 display"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("ps2 display"),
@@ -231,7 +231,7 @@ pub fn init(render_state: &egui_wgpu::RenderState) {
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     let sampler = |filter: wgpu::FilterMode| {
@@ -242,7 +242,7 @@ pub fn init(render_state: &egui_wgpu::RenderState) {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: filter,
             min_filter: filter,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         })
     };
