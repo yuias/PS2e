@@ -310,6 +310,9 @@ impl Ps2System {
         let mut ambient = self.take_ambient();
         // The renderer is the host's, but what it holds is the machine's.
         ambient.gs.reset();
+        // Same for the memory card: the console powers it, so it comes up
+        // unidentified again with its contents untouched.
+        ambient.memcard.power_on();
         // This one *is* a boot, so the one-shot cheats fire again.
         ambient.cheats.rearm();
         fresh.set_ambient(ambient);

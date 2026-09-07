@@ -878,6 +878,10 @@ pub struct MemCard {
     pub data: Vec<u8>,
     /// Set whenever a write or erase lands, so the host can persist.
     pub dirty: bool,
+    /// Byte every reply ends with. A card powers up "not ready" (0x66) and
+    /// becomes "ready" (0x55) once the MagicGate reset has run; MCMAN's
+    /// card-changed probe reads it to tell a newly inserted card from the
+    /// one it has already identified.
     terminator: u8,
     /// Page selected by SetSector, and the byte cursor within it that
     /// ReadData/WriteData advance.
@@ -900,7 +904,9 @@ impl Default for MemCard {
             // Erased flash reads all-ones; the OSD offers to format it.
             data: vec![0xFF; MEMCARD_PAGE * MEMCARD_PAGES],
             dirty: false,
-            terminator: 0x55,
+            // A card powers up "not ready" (0x66) so MCMAN sees it as newly
+            // inserted and runs its detection; the F3 reset makes it 0x55.
+            terminator: 0x66,
             sector: 0,
             progress: 0,
         }
@@ -908,6 +914,15 @@ impl Default for MemCard {
 }
 
 impl MemCard {
+    /// The card is powered from the console, so a power cycle takes it back
+    /// to "not ready" with nothing selected. The flash contents are the
+    /// host's file and stay as they are.
+    pub fn power_on(&mut self) {
+        self.terminator = 0x66;
+        self.sector = 0;
+        self.progress = 0;
+    }
+
     fn pos(&self) -> usize {
         (self.sector as usize * MEMCARD_PAGE + self.progress) % (MEMCARD_PAGE * MEMCARD_PAGES)
     }
@@ -943,7 +958,7 @@ impl MemCard {
             }
             // Boot-time probe MCMAN issues before the auth handshake.
             0xBF | 0xF7 => ack(&mut r, 5),
-            // MagicGate session reset; also forces the terminator back to 0x55.
+            // MagicGate session reset; the card becomes "ready" (terminator 0x55).
             0xF3 => {
                 self.terminator = 0x55;
                 r.resize(3, 0);
