@@ -1,9 +1,10 @@
 # PS2e
 
 A PlayStation 2 emulator written in Rust. Software-rasterized GS with the
-hardware VRAM layout, an x86-64 recompiler for the EE, SPU2 with reverb and
-AutoDMA streaming, CDVD with drive timing and mechacon NVRAM, memory cards,
-and an LLDB-compatible remote debugger on both cores.
+hardware VRAM layout, x86-64 recompilers for the EE, IOP and VU1, an IPU
+that decodes MPEG-2 video, SPU2 with reverb and AutoDMA streaming, CDVD with
+drive timing and mechacon NVRAM, memory cards, and an LLDB-compatible remote
+debugger on both cores.
 
 A PlayStation 2 BIOS image (4 MiB, e.g. SCPH-50000) is required and not
 included.
@@ -41,18 +42,18 @@ starting a disc over.
 
 The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
-disc, memory card and mechacon NVRAM stay in), the two disc commands,
-save/load state and screenshots; View toggles fullscreen, the side pane and
-the TTY console, and sizes the window to a 720p or 1080p display; Help lists
-the current key bindings.
+disc, memory card and mechacon NVRAM stay in), the two disc commands, the
+cheat toggle, save/load state and screenshots; View toggles fullscreen, the
+side pane and the TTY console, and sizes the window to a 720p or 1080p
+display; Help lists the current key bindings.
 
 Settings live in the side pane on the right, which has three pages behind a
-row of tabs: Settings (display scaler, aspect ratio, deinterlacer, internal
-2x rendering, master volume), Memory (a RAM viewer and the cheat-value
-scanner) and Registers (both CPUs' register files). Only the page on screen
-is fed by the emulator, so the two behind it cost nothing, and the whole
-pane can be closed from the View menu. The pane's width and whether it
-opens are remembered in `config.toml`.
+row of tabs: Settings (display scaler, aspect ratio, deinterlacer, field
+order, internal 2x rendering, master volume), Memory (a RAM viewer and the
+cheat-value scanner) and Registers (both CPUs' register files). Only the
+page on screen is fed by the emulator, so the two behind it cost nothing,
+and the whole pane can be closed from the View menu. The pane's width and
+whether it opens are remembered in `config.toml`.
 
 View > Display size resizes the *window* until the display itself is 720 or
 1080 pixels tall, at whatever aspect ratio is selected, so a window dragged
@@ -89,13 +90,16 @@ The pad and the save/load shortcuts are rebindable; see the `[keys]`,
 Fullscreen and screenshot are fixed.
 
 A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
-working directory, the same encoding as headless `--screenshot`.
+working directory. Headless `--screenshot` picks its encoding from the
+extension instead, so it writes the same BMP for a `.bmp` path and a PNG
+for `.png`.
 
-Save states snapshot the whole machine to `state0.sst` next to the memory
-card image, zstd-compressed (about 13 MiB of a 40 MiB image, and roughly
-0.4 s to write, which the machine pauses for). The BIOS, disc image and
-memory card are not part of a state and carry over on load; a state saved
-with a different BIOS loads with a warning.
+Save states snapshot the whole machine to `state0.sst` next to
+`config.toml`, or wherever `state` points, zstd-compressed (about 13 MiB of
+a 40 MiB image, and roughly 0.4 s to write, which the machine pauses for).
+The BIOS, disc image and memory card are not part of a state and carry over
+on load; a state saved with a different BIOS loads with a warning in the
+log.
 
 ## Configuration
 
@@ -107,12 +111,15 @@ run. CLI flags override the file.
 bios = "path/to/bios.bin"   # falls back to assets/SCPH-50000.bin
 region = "ntsc"             # video timing before SetGsCrt: ntsc | pal
 volume = 0.5                # master volume, 0.0..1.0
-memcard = "memcard0.ps2"    # created and formatted automatically
+memcard = "memcard0.ps2"    # blank until the BIOS browser formats it
+state = "state0.sst"        # save state; next to config.toml by default
 scaler = "sharp"            # nearest | linear | sharp | lanczos
 aspect = "4:3"              # 4:3 | 16:9 | native
-deinterlace = "bwdif"       # weave | bob | blend | adaptive | bwdif
+deinterlace = "bwdif"       # weave | bob | blend | adaptive | adaptivedebug
+                            # | bwdif ("yadif" parses but is not in the menu)
 swap_fields = false         # flip which rows each field lands on
 internal_2x = false         # true 2x edges on 3D geometry
+cheats = false              # apply <disc>.pnach next to the disc image
 pane = true                 # open the side pane at startup
 pane_width = 420.0          # and the width it opens at
 window_width = 960.0        # window size at the last exit, in egui points
@@ -163,18 +170,29 @@ to run, which is what changes get checked against.
 | `--insert` | Open the drive and close it on a new image, `<path>@<cycle>` |
 | `--save-state <p>@<n>` | Write a save state at that cycle |
 | `--load-state <p>` | Start from a save state instead of the reset vector |
-| `--screenshot <p>` | Write the final framebuffer as a BMP |
-| `--screenshot-every N` | Also write `<p>_<n>.bmp` every N cycles |
+| `--screenshot <p>` | Final framebuffer as `.bmp` or `.png`, by extension |
+| `--screenshot-every N` | Also write `<stem>_<n>.<ext>` every N cycles |
 | `--wav <p>` | Write the SPU2 output as a 48 kHz stereo WAV |
-| `--dump <dir>` | EE and IOP RAM dumps after the run |
+| `--dump <dir>` | EE/IOP RAM, GS VRAM, VU1 and SPU2 dumps after the run |
 | `--memcard <p>` | Card image to load and persist |
+| `--cheats` | Apply `<disc>.pnach` next to the image |
+| `--watch` | Log writers of `<ee\|iop>:<addr>[,<len>]`, repeatable |
 | `--log <filter>` | Tracing filter, e.g. `info,ps2_core::tty=debug` |
 | `--no-jit` | Interpret EE, VU1 and IOP instead of recompiling them |
 | `--gs-inline` | Render on the emulation thread, no GS worker |
 | `--internal-2x` | Render internally at 2x |
 | `--region <r>` | Video timing until `SetGsCrt`, `ntsc` (default) or `pal` |
 
-`--window` opens the window even when `--cycles` is given.
+`--window` opens the window even when `--cycles` is given. `--watch` steps
+the interpreter so it can compare bytes between instructions, which is slow;
+the frames it produces still match the recompilers'.
+
+Every cycle count takes digits, `_` separators or e-notation, so `13e9`,
+`13_000_000_000` and `13000000000` are the same number. `--cycles` is a
+duration, but the cycles in `--press`, `--insert` and `--save-state` are
+read off the machine's own counter — which a save state carries, so from
+`--load-state` they are positions in that state's timeline, not offsets
+from the start of the run.
 
 `--region` only sets the refresh and horizontal-blank rates the machine
 starts with. Software owns the CRTC from there: the kernel's `SetGsCrt`
@@ -192,8 +210,9 @@ ps2e --cycles <n> --debug-ee 9000 --debug-iop 9001 --wait-debugger
 Each core gets its own port and its own stub, speaking the gdb-remote serial
 protocol with LLDB as the primary client; plain GDB works too.
 `--wait-debugger` holds execution at the reset vector until a client
-attaches. Halting either core halts the whole machine — the two run in
-lockstep.
+attaches, and needs one of the two ports. Halting either core halts the
+whole machine — the two run in lockstep. `--watch` is the cheaper way to
+answer "who wrote this address" and is refused alongside either port.
 
 ```
 (lldb) gdb-remote localhost:9000
@@ -201,17 +220,23 @@ lockstep.
 (lldb) continue
 ```
 
-Registers, memory read/write, software breakpoints, single-stepping and
-interrupt are supported. EE registers are 64-bit on the wire (mips64el);
+Registers (read and write), memory read/write, software breakpoints,
+single-stepping and interrupt are supported, along with write watchpoints,
+which are polled per instruction and so catch DMA writes too; read and
+access watchpoints are not. EE registers are 64-bit on the wire (mips64el);
 the IOP is the PS1-style 32-bit layout. Disassembly requires an LLVM build
 that includes the Mips target.
 
 ## Limitations
 
-- The IPU (MPEG decoder) is not implemented, so full-motion video does not
-  decode.
-- The emulated controller is a digital pad: the keyboard and a gamepad both
-  drive it, but the analog sticks read as centred.
+- The IPU decodes every command it has, and full-motion video plays, but it
+  has been exercised against one title's movies only. `PACK` to 4-bit
+  indexed output is not modelled and emits zeros.
+- One controller, a DualShock 2 in port 1; port 2 reads as empty. A gamepad
+  drives the buttons and both sticks; the keyboard drives the buttons only,
+  so with no gamepad attached the sticks read as centred. Pressure-sensitive
+  buttons report fully down or not at all, and vibration is acknowledged but
+  goes nowhere.
 - Memory cards respond in slot 1 only.
 - A game asking for the next disc has not been tried against a real
   multi-disc title yet, though swapping mid-game works.

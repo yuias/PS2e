@@ -143,8 +143,8 @@ the BIOS reimplementation project (`PS2BiosRebuild`).
 
 ## CDVD osdconfig (what makes the OSD skip first-boot setup)
 
-Wire format decoded by PS2BiosRebuild (see
-`N:\PS2BiosRebuild` analysis; SCPH-50000): a config block is 15 data
+Wire format decoded by PS2BiosRebuild (see that project's own
+analysis; SCPH-50000): a config block is 15 data
 bytes + a one-byte sum mod 256; CDVDMAN verifies the sum and never
 looks inside. The OSD opens area (1, 0) with count 2 — wire triple
 `[0, 1, 2]` — reads two blocks, and retries open/read/close while the
@@ -351,10 +351,12 @@ Related: this BIOS's Version screen reads the model via S command
 0x17 (sceCdReadModelNumber): param = byte offset, result = [stat,
 8 model chars], two calls (offsets 0 and 8). This cdvdman revision
 also has an interrupt-driven S-command engine (a mailbox at ~0x3D81D
-+ completion flag polled with DelayThread) and a register-window
-result path (banks 0x2020-0x2034 XOR-obfuscated with 0x2039, valid
-bits in 0x2038) that our FIFO-only model never triggers — worth
-knowing if some path stops getting results.
++ completion flag polled with DelayThread) that our synchronous model
+never triggers — worth knowing if some path stops getting results.
+The register-window result path it shares (banks 0x2020-0x2034
+XOR-obfuscated with 0x2039, valid bits in 0x2038) we do model, but
+only for the disc key N 0x0C hands over; S-command results still come
+back through the FIFO.
 
 ## SPU2 transfer engine (what libspu2 / libsd wait on)
 
