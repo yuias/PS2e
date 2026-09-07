@@ -5066,6 +5066,21 @@ mod tests {
         assert_ne!(b.iop_i_stat & 1 << 2, 0);
     }
 
+    /// A card answers "not ready" (0x66) until the MagicGate reset, which
+    /// is how MCMAN's card-changed probe tells a card it has not
+    /// identified from one it has. The console powers the card, so a power
+    /// cycle takes it back there.
+    #[test]
+    fn a_memory_card_powers_up_not_ready() {
+        let mut c = MemCard::default();
+        let probe = |c: &mut MemCard| *c.respond(&[0x81, 0x11], 4).last().unwrap();
+        assert_eq!(probe(&mut c), 0x66);
+        c.respond(&[0x81, 0xF3], 5);
+        assert_eq!(probe(&mut c), 0x55);
+        c.power_on();
+        assert_eq!(probe(&mut c), 0x66);
+    }
+
     #[test]
     fn iop_tty_capture() {
         let mut b = bus();
