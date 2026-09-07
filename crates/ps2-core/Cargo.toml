@@ -29,5 +29,5 @@ default = []
 profile = []
 # Run the GS renderer on a worker thread (native only; wasm keeps it inline).
 threads = ["dep:rayon"]
-# x86-64 dynamic recompiler for the EE (native only).
+# x86-64 dynamic recompilers for the EE, IOP and VU1 (native only).
 jit = ["dep:dynasm", "dep:dynasmrt", "dep:windows-sys", "dep:libc"]

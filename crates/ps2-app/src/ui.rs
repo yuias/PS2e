@@ -479,8 +479,9 @@ impl App {
         }
     }
 
-    /// Dump the currently displayed frame to a timestamped BMP next to the
-    /// working directory, mirroring the headless `--screenshot` writer.
+    /// Dump the currently displayed frame to a timestamped BMP in the
+    /// working directory. Headless `--screenshot` picks BMP or PNG from
+    /// the path's extension; this one has no path to read.
     fn take_screenshot(&mut self) {
         let frame = self.emu.shared.frame.lock().unwrap();
         if frame.width == 0 || frame.height == 0 {

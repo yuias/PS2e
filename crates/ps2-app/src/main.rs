@@ -203,7 +203,7 @@ fn parse_args() -> Result<Args, String> {
             "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ps2-app [--bios <path>] [--cycles <n>] [--window] [--log <filter>]\n\
+                    "usage: ps2e [--bios <path>] [--cycles <n>] [--window] [--log <filter>]\n\
                      \n\
                      With no --cycles (or with --window), opens a window; otherwise runs\n\
                      headless for the given number of EE cycles and exits.\n\

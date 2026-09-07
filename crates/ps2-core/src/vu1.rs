@@ -1,12 +1,14 @@
-//! VU1 microprogram interpreter.
+//! VU microprogram interpreter: VU1, VU0's micro mode and VU0's macro
+//! mode all run through it.
 //!
-//! Executes the micro memory filled by VIF1 MPG when MSCAL/MSCNT fires.
+//! Executes the micro memory filled by VIF MPG when MSCAL/MSCNT fires.
 //! One instruction pair per step, upper (FMAC) then lower — the true
 //! parallel read semantics are approximated by committing the upper result
 //! before the lower executes, which the OSD's programs tolerate. XGKICK
-//! streams GIF packets from VU1 data memory (PATH1). Unimplemented
-//! opcodes panic loudly with pc and instruction, same as the CPU cores:
-//! during bring-up a silent wrong result is worse than a stop.
+//! streams GIF packets from VU1 data memory (PATH1). An opcode we do not
+//! decode is named once and its slot runs as a nop: unlike the CPU cores,
+//! stopping recovers nothing, because the pair carries no side effect the
+//! rest of the program can be waiting on.
 
 use crate::gif::Gif;
 use crate::gs::GsFront;

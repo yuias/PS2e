@@ -1,8 +1,8 @@
 //! EE-side system bus: memory map, MMIO dispatch, TTY capture.
 //!
-//! Address translation is a direct segment fold for now: the kernel's TLB
-//! mappings are essentially identity, so TLB instructions record entries
-//! without remapping (see ARCHITECTURE.md).
+//! Address translation folds KSEG0/1 and walks the real TLB for mapped
+//! segments, behind a translation cache and a one-page instruction-fetch
+//! cache (see ARCHITECTURE.md).
 
 use crate::Region;
 use crate::gif::Gif;

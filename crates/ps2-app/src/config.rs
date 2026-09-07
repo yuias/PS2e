@@ -69,9 +69,16 @@ pane_width = 420.0
 window_width = 960.0
 window_height = 640.0
 
-# Memory card image (created and formatted automatically).
+# Memory card image (blank until the BIOS browser formats it).
 # Defaults to memcard0.ps2 next to this file.
 #memcard = "memcard0.ps2"
+
+# Save-state file for F5/F9. Defaults to state0.sst next to this file.
+#state = "state0.sst"
+
+# Apply the patches in <image>.pnach next to the disc image. The Emulation
+# menu has the same toggle, and shows how many the file holds.
+cheats = false
 
 # Digital pad bindings. Names are the ones egui reports: letters and
 # digits as themselves ("X", "1"), arrows as "Up"/"Down"/"Left"/"Right",
