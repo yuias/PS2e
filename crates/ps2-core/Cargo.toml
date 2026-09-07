@@ -14,8 +14,8 @@ serde-big-array = "0.5"
 serde_bytes = "0.11"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 rayon = { version = "1", optional = true }
-dynasm = { version = "3", optional = true }
-dynasmrt = { version = "3", optional = true }
+dynasm = { version = "5", optional = true }
+dynasmrt = { version = "5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"], optional = true }
