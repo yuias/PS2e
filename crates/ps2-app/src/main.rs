@@ -81,21 +81,33 @@ struct Args {
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
 const PRESS_HOLD: u64 = 150_000_000;
 
+/// An EE cycle count on the command line: plain digits, `_` separators, or
+/// the scientific shorthand the counts are usually quoted in (`5e9`,
+/// `5.2e9`). Anything with an exponent or a point goes through `f64`, which
+/// is exact well past the cycle counts a run reaches.
+fn parse_cycle(s: &str) -> Result<u64, String> {
+    let t = s.replace('_', "");
+    if t.contains(['e', 'E', '.']) {
+        let n: f64 = t.parse().map_err(|e| format!("bad cycle '{s}': {e}"))?;
+        if !n.is_finite() || n < 0.0 || n >= (u64::MAX as f64) {
+            return Err(format!("bad cycle '{s}': not a cycle count"));
+        }
+        Ok(n as u64)
+    } else {
+        t.parse().map_err(|e| format!("bad cycle '{s}': {e}"))
+    }
+}
+
 /// Parse "circle@6000000000" or "down@5e9-5.2e9"-style "<button>@<from>[-<to>]".
 fn parse_press(spec: &str) -> Result<(u16, u64, u64), String> {
     let (name, range) = spec
         .split_once('@')
         .ok_or_else(|| format!("--press needs <button>@<cycle>, got '{spec}'"))?;
     let mask = pad::mask_by_name(name)?;
-    let parse_n = |s: &str| -> Result<u64, String> {
-        s.replace('_', "")
-            .parse()
-            .map_err(|e| format!("bad cycle '{s}': {e}"))
-    };
     let (from, to) = match range.split_once('-') {
-        Some((a, b)) => (parse_n(a)?, parse_n(b)?),
+        Some((a, b)) => (parse_cycle(a)?, parse_cycle(b)?),
         None => {
-            let a = parse_n(range)?;
+            let a = parse_cycle(range)?;
             (a, a + PRESS_HOLD)
         }
     };
@@ -107,11 +119,7 @@ fn parse_insert(spec: &str) -> Result<(String, u64), String> {
     let (path, cycle) = spec
         .rsplit_once('@')
         .ok_or_else(|| format!("--insert needs <path>@<cycle>, got '{spec}'"))?;
-    let cycle = cycle
-        .replace('_', "")
-        .parse()
-        .map_err(|e| format!("bad cycle '{cycle}': {e}"))?;
-    Ok((path.to_string(), cycle))
+    Ok((path.to_string(), parse_cycle(cycle)?))
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -145,26 +153,17 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--bios" => args.bios = Some(it.next().ok_or("--bios needs a path")?),
             "--cycles" => {
-                args.cycles = Some(
-                    it.next()
-                        .ok_or("--cycles needs a number")?
-                        .replace('_', "")
-                        .parse()
-                        .map_err(|e| format!("bad --cycles: {e}"))?,
-                );
+                args.cycles =
+                    Some(parse_cycle(&it.next().ok_or("--cycles needs a number")?)?);
             }
             "--window" => args.window = true,
             "--log" => args.log = Some(it.next().ok_or("--log needs a filter")?),
             "--dump" => args.dump = Some(it.next().ok_or("--dump needs a directory")?),
             "--screenshot" => args.screenshot = Some(it.next().ok_or("--screenshot needs a path")?),
             "--screenshot-every" => {
-                args.screenshot_every = Some(
-                    it.next()
-                        .ok_or("--screenshot-every needs a cycle count")?
-                        .replace('_', "")
-                        .parse()
-                        .map_err(|e| format!("bad --screenshot-every: {e}"))?,
-                )
+                args.screenshot_every = Some(parse_cycle(
+                    &it.next().ok_or("--screenshot-every needs a cycle count")?,
+                )?)
             }
             "--debug-ee" => {
                 args.debug_ee = Some(parse_port(it.next().ok_or("--debug-ee needs a port")?)?)
@@ -208,6 +207,8 @@ fn parse_args() -> Result<Args, String> {
                      \n\
                      With no --cycles (or with --window), opens a window; otherwise runs\n\
                      headless for the given number of EE cycles and exits.\n\
+                     Every cycle count takes digits, '_' separators or e-notation\n\
+                     (13000000000, 13_000_000_000, 13e9).\n\
                      \n\
                      --bios           BIOS image (default assets/SCPH-50000.bin)\n\
                      --cycles         EE cycles to run headlessly, then exit\n\
