@@ -23,7 +23,7 @@ impl Audio {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let config = device.default_output_config().ok()?;
-        let sample_rate = config.sample_rate().0;
+        let sample_rate = config.sample_rate();
         let channels = config.channels() as usize;
         let queue: SampleQueue = Arc::new(Mutex::new(VecDeque::new()));
         let q = queue.clone();
@@ -42,7 +42,7 @@ impl Audio {
 
         let stream = device
             .build_output_stream(
-                &config.into(),
+                config.into(),
                 move |data: &mut [f32], _| {
                     let mut q = q.lock().unwrap();
                     let mut starved = false;
