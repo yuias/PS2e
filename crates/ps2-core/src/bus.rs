@@ -158,6 +158,14 @@ pub struct Cdvd {
     /// An N command is in flight: the completion interrupt is deferred by
     /// the drive-latency model (the bus delivers it via `finish_n`).
     n_busy: bool,
+    /// A read has completed with sectors still staged, so its interrupt is
+    /// held until DMA channel 3 drains the last of them — on the drive the
+    /// completion follows the final sector out, and it cannot precede it.
+    /// Kept out of the save state: it is derivable there
+    /// ([`Bus::after_load`]) and a serialized field would cost a state
+    /// version.
+    #[serde(skip)]
+    done_after_drain: bool,
     /// Head position after the last read, for the seek-time model.
     last_lsn: u32,
     /// EE cycle at which the drive has spun up and identified the disc:
@@ -205,6 +213,7 @@ impl Cdvd {
         self.last_lsn = 0;
         self.read_buf.clear();
         self.read_pos = 0;
+        self.done_after_drain = false;
         self.disc.take()
     }
 
@@ -257,6 +266,7 @@ impl Cdvd {
                     cmd = format_args!("{cmd:#04x}"), lsn, count, "disc read");
                 self.read_buf.clear();
                 self.read_pos = 0;
+                self.done_after_drain = false;
                 // Latency: a distance-graded seek and ~4x-DVD streaming
                 // (0.4 ms/sector); the spin-up is in `CDVD_READY_AT`.
                 let seek = self.seek_time(lsn);
@@ -2804,10 +2814,24 @@ impl Bus {
         {
             self.cdvd_done_at = None;
             self.cdvd.finish_n();
-            self.iop_i_stat |= 1 << 2;
+            // The drive's "done" follows the last sector out of it, so a
+            // read still being drained must not interrupt yet: kick the
+            // channel that was armed for it and let the drain raise the
+            // line. Without an armed channel nothing would ever drain, so
+            // that case interrupts here, as it always did.
             if self.cdvd_dma_deferred && self.cdvd.read_remaining() > 0 {
                 self.cdvd_dma_deferred = false;
+                self.cdvd.done_after_drain = true;
                 self.do_cdvd_dma();
+            } else {
+                if self.cdvd.read_remaining() > 0 {
+                    // The ordering the drive cannot produce, and the one
+                    // place it is still visible.
+                    debug!(target: "ps2_core::iop::cdvd", now = self.now,
+                        remaining = self.cdvd.read_remaining(),
+                        "N-command done with no channel armed to drain it");
+                }
+                self.iop_i_stat |= 1 << 2;
             }
         }
         // Deliver due deferred DMA completion interrupts.
@@ -3741,6 +3765,11 @@ impl Bus {
             madr = format_args!("{:#x}", self.iop_dma_cdvd.madr),
             "DMA ch3");
         self.iop_dma_irq(3);
+        if self.cdvd.done_after_drain && self.cdvd.read_remaining() == 0 {
+            self.cdvd.done_after_drain = false;
+            self.iop_i_stat |= 1 << 2;
+            debug!(target: "ps2_core::iop::cdvd", now = self.now, "N-command done after drain");
+        }
     }
 
     /// Drain the SIO2 out-FIFO into RAM for DMA ch12.
@@ -4168,6 +4197,12 @@ impl Bus {
         self.iop_dirty_code_writes.clear();
         self.iop_dirty_code_pages.clear();
         self.iop_jit_flush_needed = true;
+        // A completed read with sectors still staged is exactly the held
+        // case. It over-sets in one window — a state saved after the line
+        // was raised, with the driver still draining — and that costs one
+        // extra interrupt on load, which the handler sees as an empty
+        // CDVD status.
+        self.cdvd.done_after_drain = !self.cdvd.n_busy && self.cdvd.read_remaining() > 0;
     }
 
     pub fn iop_read32(&mut self, vaddr: u32) -> u32 {
@@ -5001,6 +5036,34 @@ mod tests {
         let read = n_command(&mut b.cdvd, 0x08, 0, 1);
         assert_eq!(seek, 80 * CDVD_MS);
         assert_eq!(read, CDVD_MS / 4 + 2 * CDVD_MS / 5);
+    }
+
+    /// The drive's completion follows the last sector out of it, so a read
+    /// the DMA has only half drained must not interrupt yet: the driver
+    /// takes the interrupt for the end of the transfer, and one that
+    /// arrives early can leave it waiting for a chunk it already asked for.
+    #[test]
+    fn a_read_completes_only_once_its_last_chunk_has_drained() {
+        let mut b = bus();
+        // Two chunks of staged sectors, as a disc read leaves them.
+        b.cdvd.read_buf = vec![0xA5; 2 * ISO_SECTOR as usize];
+        b.cdvd.n_busy = true;
+        b.cdvd_done_at = Some(b.now);
+        // Channel 3 is armed for the first chunk while the drive is still
+        // working, the way cdvdman arms it before issuing the read.
+        b.iop_write32(0x1F80_10B0, 0x0010_0000);
+        b.iop_write32(0x1F80_10B4, (ISO_SECTOR as u32 / 4) | 1 << 16);
+        b.iop_write32(0x1F80_10B8, IOP_CHCR_BUSY);
+        assert!(b.cdvd_dma_deferred);
+
+        b.tick_timers();
+        assert_eq!(b.cdvd.read_remaining(), ISO_SECTOR as usize);
+        assert_eq!(b.iop_i_stat & 1 << 2, 0, "half a read is not a completed one");
+
+        // The driver kicks the rest; that chunk ends the command.
+        b.iop_write32(0x1F80_10B8, IOP_CHCR_BUSY);
+        assert_eq!(b.cdvd.read_remaining(), 0);
+        assert_ne!(b.iop_i_stat & 1 << 2, 0);
     }
 
     #[test]
