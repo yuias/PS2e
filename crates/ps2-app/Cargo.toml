@@ -28,7 +28,7 @@ serde = { version = "1", features = ["derive"] }
 rfd = "0.17"
 # Save states are ~40 MiB of mostly-zero machine state; zstd makes them
 # cheap to write without the core needing a compressor.
-zstd = "0.13"
+zstd = "0.14"
 # Already in the tree through eframe, so PNG screenshots cost no new build.
 png = "0.18"
 toml = "0.9"
