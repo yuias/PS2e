@@ -655,14 +655,14 @@ pub fn emit(ops: &mut Ops, st: &mut State, addr: u32, instr: u32, delay: bool) -
 /// A direct jump is what makes linking worth having at all — an indirect
 /// one through a cell is not predicted, and blocks here are five
 /// instructions long, so the exit is a fifth of the work.
-pub struct Exits<'a> {
-    pub jit: &'a mut super::Jit,
+#[derive(Default)]
+pub struct Exits {
     /// One per constant-target exit: (offset of the rel32 field, offset of
     /// the instruction after the jump, target pc).
     pub links: Vec<(usize, usize, u32)>,
 }
 
-impl Exits<'_> {
+impl Exits {
     /// Exit to constant `target` after `count` instructions, linking the
     /// jump to the target block once one exists. `last` is the address of
     /// the instruction that retired last.

@@ -317,7 +317,7 @@ impl Jit {
             ; cmp eax, ebp
             ; ja =>budget_exit
         );
-        let mut exits = emit::Exits { jit: self, links: Vec::new() };
+        let mut exits = emit::Exits::default();
         let mut st = emit::State::new();
         // (label, instructions retired) for interpreter calls that diverted.
         let mut interp_exits: Vec<(DynamicLabel, u32)> = Vec::new();
