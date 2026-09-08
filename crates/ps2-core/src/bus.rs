@@ -1596,6 +1596,10 @@ pub struct Bus {
     /// Unmapped addresses already reported, to keep the log readable.
     #[serde(skip)]
     warned_unmapped: HashSet<u32>,
+    /// SIO2 channels (bit 0 = ch11, bit 1 = ch12) already reported as
+    /// started with a non-canonical CHCR.
+    #[serde(skip)]
+    warned_sio2_chcr: u8,
     /// EE TLB entries (raw registers) and a 4 KiB-granular lookup cache.
     #[serde(with = "serde_big_array::BigArray")]
     ee_tlb: [(u32, u32, u32, u32); 48],
@@ -1741,6 +1745,7 @@ impl Bus {
             dma_hits: Vec::new(),
             rdram_sdevid: 0,
             warned_unmapped: HashSet::new(),
+            warned_sio2_chcr: 0,
             ee_tlb: [(0, 0, 0, 0); 48],
             tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
             code_pages: vec![false; RAM_SIZE >> 12].into_boxed_slice(),
@@ -3773,6 +3778,27 @@ impl Bus {
     }
 
     /// Drain the SIO2 out-FIFO into RAM for DMA ch12.
+    /// Warn about a SIO2 DMA started with a CHCR that is not the value the
+    /// hardware channel wants. We run it anyway, but PCSX2 refuses anything
+    /// else outright (`psxDma11`/`psxDma12`), so a driver that gets this
+    /// wrong works here and silently transfers nothing there. `sceSetSliceDMA`
+    /// builds the canonical word as `0x200 | dir | (dir == 0) << 30`, plus
+    /// the start bit.
+    fn check_sio2_chcr(&mut self, ch: u32, v: u32, canonical: u32) {
+        let bit = 1 << (ch - 11);
+        if v == canonical || self.warned_sio2_chcr & bit != 0 {
+            return;
+        }
+        self.warned_sio2_chcr |= bit;
+        warn!(
+            target: "ps2_core::iop::sio2",
+            ch,
+            chcr = format_args!("{v:#010x}"),
+            expected = format_args!("{canonical:#010x}"),
+            "SIO2 DMA started with a non-canonical CHCR; running it anyway, but PCSX2 would drop the transfer"
+        );
+    }
+
     fn do_sio2_out(&mut self) {
         let bytes = Self::iop_bcr_bytes(self.iop_dma_sio2out.bcr);
         let start = (self.iop_dma_sio2out.madr & 0x1F_FFFF) as usize;
@@ -4519,6 +4545,7 @@ impl Bus {
             0x1F80_1548 => {
                 self.iop_dma_sio2in.chcr = v & !IOP_CHCR_BUSY;
                 if v & IOP_CHCR_BUSY != 0 {
+                    self.check_sio2_chcr(11, v, 0x0100_0201);
                     let bcr = self.iop_dma_sio2in.bcr;
                     let bytes = Self::iop_bcr_bytes(bcr);
                     self.sio2.in_block = (((bcr & 0xFFFF) * 4) as usize, (bcr >> 16) as usize);
@@ -4545,6 +4572,7 @@ impl Bus {
             0x1F80_1558 => {
                 self.iop_dma_sio2out.chcr = v & !IOP_CHCR_BUSY;
                 if v & IOP_CHCR_BUSY != 0 {
+                    self.check_sio2_chcr(12, v, 0x4100_0200);
                     // The hardware channel waits on the SIO2's DRQ: if the
                     // transfer hasn't produced its response yet (the driver
                     // may arm this DMA before CTRL), hold the copy until it
@@ -5064,6 +5092,21 @@ mod tests {
         b.iop_write32(0x1F80_10B8, IOP_CHCR_BUSY);
         assert_eq!(b.cdvd.read_remaining(), 0);
         assert_ne!(b.iop_i_stat & 1 << 2, 0);
+    }
+
+    /// A non-canonical CHCR is reported but still honoured: PCSX2 drops
+    /// such a transfer, and matching that would break the drivers that get
+    /// it right today for no gain.
+    #[test]
+    fn a_sio2_dma_with_a_non_canonical_chcr_still_transfers() {
+        let mut b = bus();
+        b.iop_ram[0x1000..0x1010].copy_from_slice(&[0x5A; 16]);
+        b.iop_write32(0x1F80_1540, 0x1000);
+        b.iop_write32(0x1F80_1544, 4 | 1 << 16);
+        // What our DMACMAN wrote: the start bit without bit 30.
+        b.iop_write32(0x1F80_1548, 0x0100_0200);
+        assert_eq!(b.sio2.fifo_in.len(), 16);
+        assert_ne!(b.warned_sio2_chcr & 1, 0);
     }
 
     /// A card answers "not ready" (0x66) until the MagicGate reset, which
