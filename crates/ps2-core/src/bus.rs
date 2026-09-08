@@ -1596,6 +1596,10 @@ pub struct Bus {
     /// Unmapped addresses already reported, to keep the log readable.
     #[serde(skip)]
     warned_unmapped: HashSet<u32>,
+    /// A masked vertical blank has been reported since SMODE1 last had
+    /// SINT clear; one line per episode, not one per frame.
+    #[serde(skip)]
+    warned_vblank_sint: bool,
     /// SIO2 channels (bit 0 = ch11, bit 1 = ch12) already reported as
     /// started with a non-canonical CHCR.
     #[serde(skip)]
@@ -1745,6 +1749,7 @@ impl Bus {
             dma_hits: Vec::new(),
             rdram_sdevid: 0,
             warned_unmapped: HashSet::new(),
+            warned_vblank_sint: false,
             warned_sio2_chcr: 0,
             ee_tlb: [(0, 0, 0, 0); 48],
             tlb_cache: vec![(0u32, 0u32); 1024].into_boxed_slice(),
@@ -2733,6 +2738,10 @@ impl Bus {
         self.gs.priv_write(addr & !0x7, v);
         if addr & 0x1FF0 == 0x0010 {
             self.set_region_from_smode1(v);
+            // A later episode of masked vblank is worth its own line.
+            if v & (1 << 17) == 0 {
+                self.warned_vblank_sint = false;
+            }
         }
         self.gs_sync_int();
     }
@@ -2923,14 +2932,30 @@ impl Bus {
 
     /// Vertical blank begin/end: EE INTC bits 2/3, IOP I_STAT bits 0/11,
     /// GS CSR VSINT.
+    ///
+    /// SMODE1.SINT masks the CRTC's interrupt output, so while it is set
+    /// neither the EE nor the IOP edge is delivered — a kernel that leaves
+    /// it set after `SetGsCrt` stops every vsync-driven wait on the
+    /// machine. The GS side runs either way: the frame still composites and
+    /// CSR VSINT still latches.
     pub fn vblank(&mut self, begin: bool) {
+        let masked = self.gs.sint();
+        if masked && !self.warned_vblank_sint {
+            self.warned_vblank_sint = true;
+            warn!(
+                target: "ps2_core::gs::crtc",
+                "vertical blank delivered with SMODE1.SINT set: the EE and IOP interrupts are masked until software clears it"
+            );
+        }
         if begin {
-            self.intc_stat |= 1 << 2;
-            self.intc_changed();
-            self.iop_i_stat |= 1 << 0;
+            if !masked {
+                self.intc_stat |= 1 << 2;
+                self.intc_changed();
+                self.iop_i_stat |= 1 << 0;
+            }
             self.gs.vblank();
             self.gs_sync_int();
-        } else {
+        } else if !masked {
             self.intc_stat |= 1 << 3;
             self.intc_changed();
             self.iop_i_stat |= 1 << 11;
@@ -5092,6 +5117,31 @@ mod tests {
         b.iop_write32(0x1F80_10B8, IOP_CHCR_BUSY);
         assert_eq!(b.cdvd.read_remaining(), 0);
         assert_ne!(b.iop_i_stat & 1 << 2, 0);
+    }
+
+    /// SMODE1.SINT masks the CRTC's interrupt output. The frame still
+    /// composites and CSR VSINT still latches, but a kernel that leaves
+    /// SINT set delivers no vblank to either core — which is what makes
+    /// every vsync-driven wait in a title stop.
+    #[test]
+    fn smode1_sint_masks_the_vblank_interrupts() {
+        let mut b = bus();
+        // PRST|SINT, as SetGsCrt opens its programming sequence with.
+        b.write32(0x1200_0010, 0x4083_4504);
+        b.vblank(true);
+        b.vblank(false);
+        assert_eq!(b.intc_stat & (1 << 2 | 1 << 3), 0);
+        assert_eq!(b.iop_i_stat & (1 << 0 | 1 << 11), 0);
+        assert_ne!(b.gs.csr & 1 << 3, 0, "the GS latches VSINT regardless");
+
+        // The same sequence's closing write, SINT cleared.
+        b.write32(0x1200_0010, 0x4081_4504);
+        b.vblank(true);
+        b.vblank(false);
+        assert_ne!(b.intc_stat & 1 << 2, 0);
+        assert_ne!(b.intc_stat & 1 << 3, 0);
+        assert_ne!(b.iop_i_stat & 1 << 0, 0);
+        assert_ne!(b.iop_i_stat & 1 << 11, 0);
     }
 
     /// A non-canonical CHCR is reported but still honoured: PCSX2 drops

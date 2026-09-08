@@ -439,6 +439,14 @@ impl GsFront {
         }
     }
 
+    /// SMODE1.SINT: software has parked the CRTC's interrupt output while
+    /// it reprograms the timings. Vertical blank still happens — the frame
+    /// composites and CSR VSINT latches — but the INTC and I_STAT edges it
+    /// would deliver are suppressed until software clears the bit.
+    pub fn sint(&self) -> bool {
+        self.smode1 & (1 << 17) != 0
+    }
+
     /// Vertical sync: toggles FIELD, latches VSINT, and lets the renderer
     /// composite the frame the display shows now.
     pub fn vblank(&mut self) {
