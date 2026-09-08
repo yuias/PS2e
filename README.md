@@ -49,8 +49,9 @@ display; Help lists the current key bindings.
 
 Settings live in the side pane on the right, which has three pages behind a
 row of tabs: Settings (display scaler, aspect ratio, deinterlacer, field
-order, internal 2x rendering, master volume), Memory (a RAM viewer and the
-cheat-value scanner) and Registers (both CPUs' register files). Only the
+order, internal 2x rendering, master volume, keyboard bindings), Memory (a
+RAM viewer and the cheat-value scanner) and Registers (both CPUs'
+register files). Only the
 page on screen is fed by the emulator, so the two behind it cost nothing,
 and the whole pane can be closed from the View menu. The pane's width and
 whether it opens are remembered in `config.toml`.
@@ -85,9 +86,14 @@ title on it, so the serial stands in for one.
 A gamepad drives the same pad in parallel with the keyboard, so either can
 press any button. It is picked up automatically when one is plugged in.
 
-The pad and the save/load shortcuts are rebindable; see the `[keys]`,
-`[pad]` and `[hotkeys]` tables under [Configuration](#configuration).
-Fullscreen and screenshot are fixed.
+Settings > Input > Keyboard opens a controller diagram with a box against
+every button: click one and press a key to bind it. A key bound to two
+buttons is outlined in red, which is allowed but rarely meant. OK writes
+the bindings back and they persist with the rest of the settings.
+
+The pad and the save/load shortcuts are also rebindable by hand; see the
+`[keys]`, `[pad]` and `[hotkeys]` tables under
+[Configuration](#configuration). Fullscreen and screenshot are fixed.
 
 A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
 working directory. Headless `--screenshot` picks its encoding from the

@@ -80,10 +80,11 @@ window_height = 640.0
 # menu has the same toggle, and shows how many the file holds.
 cheats = false
 
-# Digital pad bindings. Names are the ones egui reports: letters and
-# digits as themselves ("X", "1"), arrows as "Up"/"Down"/"Left"/"Right",
-# plus "Enter", "Backspace", "Space" and "F1".."F35". Omitted buttons keep
-# the defaults shown here; an unknown name falls back with a warning.
+# Digital pad bindings. Settings > Input > Keyboard edits these from the
+# window; the names it writes are the ones egui reports: letters and digits
+# as themselves ("X", "1"), arrows as "Up"/"Down"/"Left"/"Right", plus
+# "Enter", "Backspace", "Space" and "F1".."F35". Omitted buttons keep the
+# defaults shown here; an unknown name falls back with a warning.
 #[keys]
 #up = "Up"
 #down = "Down"
@@ -245,6 +246,29 @@ impl KeyBindings {
             (&self.r3, pad::R3),
             (&self.start, pad::START),
             (&self.select, pad::SELECT),
+        ]
+    }
+
+    /// The same bindings, mutably, in [`KeyBindings::pairs`] order, so the
+    /// binding dialog can write one back by the index it drew it at.
+    pub fn fields_mut(&mut self) -> [&mut String; 16] {
+        [
+            &mut self.up,
+            &mut self.down,
+            &mut self.left,
+            &mut self.right,
+            &mut self.cross,
+            &mut self.circle,
+            &mut self.square,
+            &mut self.triangle,
+            &mut self.l1,
+            &mut self.l2,
+            &mut self.r1,
+            &mut self.r2,
+            &mut self.l3,
+            &mut self.r3,
+            &mut self.start,
+            &mut self.select,
         ]
     }
 }

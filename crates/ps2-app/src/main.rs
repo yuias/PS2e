@@ -17,6 +17,7 @@ mod config;
 mod display;
 mod emu;
 mod gamepad;
+mod keymap;
 mod pad;
 mod scan;
 mod state;
