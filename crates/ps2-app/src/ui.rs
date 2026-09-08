@@ -4,10 +4,12 @@
 //! commands, reads published snapshots and draws. Keeping it presentation-only
 //! is deliberate — a wasm frontend could reuse the same snapshot types.
 
+use crate::cheatfile;
 use crate::config::Config;
-use crate::emu::{Command, DebuggerState, Disc, Emu, MemoryView, PANEL_MEMORY, PANEL_REGS, Status};
+use crate::emu::{Command, DebuggerState, Disc, DiscInfo, Emu, MemoryView, PANEL_MEMORY, PANEL_REGS, Status};
 use crate::keymap::{self, BUTTON_NAMES};
 use crate::scan;
+use ps2_core::cheats::Group;
 use eframe::egui;
 use crate::gamepad::Gamepad;
 use std::path::PathBuf;
@@ -89,16 +91,18 @@ const COP0_EPC: usize = 14;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Settings,
+    Cheats,
     Memory,
     Registers,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::Settings, Page::Memory, Page::Registers];
+    const ALL: [Page; 4] = [Page::Settings, Page::Cheats, Page::Memory, Page::Registers];
 
     fn label(self) -> &'static str {
         match self {
             Page::Settings => "Settings",
+            Page::Cheats => "Cheats",
             Page::Memory => "Memory",
             Page::Registers => "Registers",
         }
@@ -107,7 +111,8 @@ impl Page {
     /// What the worker has to publish for this page, as `PANEL_*` bits.
     fn panels(self) -> u8 {
         match self {
-            Page::Settings => 0,
+            // The cheat list is the UI's own, so the worker owes it nothing.
+            Page::Settings | Page::Cheats => 0,
             Page::Memory => PANEL_MEMORY,
             Page::Registers => PANEL_REGS,
         }
@@ -200,7 +205,20 @@ pub struct App {
     aspect: crate::config::AspectSetting,
     deinterlace: crate::config::DeinterlaceSetting,
     swap_fields: bool,
-    cheats: bool,
+    /// Master cheat switch, mirrored into [`crate::emu::Shared::cheats`].
+    cheats_on: bool,
+    /// Cheats for the disc in the drive and the pnach they were read
+    /// from. The list is the UI's: the worker gets it through
+    /// [`Command::SetCheats`].
+    cheats: Vec<Group>,
+    cheat_file: Option<PathBuf>,
+    /// The `cheats.toml` key the current list is keyed under. It starts
+    /// as the pnach's file stem and becomes the boot serial as soon as
+    /// the worker has read one off the disc, which is a frame or two
+    /// after the disc goes in.
+    cheat_key: Option<String>,
+    cheat_store: cheatfile::Store,
+    cheats_toml: PathBuf,
     internal_2x: bool,
     /// Master volume applied on top of the SPU2 output (0..=1).
     volume: f32,
@@ -253,7 +271,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>) -> Self {
+    /// `disc` is the image `--disc` put in the drive, if any: the Cheats
+    /// page needs the pnach beside it the same way an inserted disc's does.
+    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, disc: Option<&std::path::Path>) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keys = config.keys.clone();
         let keymap = resolve_keymap(&keys);
@@ -263,13 +283,22 @@ impl App {
         let show_pane = config.pane;
         let pane_width = config.pane_width;
         let window_size = egui::vec2(config.window_width, config.window_height);
+        let cheats_toml = Config::cheats_path(config_path.as_ref());
+        let cheat_store = cheatfile::Store::load(&cheats_toml);
+        let cheat_file = disc.map(cheatfile::path_for);
+        let cheats = cheat_file.as_deref().map(cheatfile::load).unwrap_or_default();
         Self {
             emu,
             scale_mode: config.scaler,
             aspect: config.aspect,
             deinterlace: config.deinterlace,
             swap_fields: config.swap_fields,
-            cheats: config.cheats,
+            cheats_on: config.cheats,
+            cheats,
+            cheat_file,
+            cheat_key: None,
+            cheat_store,
+            cheats_toml,
             internal_2x: config.internal_2x,
             volume,
             config,
@@ -315,6 +344,122 @@ impl App {
         if let Some(disc) = self.pick_disc() {
             self.emu.send(Command::BootDisc(Some(disc)));
         }
+    }
+
+    /// Settle which `cheats.toml` entry the current disc uses. The boot
+    /// serial only arrives once the worker has read the disc, so the list
+    /// runs under the pnach's file stem for the frame or two before that,
+    /// then switches over and is re-sent.
+    fn sync_cheat_key(&mut self, disc: Option<&DiscInfo>) {
+        let (Some(path), Some(disc)) = (&self.cheat_file, disc) else { return };
+        let key = cheatfile::key(disc.serial.as_deref(), path);
+        if self.cheat_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.cheat_store.apply(&key, &mut self.cheats);
+        self.cheat_key = Some(key);
+        self.emu.send(Command::SetCheats(self.cheats.clone()));
+    }
+
+    /// Cheats page: the master switch, then one checkbox per section of the
+    /// disc's pnach.
+    fn cheats_page(&mut self, ui: &mut egui::Ui, disc: Option<&DiscInfo>) {
+        ui.checkbox(&mut self.cheats_on, "Apply cheats")
+            .on_hover_text("nothing below does anything until this is on");
+        ui.separator();
+        let (Some(path), true) = (self.cheat_file.clone(), disc.is_some()) else {
+            ui.label("No disc in the drive.");
+            return;
+        };
+        if self.cheats.is_empty() {
+            ui.label("No cheats for this disc.");
+            self.cheat_footer(ui, &path);
+            return;
+        }
+
+        // The per-cheat boxes stay usable while the master switch is off:
+        // setting a list up before switching it on is the normal order.
+        let mut changed = None;
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for cheat in &mut self.cheats {
+                let name = if cheat.name.is_empty() { "(unnamed)" } else { cheat.name.as_str() };
+                if ui.checkbox(&mut cheat.enabled, name).changed() {
+                    changed = Some((cheat.name.clone(), cheat.enabled));
+                }
+                for w in &cheat.warnings {
+                    ui.label(egui::RichText::new(format!("      skipped {w}")).weak().small());
+                }
+            }
+        });
+        if let Some((name, on)) = changed {
+            // A pnach may open the same section twice. The core switches
+            // every group of that name together, so the list has to as
+            // well, or what gets written out is half on and half off.
+            for g in self.cheats.iter_mut().filter(|g| g.name == name) {
+                g.enabled = on;
+            }
+            self.emu.send(Command::SetCheatEnabled(name, on));
+            self.save_cheat_state();
+        }
+        ui.separator();
+        self.cheat_footer(ui, &path);
+    }
+
+    fn cheat_footer(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        ui.horizontal(|ui| {
+            if ui.button("Reload").on_hover_text("re-read the pnach from disk").clicked() {
+                self.reload_cheats();
+            }
+            ui.label(egui::RichText::new(path.display().to_string()).weak().monospace());
+        });
+    }
+
+    /// Re-read the pnach and install it. This re-arms every one-shot
+    /// command, which is what a reload is for.
+    fn reload_cheats(&mut self) {
+        let Some(path) = self.cheat_file.clone() else { return };
+        self.cheats = cheatfile::load(&path);
+        if let Some(key) = &self.cheat_key {
+            self.cheat_store.apply(key, &mut self.cheats);
+        }
+        self.emu.send(Command::SetCheats(self.cheats.clone()));
+    }
+
+    fn save_cheat_state(&mut self) {
+        let Some(key) = &self.cheat_key else { return };
+        self.cheat_store.update(key, &self.cheats);
+        self.cheat_store.save(&self.cheats_toml);
+    }
+
+    /// Turn a scanner hit into a cheat that writes the value back every
+    /// frame. The section is named after the address and width, so a second
+    /// press on the same hit rewrites it with the current value rather than
+    /// stacking another section: the list has no delete, and pressing again
+    /// is what a user does when the value has moved on.
+    fn keep_value(&mut self, addr: u32, value: u64, width: u8) {
+        let Some(path) = self.cheat_file.clone() else { return };
+        let target = self.mem_target.into();
+        let name = cheatfile::scan_name(target, addr, width);
+        let span = self.cheats.iter().find(|g| g.name == name).map(|g| g.span);
+        let body = cheatfile::constant_write(&name, target, addr, value, width);
+        if let Err(e) = cheatfile::write_section(&path, span, &body) {
+            self.notify(format!("cannot write {}: {e}", path.display()), true);
+            return;
+        }
+        // Re-read rather than patch the model: the edit moved the spans of
+        // everything after it.
+        self.reload_cheats();
+        let note = match self.cheats_on {
+            true => format!("added '{name}'"),
+            // The new cheat is in the file and doing nothing, which is easy
+            // to mistake for the write having failed.
+            false => format!("added '{name}' - 'Apply cheats' is off"),
+        };
+        self.notify(note, false);
+    }
+
+    fn notify(&mut self, text: String, failed: bool) {
+        *self.emu.shared.notice.lock().unwrap() = Some((text, failed));
     }
 
     /// Video and audio settings: what the View and Audio menus used to
@@ -456,15 +601,29 @@ impl App {
             ui.label(format!("{} candidate{}", result.count, if result.count == 1 { "" } else { "s" }));
             let digits = usize::from(result.width) * 2;
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                let can_keep = self.cheat_file.is_some();
+                let mut keep = None;
                 for &(addr, value) in &result.hits {
                     let line = format!("{addr:08x}  {value:0digits$x}  {value}");
-                    if ui
-                        .add(egui::Label::new(egui::RichText::new(line).monospace()).sense(egui::Sense::click()))
-                        .on_hover_text("show in the viewer")
-                        .clicked()
-                    {
-                        self.mem_addr = format!("{:08x}", addr & !0xF);
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_keep, egui::Button::new("+").small())
+                            .on_hover_text("keep this value: adds a cheat to the disc's .pnach")
+                            .clicked()
+                        {
+                            keep = Some((addr, value));
+                        }
+                        if ui
+                            .add(egui::Label::new(egui::RichText::new(line).monospace()).sense(egui::Sense::click()))
+                            .on_hover_text("show in the viewer")
+                            .clicked()
+                        {
+                            self.mem_addr = format!("{:08x}", addr & !0xF);
+                        }
+                    });
+                }
+                if let Some((addr, value)) = keep {
+                    self.keep_value(addr, value, result.width);
                 }
                 if result.count > result.hits.len() {
                     ui.label(format!("... and {} more", result.count - result.hits.len()));
@@ -478,10 +637,18 @@ impl App {
         let path = rfd::FileDialog::new()
             .add_filter("PlayStation 2 disc image", &["iso", "img", "bin"])
             .pick_file()?;
-        match Disc::open(&path) {
+        let pnach = cheatfile::path_for(&path);
+        let cheats = cheatfile::load(&pnach);
+        match Disc::open(&path, cheats.clone()) {
             Ok(disc) => {
                 self.disc_error = None;
                 tracing::info!(path = %path.display(), "disc loaded");
+                // The disc's own list replaces whatever was showing. It stays
+                // keyed by the pnach stem until the worker reports a boot
+                // serial; `sync_cheat_key` takes it from there.
+                self.cheats = cheats;
+                self.cheat_file = Some(pnach);
+                self.cheat_key = None;
                 Some(disc)
             }
             Err(e) => {
@@ -530,7 +697,7 @@ impl Drop for App {
         cfg.aspect = self.aspect;
         cfg.deinterlace = self.deinterlace;
         cfg.swap_fields = self.swap_fields;
-        cfg.cheats = self.cheats;
+        cfg.cheats = self.cheats_on;
         cfg.internal_2x = self.internal_2x;
         cfg.pane = self.show_pane;
         cfg.pane_width = self.pane_width;
@@ -578,7 +745,7 @@ impl eframe::App for App {
             .store(self.volume.to_bits(), Ordering::Relaxed);
         self.emu.shared.deinterlace.store(self.deinterlace.index(), Ordering::Relaxed);
         self.emu.shared.swap_fields.store(self.swap_fields, Ordering::Relaxed);
-        self.emu.shared.cheats.store(self.cheats, Ordering::Relaxed);
+        self.emu.shared.cheats.store(self.cheats_on, Ordering::Relaxed);
         // The worker does the work behind a page only while that page is
         // the one showing; every other page costs nothing but this store.
         // A tab switch reaches the worker on the next frame, so the new
@@ -601,6 +768,7 @@ impl eframe::App for App {
         let status = self.emu.shared.status.lock().unwrap().clone();
         let disc = self.emu.shared.disc.lock().unwrap().clone();
         let debugger_active = self.emu.shared.debugger_active.load(Ordering::Relaxed);
+        self.sync_cheat_key(disc.as_ref());
 
         // A PS2 disc carries no printable title, so the boot serial stands in
         // for one; the file name covers images the serial cannot be read from.
@@ -715,9 +883,6 @@ impl eframe::App for App {
                                 self.insert_disc();
                                 ui.close();
                             }
-                            let count = disc.as_ref().map_or(0, |d| d.cheats);
-                            ui.add_enabled(count > 0, egui::Checkbox::new(&mut self.cheats, format!("Cheats ({count})")))
-                                .on_hover_text("apply the patches in <image>.pnach next to the disc image");
                             ui.separator();
                             let save = &self.config.hotkeys.save_state;
                             if ui.button(format!("Save state	{save}")).clicked() {
@@ -864,6 +1029,7 @@ impl eframe::App for App {
                     ui.separator();
                     match self.page {
                         Page::Settings => self.settings_page(ui),
+                        Page::Cheats => self.cheats_page(ui, disc.as_ref()),
                         Page::Memory => self.memory_page(ui),
                         Page::Registers => registers_page(ui, &status),
                     }

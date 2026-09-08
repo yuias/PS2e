@@ -80,6 +80,34 @@ pub struct Cheat {
     pub op: Op,
 }
 
+/// A named block of commands: a `[Name]` section of the file, or the run
+/// of lines before the first header. A file may open the same section
+/// name twice; each occurrence is its own group, and enabling matches by
+/// name, so the two switch together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    /// The section header, empty for the leading unnamed run.
+    pub name: String,
+    pub cheats: Vec<Cheat>,
+    /// Lines the parser rejected, each naming its line number. Kept in
+    /// the model rather than only logged, so a front-end can show what a
+    /// file lost.
+    pub warnings: Vec<String>,
+    pub enabled: bool,
+    /// 1-based inclusive line span in the source file. Rewriting one
+    /// section means replacing these lines, which leaves the comments and
+    /// metadata of a hand-written pnach elsewhere in the file alone.
+    pub span: (usize, usize),
+}
+
+impl Group {
+    /// One unnamed group holding these commands, for a caller with no
+    /// file behind it.
+    pub fn of(cheats: Vec<Cheat>) -> Group {
+        Group { name: String::new(), cheats, warnings: Vec::new(), enabled: true, span: (0, 0) }
+    }
+}
+
 /// A `patch=` line's fields, before the type is interpreted.
 struct Line {
     once: bool,
@@ -90,42 +118,96 @@ struct Line {
     number: usize,
 }
 
-/// Parse a pnach file. Every line the parser rejects becomes a warning
-/// naming its line number; the rest of the file is still used.
-pub fn parse(text: &str) -> (Vec<Cheat>, Vec<String>) {
-    let mut cheats = Vec::new();
-    let mut warnings: Vec<(usize, String)> = Vec::new();
-    let mut lines = Vec::new();
+/// Parse a pnach file into its `[Name]` sections. Every line the parser
+/// rejects becomes a warning on the section it sits in, naming its line
+/// number; the rest of the file is still used.
+pub fn parse(text: &str) -> Vec<Group> {
+    let mut groups = Vec::new();
+    let mut open = Pending::new(String::new(), 1);
     for (i, raw) in text.trim_start_matches('\u{FEFF}').lines().enumerate() {
-        let line = raw.split("//").next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with('[') {
+        let number = i + 1;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let line = trimmed.split("//").next().unwrap_or("").trim();
+        if let Some(name) = section(line) {
+            finish(&mut groups, std::mem::replace(&mut open, Pending::new(name, number)));
+            continue;
+        }
+        // A comment line inside a section still belongs to it: the span is
+        // what a rewrite replaces, and it should not orphan them.
+        open.span.1 = number;
+        if line.is_empty() {
             continue;
         }
         let Some((key, rest)) = line.split_once('=') else {
-            warnings.push((i + 1, "not a key=value line".into()));
+            open.warn.push((number, "not a key=value line".into()));
             continue;
         };
         if !key.trim().eq_ignore_ascii_case("patch") {
             // gametitle=, author=, comment=, description=, gs*=: metadata.
             continue;
         }
-        match parse_fields(rest, i + 1) {
-            Ok(l) => lines.push(l),
-            Err(e) => warnings.push((i + 1, e)),
+        match parse_fields(rest, number) {
+            Ok(l) => open.lines.push(l),
+            Err(e) => open.warn.push((number, e)),
         }
     }
-    // Extended codes may continue onto following lines, so they are
-    // assembled over the list rather than line by line.
-    let mut it = lines.into_iter();
+    finish(&mut groups, open);
+    groups
+}
+
+/// A section's header name, if this is a header line. A `[` with no
+/// closing bracket still opens a section: the parser has always skipped
+/// any line starting with one, and a truncated header is not worth a
+/// warning.
+fn section(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('[')?;
+    Some(rest.split(']').next().unwrap_or(rest).trim().to_string())
+}
+
+/// One section being read: its `patch=` lines and its rejects, held until
+/// the section ends.
+struct Pending {
+    name: String,
+    span: (usize, usize),
+    lines: Vec<Line>,
+    warn: Vec<(usize, String)>,
+}
+
+impl Pending {
+    fn new(name: String, line: usize) -> Pending {
+        Pending { name, span: (line, line), lines: Vec::new(), warn: Vec::new() }
+    }
+}
+
+/// Turn a finished section into a group. Extended codes may continue onto
+/// following lines, so commands are assembled over the section's line list
+/// rather than line by line.
+fn finish(groups: &mut Vec<Group>, mut open: Pending) {
+    let mut cheats = Vec::new();
+    let mut it = std::mem::take(&mut open.lines).into_iter();
     while let Some(l) = it.next() {
         let number = l.number;
         match parse_command(l, &mut it) {
             Ok(c) => cheats.push(c),
-            Err(e) => warnings.push((number, e)),
+            Err(e) => open.warn.push((number, e)),
         }
     }
-    warnings.sort_by_key(|w| w.0);
-    (cheats, warnings.into_iter().map(|(n, e)| format!("line {n}: {e}")).collect())
+    // An empty leading run is not a group; an empty named section is, so a
+    // header with nothing usable under it still shows up.
+    if open.name.is_empty() && cheats.is_empty() && open.warn.is_empty() {
+        return;
+    }
+    open.warn.sort_by_key(|w| w.0);
+    groups.push(Group {
+        name: open.name,
+        cheats,
+        warnings: open.warn.into_iter().map(|(n, e)| format!("line {n}: {e}")).collect(),
+        enabled: true,
+        span: open.span,
+    });
 }
 
 /// `place,cpu,address,type,data`. Note that `place` 0 is "once at
@@ -289,7 +371,15 @@ fn hex(s: &str) -> Result<u64, String> {
 /// The installed table and what has happened to it.
 #[derive(Default)]
 pub struct Table {
+    /// Every group's commands flattened in file order. A conditional's
+    /// skip count counts commands as the file writes them, so a disabled
+    /// group's commands stay in the run and are stepped over rather than
+    /// removed.
     cheats: Vec<Cheat>,
+    /// The group each command came from, as an index into `groups`.
+    owner: Vec<usize>,
+    /// Group names in file order, and whether each is switched on.
+    groups: Vec<(String, bool)>,
     /// Per command: a one-shot has fired, or a write was refused and warned.
     done: Vec<bool>,
     pub enabled: bool,
@@ -301,12 +391,28 @@ impl Table {
         self.done.fill(false);
     }
 
+    /// Commands installed, counting those of disabled groups.
     pub fn len(&self) -> usize {
         self.cheats.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.cheats.is_empty()
+    }
+
+    /// Named blocks installed, which is what a user counts as cheats.
+    pub fn groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Switch every group of this name on or off. `done` is deliberately
+    /// left alone: rebuilding the table re-arms every one-shot command,
+    /// so flipping one cheat would otherwise re-fire the start-up writes
+    /// of every other cheat that was already on.
+    pub fn set_group_enabled(&mut self, name: &str, on: bool) {
+        for g in self.groups.iter_mut().filter(|g| g.0 == name) {
+            g.1 = on;
+        }
     }
 
     /// Run the table once, in order, honouring conditional skips.
@@ -316,7 +422,7 @@ impl Table {
             let c = &self.cheats[i];
             let at = i;
             i += 1;
-            if self.done[at] {
+            if self.done[at] || !self.groups[self.owner[at]].1 {
                 continue;
             }
             let mut mem = Memory { bus, target: c.target };
@@ -436,13 +542,28 @@ fn run(m: &mut Memory, op: &Op) -> Result<usize, u32> {
 
 impl Ps2System {
     /// Install a cheat table, re-arming the one-shot entries. Nothing is
-    /// applied until the next frame boundary.
-    pub fn set_cheats(&mut self, cheats: Vec<Cheat>) {
-        if !cheats.is_empty() {
-            info!(count = cheats.len(), "cheats installed");
+    /// applied until the next frame boundary. Use
+    /// [`Ps2System::set_group_enabled`] to switch one cheat rather than
+    /// installing a filtered table, which would re-arm the rest.
+    pub fn set_cheats(&mut self, groups: Vec<Group>) {
+        let mut t = Table { enabled: self.cheats.enabled, ..Table::default() };
+        for g in groups {
+            let owner = t.groups.len();
+            t.groups.push((g.name, g.enabled));
+            t.owner.extend(std::iter::repeat_n(owner, g.cheats.len()));
+            t.cheats.extend(g.cheats);
         }
-        self.cheats.done = vec![false; cheats.len()];
-        self.cheats.cheats = cheats;
+        t.done = vec![false; t.cheats.len()];
+        if !t.cheats.is_empty() {
+            info!(groups = t.groups.len(), count = t.cheats.len(), "cheats installed");
+        }
+        self.cheats = t;
+    }
+
+    /// Switch one named cheat on or off without disturbing what the rest
+    /// of the table has already done.
+    pub fn set_group_enabled(&mut self, name: &str, on: bool) {
+        self.cheats.set_group_enabled(name, on);
     }
 
     pub fn cheats(&self) -> &Table {
@@ -488,10 +609,13 @@ mod tests {
                     patch=1,EE,203E5320,extended,00004370\r\n\
                     patch=2,EE,10300000,extended,ffff1234\r\n\
                     patch=3,EE,00400000,extended,ab\r\n";
-        let (c, w) = parse(text);
-        assert!(w.is_empty(), "{w:?}");
+        let g = parse(text);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, "Infinite Health");
+        assert!(g[0].warnings.is_empty(), "{:?}", g[0].warnings);
+        let c = &g[0].cheats;
         let write = |addr, data: &[u8], once| Cheat { target: Target::Ee, once, op: Op::Write { addr, data: data.to_vec() } };
-        assert_eq!(c, vec![
+        assert_eq!(c, &vec![
             write(0x0012_3456, &[0xCD, 0xAB, 0, 0], false),
             write(0x0010_0000, &[0x34, 0x12], true),
             Cheat { target: Target::Iop, once: false, op: Op::Write { addr: 0x1000, data: vec![0x7F] } },
@@ -522,9 +646,11 @@ mod tests {
                     patch=1,EE,70100000,extended,003000f0\n\
                     patch=1,EE,D0100000,extended,02100005\n\
                     patch=1,EE,D0100000,extended,000100ff\n";
-        let (c, w) = parse(text);
-        assert!(w.is_empty(), "{w:?}");
-        assert_eq!(c, vec![
+        let g = parse(text);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, "", "a file with no header is one unnamed group");
+        assert!(g[0].warnings.is_empty(), "{:?}", g[0].warnings);
+        assert_eq!(g[0].cheats, vec![
             ee(Op::Add { addr: 0x10_0000, width: 1, amount: -5 }),
             ee(Op::Add { addr: 0x10_0002, width: 2, amount: 0xFFFF }),
             ee(Op::Add { addr: 0x10_0004, width: 4, amount: -0x10 }),
@@ -550,7 +676,9 @@ mod tests {
                     what is this\n\
                     patch=1,EE,00100000,byte,5\n\
                     patch=1,EE,30400000,extended,00100000\n";
-        let (c, w) = parse(text);
+        let g = parse(text);
+        assert_eq!(g.len(), 1);
+        let (c, w) = (&g[0].cheats, &g[0].warnings);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].op, Op::Write { addr: 0x10_0000, data: vec![5] });
         let lines: Vec<u32> = w.iter().map(|m| m.split(&[' ', ':']).nth(1).unwrap().parse().unwrap()).collect();
@@ -565,7 +693,13 @@ mod tests {
     }
 
     fn table(cheats: Vec<Cheat>) -> Table {
-        Table { done: vec![false; cheats.len()], cheats, enabled: true }
+        Table {
+            done: vec![false; cheats.len()],
+            owner: vec![0; cheats.len()],
+            groups: vec![(String::new(), true)],
+            cheats,
+            enabled: true,
+        }
     }
 
     #[test]
@@ -612,6 +746,81 @@ mod tests {
         t.apply(&mut b);
         assert_eq!(b.read32(0x10_0010), 0x0400_0001);
         assert_eq!(b.read32(0x10_0014), 0x0000_0005);
+    }
+
+    #[test]
+    fn sections_become_groups_that_know_their_own_lines() {
+        let text = "gametitle=Some Game\n\
+                    \n\
+                    [Infinite Health]\n\
+                    // keeps hp pinned\n\
+                    patch=1,EE,00100000,word,00000063\n\
+                    \n\
+                    [All Weapons]\n\
+                    patch=1,EE,00100010,byte,ff\n\
+                    patch=1,EE,00100011,byte,ff\n";
+        let g = parse(text);
+        assert_eq!(g.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Infinite Health", "All Weapons"]);
+        assert_eq!(g[0].cheats.len(), 1);
+        assert_eq!(g[1].cheats.len(), 2);
+        // The span runs from the header through the section's last line,
+        // comments included, and stops before the next header.
+        assert_eq!(g[0].span, (3, 5));
+        assert_eq!(g[1].span, (7, 9));
+    }
+
+    #[test]
+    fn a_header_with_nothing_usable_still_appears() {
+        let g = parse("[Broken]\npatch=1,EE,zz,word,1\n");
+        assert_eq!(g.len(), 1);
+        assert!(g[0].cheats.is_empty());
+        assert_eq!(g[0].warnings.len(), 1);
+    }
+
+    /// A conditional counts commands as the file writes them, so a
+    /// disabled group in front of one must not shift what it skips.
+    #[test]
+    fn a_disabled_group_is_stepped_over_not_removed() {
+        let mut b = bus();
+        b.write32(0x10_0000, 1);
+        let mut t = Table {
+            cheats: vec![
+                ee(Op::Write { addr: 0x10_0010, data: vec![0xAA] }),
+                ee(Op::Cond { addr: 0x10_0000, width: 4, cmp: Compare::Equal, value: 0, skip: 1 }),
+                ee(Op::Write { addr: 0x10_0020, data: vec![0xBB] }),
+                ee(Op::Write { addr: 0x10_0024, data: vec![0xCC] }),
+            ],
+            owner: vec![0, 1, 1, 1],
+            groups: vec![("off".into(), true), ("on".into(), true)],
+            done: vec![false; 4],
+            enabled: true,
+        };
+        t.set_group_enabled("off", false);
+        t.apply(&mut b);
+        assert_eq!(b.peek8(0x10_0010), Some(0), "the disabled group did not write");
+        assert_eq!(b.peek8(0x10_0020), Some(0), "the condition still skipped its own command");
+        assert_eq!(b.peek8(0x10_0024), Some(0xCC));
+    }
+
+    /// Switching one cheat on must not re-arm another's start-up writes,
+    /// which is what rebuilding the table would do.
+    #[test]
+    fn toggling_a_group_leaves_the_others_fired() {
+        let mut b = bus();
+        let once = |addr| Cheat { target: Target::Ee, once: true, op: Op::Write { addr, data: vec![1] } };
+        let mut t = Table {
+            cheats: vec![once(0x10_0000), once(0x10_0004)],
+            owner: vec![0, 1],
+            groups: vec![("a".into(), true), ("b".into(), false)],
+            done: vec![false; 2],
+            enabled: true,
+        };
+        t.apply(&mut b);
+        b.poke8(0x10_0000, 0); // the game moves the value on
+        t.set_group_enabled("b", true);
+        t.apply(&mut b);
+        assert_eq!(b.peek8(0x10_0000), Some(0), "a's one-shot stayed fired");
+        assert_eq!(b.peek8(0x10_0004), Some(1));
     }
 
     #[test]

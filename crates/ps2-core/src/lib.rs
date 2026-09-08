@@ -989,14 +989,14 @@ mod state_tests {
     /// one-shot entry fires on the first frame only.
     #[test]
     fn cheats_are_applied_at_vblank() {
-        use cheats::{Cheat, Op, Target};
+        use cheats::{Cheat, Group, Op, Target};
         let write = |target, once, addr, data: &[u8]| Cheat { target, once, op: Op::Write { addr, data: data.to_vec() } };
         let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
-        sys.set_cheats(vec![
+        sys.set_cheats(vec![Group::of(vec![
             write(Target::Ee, false, 0x0010_0000, &[0x34, 0x12]),
             write(Target::Iop, false, 0x0000_2000, &[0x5A]),
             write(Target::Ee, true, 0x0010_0010, &[0x77]),
-        ]);
+        ])]);
         let frame = sys.frame_cycles();
         // Disabled: a whole frame passes and nothing is written.
         sys.run(frame);
@@ -1019,13 +1019,13 @@ mod state_tests {
     /// that is installed and never takes one out of the file.
     #[test]
     fn a_state_load_keeps_the_installed_cheats() {
-        use cheats::{Cheat, Op, Target};
+        use cheats::{Cheat, Group, Op, Target};
         let mut a = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
-        a.set_cheats(vec![Cheat {
+        a.set_cheats(vec![Group::of(vec![Cheat {
             target: Target::Ee,
             once: false,
             op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
-        }]);
+        }])]);
         a.set_cheats_enabled(true);
         let blob = a.save_state().unwrap();
         a.load_state(&blob).unwrap();
@@ -1065,13 +1065,13 @@ mod state_tests {
     /// case that proves the order.
     #[test]
     fn a_rejected_state_leaves_the_machine_whole() {
-        use cheats::{Cheat, Op, Target};
+        use cheats::{Cheat, Group, Op, Target};
         let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
-        sys.set_cheats(vec![Cheat {
+        sys.set_cheats(vec![Group::of(vec![Cheat {
             target: Target::Ee,
             once: false,
             op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
-        }]);
+        }])]);
         sys.set_cheats_enabled(true);
         sys.bus.cdvd.nvram[0] = 0x5A;
 
@@ -1098,13 +1098,13 @@ mod state_tests {
     /// one-shot cheats arm again, the renderer comes up blank.
     #[test]
     fn a_power_cycle_keeps_the_assets_and_rearms() {
-        use cheats::{Cheat, Op, Target};
+        use cheats::{Cheat, Group, Op, Target};
         let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
-        sys.set_cheats(vec![Cheat {
+        sys.set_cheats(vec![Group::of(vec![Cheat {
             target: Target::Ee,
             once: true,
             op: Op::Write { addr: 0x0010_0000, data: vec![0x34] },
-        }]);
+        }])]);
         sys.set_cheats_enabled(true);
         sys.bus.cdvd.nvram[0] = 0x5A;
         sys.bus.dma_watch.push(bus::DmaWatch { iop: false, start: 0x1000, len: 16 });

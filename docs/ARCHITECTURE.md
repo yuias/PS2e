@@ -80,7 +80,8 @@ Planned crates:
 6. **Front-end and speed** *(in progress)* — Front-end *(done)*:
    eframe/wgpu window with keyboard and gilrs gamepad input (rebindable;
    the gamepad also drives both analog sticks), menu/status bar, a tabbed
-   side pane (Settings, a memory viewer with a cheat-value scanner, both
+   side pane (Settings, a per-cheat Cheats page, a memory viewer with a
+   cheat-value scanner that can keep a hit as a cheat, both
    register files), TTY panel, save states (postcard + zstd), disc
    swapping through the drive tray, pnach cheats applied at vblank, F11
    fullscreen, BMP and PNG screenshots, window size and 720p/1080p
@@ -127,7 +128,7 @@ Planned crates:
 ps2-core/src/
 ├── lib.rs        # Ps2System: EE + IOP interleave (8:1), JIT chains to the next due event, idle skipping, save states, power cycle
 ├── bus.rs        # Both memory maps, MMIO dispatch, EE/IOP DMA, INTC/DMAC, CDVD + mechacon NVRAM, SIO2, TLB, TTY and kputs capture
-├── cheats.rs     # pnach patches applied at vblank through the debugger's poke path
+├── cheats.rs     # pnach patches, grouped by [Name] section, applied at vblank through the debugger's poke path
 ├── sif.rs        # SIF mailboxes/flags/control + SIF0/SIF1 FIFOs
 ├── timers.rs     # EE timers (lazy counts, compare interrupts)
 ├── gif.rs        # GIF tag parser (packed/reglist/image) feeding the GS

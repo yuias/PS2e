@@ -15,6 +15,17 @@ pub enum Target {
     Iop,
 }
 
+/// A scanner offset is already a pnach address: both CPUs' RAM sits at
+/// the bottom of the address space the cheat engine pokes through.
+impl From<Target> for ps2_core::cheats::Target {
+    fn from(t: Target) -> Self {
+        match t {
+            Target::Ee => ps2_core::cheats::Target::Ee,
+            Target::Iop => ps2_core::cheats::Target::Iop,
+        }
+    }
+}
+
 /// What a pass keeps. `Exact` is the only one that can start a scan
 /// without a snapshot; the others need a previous value to compare to,
 /// and a first pass with them keeps everything (`Unknown`).

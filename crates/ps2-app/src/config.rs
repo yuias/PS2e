@@ -76,8 +76,9 @@ window_height = 640.0
 # Save-state file for F5/F9. Defaults to state0.sst next to this file.
 #state = "state0.sst"
 
-# Apply the patches in <image>.pnach next to the disc image. The Emulation
-# menu has the same toggle, and shows how many the file holds.
+# Apply the patches in <image>.pnach next to the disc image. The pane's
+# Cheats page has the same switch, and lists what the file holds; which of
+# those are switched off is remembered per disc in cheats.toml.
 cheats = false
 
 # Digital pad bindings. Settings > Input > Keyboard edits these from the
@@ -526,6 +527,16 @@ impl Config {
                 .map(|d| d.join("state0.sst"))
                 .unwrap_or_else(|| PathBuf::from("state0.sst"))
         })
+    }
+
+    /// Where the per-disc list of switched-off cheats lives: cheats.toml
+    /// next to the config file. Kept out of the config itself, which is
+    /// rewritten whole on every save.
+    pub fn cheats_path(cfg_path: Option<&PathBuf>) -> PathBuf {
+        cfg_path
+            .and_then(|p| p.parent())
+            .map(|d| d.join("cheats.toml"))
+            .unwrap_or_else(|| PathBuf::from("cheats.toml"))
     }
 
     /// Memory card image location for windowed sessions: configured path,

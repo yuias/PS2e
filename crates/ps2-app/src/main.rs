@@ -13,6 +13,7 @@
 //! attaches.
 
 mod audio;
+mod cheatfile;
 mod config;
 mod display;
 mod emu;
@@ -363,7 +364,7 @@ fn main() -> ExitCode {
                     serial = sys.bus.cdvd.boot_serial().unwrap_or_default(),
                     "disc image attached"
                 );
-                cheats = emu::load_cheats(Path::new(path));
+                cheats = cheatfile::load(&cheatfile::path_for(Path::new(path)));
             }
             Err(e) => {
                 eprintln!("error: cannot open disc '{path}': {e}");
@@ -421,7 +422,7 @@ fn run_windowed(
     cfg_path: Option<PathBuf>,
     debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
-    cheats: Vec<ps2_core::cheats::Cheat>,
+    cheats: Vec<ps2_core::cheats::Group>,
 ) -> ExitCode {
     let region = sys.region();
     let options = eframe::NativeOptions {
@@ -432,7 +433,8 @@ fn run_windowed(
         ..Default::default()
     };
     let wait_debugger = args.wait_debugger;
-    let disc_name = args.disc.as_deref().map(|p| emu::disc_name(Path::new(p)));
+    let disc_path = args.disc.as_deref().map(PathBuf::from);
+    let disc_name = disc_path.as_deref().map(emu::disc_name);
     let state_path = cfg.state_path(cfg_path.as_ref());
 
     let result = eframe::run_native(
@@ -452,7 +454,7 @@ fn run_windowed(
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
             let render_state = cc.wgpu_render_state.as_ref().expect("the wgpu renderer is selected");
             display::init(render_state);
-            Ok(Box::new(ui::App::new(emu, cfg, cfg_path)))
+            Ok(Box::new(ui::App::new(emu, cfg, cfg_path, disc_path.as_deref())))
         }),
     );
     match result {
@@ -469,7 +471,7 @@ fn run_headless(
     args: &Args,
     mut debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
-    cheats: Vec<ps2_core::cheats::Cheat>,
+    cheats: Vec<ps2_core::cheats::Group>,
 ) -> ExitCode {
     let cycles = args.cycles.expect("headless mode requires --cycles");
     tracing::info!(bios = ?args.bios, cycles, "booting");

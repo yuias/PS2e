@@ -9,7 +9,7 @@
 
 use crate::audio::Audio;
 use crate::scan;
-use ps2_core::cheats::Cheat;
+use ps2_core::cheats::Group;
 use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -36,41 +36,18 @@ const TTY_CAP: usize = 64 * 1024;
 pub struct Disc {
     pub file: std::fs::File,
     pub name: String,
-    /// Cheats from the pnach file next to the image, if there is one.
-    pub cheats: Vec<Cheat>,
+    /// Cheats from the pnach file next to the image, if there is one,
+    /// already carrying whatever `cheats.toml` had switched off.
+    pub cheats: Vec<Group>,
 }
 
 impl Disc {
-    /// Open an image, labelling it with its file name and picking up
-    /// `<image>.pnach` beside it.
-    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        Ok(Self {
-            file: std::fs::File::open(path)?,
-            name: disc_name(path),
-            cheats: load_cheats(path),
-        })
+    /// Open an image, labelling it with its file name. Cheats are the
+    /// caller's to supply: reading them needs `cheats.toml`, which the UI
+    /// owns.
+    pub fn open(path: &std::path::Path, cheats: Vec<Group>) -> std::io::Result<Self> {
+        Ok(Self { file: std::fs::File::open(path)?, name: disc_name(path), cheats })
     }
-}
-
-/// Read and parse the pnach file that goes with a disc image: the image's
-/// path with its extension replaced by `pnach`. Absent is normal and
-/// silent; unreadable or partly invalid is logged.
-pub fn load_cheats(disc: &std::path::Path) -> Vec<Cheat> {
-    let path = disc.with_extension("pnach");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), "cannot read the cheat file: {e}");
-            return Vec::new();
-        }
-    };
-    let (cheats, warnings) = ps2_core::cheats::parse(&text);
-    for w in &warnings {
-        tracing::warn!(path = %path.display(), "cheat file: {w}");
-    }
-    tracing::info!(path = %path.display(), count = cheats.len(), skipped = warnings.len(), "cheat file loaded");
-    cheats
 }
 
 /// The label shown for an image: its file name, falling back to the whole
@@ -86,8 +63,6 @@ pub struct DiscInfo {
     pub name: String,
     /// Boot serial read off the disc, e.g. `SLPS-25418`.
     pub serial: Option<String>,
-    /// Cheats loaded for it; the UI's checkbox is greyed out at zero.
-    pub cheats: usize,
 }
 
 pub enum Command {
@@ -108,6 +83,13 @@ pub enum Command {
     /// One pass of the memory scanner; the result lands in
     /// [`Shared::scan`].
     Scan(scan::Request),
+    /// Install a cheat table, replacing the disc's. Rebuilding re-arms
+    /// every one-shot command, so this is for a reload or a new file --
+    /// [`Command::SetCheatEnabled`] is the way to flip one cheat.
+    SetCheats(Vec<Group>),
+    /// Switch one named cheat on or off, leaving the rest of the table
+    /// as it stands.
+    SetCheatEnabled(String, bool),
     Quit,
 }
 
@@ -264,7 +246,7 @@ pub struct WorkerConfig {
     /// Name of the image already in `sys`'s drive (from `--disc`), if any,
     /// and the cheats that came with it.
     pub disc_name: Option<String>,
-    pub cheats: Vec<Cheat>,
+    pub cheats: Vec<Group>,
     pub debugger: Option<ps2_debug::DebugServer>,
     pub wait_debugger: bool,
     /// Video timing region the machine starts in; re-applied on reset.
@@ -327,7 +309,7 @@ struct Worker {
     /// opened it is cancelled.
     removed: Option<Disc>,
     /// The cheat table of the disc in the drive, kept across power cycles.
-    cheats: Vec<Cheat>,
+    cheats: Vec<Group>,
     /// Memory scan in progress.
     scan: Option<scan::Scan>,
     /// File name of the disc in the drive; mirrors `Shared::disc` so the
@@ -379,7 +361,7 @@ impl Worker {
 
     /// Adopt a disc's cheat table. The table outlives the machine: a
     /// power cycle rebuilds `sys`, so it is pushed in again there.
-    fn install_cheats(&mut self, cheats: Vec<Cheat>) {
+    fn install_cheats(&mut self, cheats: Vec<Group>) {
         self.cheats = cheats;
         self.sys.set_cheats(self.cheats.clone());
     }
@@ -391,7 +373,6 @@ impl Worker {
         let info = name.map(|name| DiscInfo {
             name,
             serial: self.sys.bus.cdvd.boot_serial(),
-            cheats: self.cheats.len(),
         });
         *self.shared.disc.lock().unwrap() = info;
     }
@@ -524,6 +505,8 @@ impl Worker {
                 | Command::BootDisc(_)
                 | Command::SaveState
                 | Command::LoadState => {}
+                Command::SetCheats(groups) => self.install_cheats(groups),
+                Command::SetCheatEnabled(name, on) => self.sys.set_group_enabled(&name, on),
                 Command::Quit => return false,
             }
         }

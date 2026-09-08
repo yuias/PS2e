@@ -42,16 +42,17 @@ starting a disc over.
 
 The window shows the display, with a menu bar for run control and a status
 bar underneath. Emulation covers run/pause, step, reset (a power cycle; the
-disc, memory card and mechacon NVRAM stay in), the two disc commands, the
-cheat toggle, save/load state and screenshots; View toggles fullscreen, the
+disc, memory card and mechacon NVRAM stay in), the two disc commands,
+save/load state and screenshots; View toggles fullscreen, the
 side pane and the TTY console, and sizes the window to a 720p or 1080p
 display; Help lists the current key bindings.
 
-Settings live in the side pane on the right, which has three pages behind a
+Settings live in the side pane on the right, which has four pages behind a
 row of tabs: Settings (display scaler, aspect ratio, deinterlacer, field
-order, internal 2x rendering, master volume, keyboard bindings), Memory (a
-RAM viewer and the cheat-value scanner) and Registers (both CPUs'
-register files). Only the
+order, internal 2x rendering, master volume, keyboard bindings), Cheats
+(the disc's pnach, one switch per cheat -- see [docs/CHEATS.md](docs/CHEATS.md)),
+Memory (a RAM viewer and the cheat-value scanner, which can turn a hit
+into a cheat) and Registers (both CPUs' register files). Only the
 page on screen is fed by the emulator, so the two behind it cost nothing,
 and the whole pane can be closed from the View menu. The pane's width and
 whether it opens are remembered in `config.toml`.
@@ -126,6 +127,7 @@ deinterlace = "bwdif"       # weave | bob | blend | adaptive | adaptivedebug
 swap_fields = false         # flip which rows each field lands on
 internal_2x = false         # true 2x edges on 3D geometry
 cheats = false              # apply <disc>.pnach next to the disc image
+                            # (which of its cheats are off: cheats.toml)
 pane = true                 # open the side pane at startup
 pane_width = 420.0          # and the width it opens at
 window_width = 960.0        # window size at the last exit, in egui points
