@@ -6,6 +6,11 @@
 //! window is dragged to, it takes its colours from the egui theme so it is
 //! readable in light and dark alike, and the button being bound can be lit
 //! up — none of which a bitmap gives for free.
+//!
+//! The outlines below were traced off a DualShock 2 line drawing and are in
+//! its pixel coordinates, so a shape can be checked against the original by
+//! its numbers. Everything left of [`AXIS`] is mirrored to make the right
+//! half, which is why only one shoulder pad and one d-pad arm are stored.
 
 use crate::config::KeyBindings;
 use eframe::egui;
@@ -17,20 +22,68 @@ pub const BUTTON_NAMES: [&str; 16] = [
     "L3", "R3", "start", "select",
 ];
 
-/// The whole diagram is laid out in this fixed space and scaled to fit the
-/// dialog, so the layout below can be written in round numbers.
-const CANVAS: egui::Vec2 = egui::vec2(1240.0, 690.0);
+/// The controller's centre line, in drawing coordinates.
+const AXIS: f32 = 724.0;
 
-/// Where the controller drawing sits inside [`CANVAS`]. The drawing has its
-/// own 900x520 coordinate space; the margin left over is what the label
-/// boxes and their leader lines live in.
-const ORIGIN: egui::Vec2 = egui::vec2(170.0, 60.0);
+/// Left half of the body, from the notch between the grips round to the
+/// top edge. The shoulder pads were lifted out before tracing, so the
+/// outline runs along their edge and disappears under them.
+const BODY_HALF: [(f32, f32); 38] = [
+    (724.0, 712.0), (664.0, 712.0), (641.0, 751.0), (615.0, 777.0),
+    (584.0, 795.0), (544.0, 806.0), (500.0, 806.0), (462.0, 796.0),
+    (427.0, 776.0), (396.0, 744.0), (288.0, 949.0), (265.0, 976.0),
+    (226.0, 1001.0), (183.0, 1014.0), (144.0, 1015.0), (122.0, 1011.0),
+    (97.0, 1002.0), (62.0, 980.0), (36.0, 950.0), (20.0, 914.0),
+    (12.0, 874.0), (11.0, 825.0), (65.0, 415.0), (74.0, 371.0),
+    (83.0, 345.0), (113.0, 291.0), (151.0, 252.0), (155.0, 249.0),
+    (164.0, 258.0), (192.0, 243.0), (229.0, 231.0), (276.0, 225.0),
+    (327.0, 230.0), (364.0, 242.0), (407.0, 267.0), (422.0, 252.0),
+    (448.0, 245.0), (724.0, 245.0),
+];
+
+const L2_PAD: [(f32, f32); 15] = [
+    (299.0, 60.0), (358.0, 67.0), (366.0, 71.0), (383.0, 88.0),
+    (389.0, 119.0), (389.0, 137.0), (374.0, 153.0), (334.0, 147.0),
+    (279.0, 146.0), (232.0, 151.0), (202.0, 159.0), (188.0, 145.0),
+    (202.0, 93.0), (219.0, 75.0), (249.0, 65.0),
+];
+
+const L1_PAD: [(f32, f32); 20] = [
+    (276.0, 134.0), (344.0, 136.0), (367.0, 140.0), (384.0, 148.0),
+    (406.0, 173.0), (421.0, 252.0), (406.0, 266.0), (384.0, 251.0),
+    (342.0, 233.0), (310.0, 226.0), (276.0, 224.0), (251.0, 226.0),
+    (214.0, 234.0), (185.0, 245.0), (164.0, 257.0), (150.0, 240.0),
+    (169.0, 173.0), (190.0, 152.0), (200.0, 147.0), (231.0, 139.0),
+];
+
+/// The "up" d-pad arm, relative to [`DPAD`]. The other three are this one
+/// turned a quarter, a half and three quarters.
+const DPAD_ARM: [(f32, f32); 9] = [
+    (-28.0, -110.0), (29.0, -110.0), (37.0, -102.0), (37.0, -57.0),
+    (6.0, -27.0), (-2.0, -26.0), (-8.0, -28.0), (-37.0, -58.0),
+    (-37.0, -101.0),
+];
+
+/// Centres of the d-pad and of the button ring around it. The face side
+/// mirrors both.
+const DPAD: (f32, f32) = (274.0, 432.0);
+/// Ring radii: the raised collar and the recess inside it.
+const RING: (f32, f32) = (206.0, 185.0);
+/// Analog stick centre, and the radii of its three circles.
+const STICK: (f32, f32) = (521.0, 640.0);
+const STICK_R: [f32; 3] = [141.0, 102.0, 87.0];
+
+/// The whole diagram is laid out in this fixed space and scaled to fit the
+/// dialog. The drawing occupies 1448x1086 of it at [`ORIGIN`]; the margin
+/// left over is what the label boxes and their leader lines live in.
+const CANVAS: egui::Vec2 = egui::vec2(2048.0, 1240.0);
+const ORIGIN: egui::Vec2 = egui::vec2(300.0, 50.0);
 
 /// Label box size, in canvas units.
-const BOX: egui::Vec2 = egui::vec2(140.0, 30.0);
+const BOX: egui::Vec2 = egui::vec2(250.0, 54.0);
 
 /// Line weight of the drawing, in canvas units.
-const LINE: f32 = 3.0;
+const LINE: f32 = 6.0;
 
 /// Maps canvas coordinates onto the screen rect the dialog handed us.
 #[derive(Clone, Copy)]
@@ -66,52 +119,72 @@ impl View {
     }
 }
 
-/// A cubic path in the drawing's coordinates, flattened as it is built.
-struct Path {
-    view: View,
-    points: Vec<egui::Pos2>,
-    cur: (f32, f32),
+/// Fill a polygon by fanning triangles out from its centroid. egui's own
+/// path fill assumes a convex outline, and the shoulder pads are not one:
+/// their lower edge curves up around the button ring.
+fn fill_poly(p: &egui::Painter, pts: &[egui::Pos2], color: egui::Color32) {
+    if pts.len() < 3 {
+        return;
+    }
+    let centre = pts.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / pts.len() as f32;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(centre.to_pos2(), color);
+    for &pt in pts {
+        mesh.colored_vertex(pt, color);
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    p.add(egui::Shape::mesh(mesh));
 }
 
-impl Path {
-    fn new(view: View, x: f32, y: f32) -> Self {
-        Self { view, points: vec![view.art(x, y)], cur: (x, y) }
-    }
-
-    fn line(&mut self, x: f32, y: f32) {
-        self.cur = (x, y);
-        self.points.push(self.view.art(x, y));
-    }
-
-    /// Twelve segments per curve: smooth at every size this dialog is drawn
-    /// at, and it keeps the whole body outline under 200 points.
-    fn cubic(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        const STEPS: usize = 12;
-        let (x0, y0) = self.cur;
-        for i in 1..=STEPS {
-            let t = i as f32 / STEPS as f32;
-            let u = 1.0 - t;
-            let bx = u * u * u * x0 + 3.0 * u * u * t * x1 + 3.0 * u * t * t * x2 + t * t * t * x;
-            let by = u * u * u * y0 + 3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t * y;
-            self.points.push(self.view.art(bx, by));
-        }
-        self.cur = (x, y);
+/// A quarter turn clockwise about the origin, `turns` times. Screen
+/// coordinates run y down, so that is (x, y) -> (-y, x).
+fn turn(turns: u8, x: f32, y: f32) -> (f32, f32) {
+    match turns % 4 {
+        1 => (-y, x),
+        2 => (-x, -y),
+        3 => (y, -x),
+        _ => (x, y),
     }
 }
 
 /// The outline of a pressable part, in the drawing's coordinates.
 #[derive(Clone, Copy)]
 enum Art {
+    /// A traced outline; `true` mirrors it about [`AXIS`].
+    Poly(&'static [(f32, f32)], bool),
+    Circle { x: f32, y: f32, r: f32 },
     /// `x`/`y` is the top-left corner, as in the source drawing.
     Rect { x: f32, y: f32, w: f32, h: f32, r: f32 },
-    Circle { x: f32, y: f32, r: f32 },
     Tri([(f32, f32); 3]),
-    /// The shoulder buttons: a rectangle with the two top corners rounded
-    /// off, drawn as an explicit path because the shape is asymmetric.
-    Shoulder { x: f32, y: f32, w: f32, h: f32 },
+    /// One of the d-pad arms: [`DPAD_ARM`] turned this many quarter turns
+    /// clockwise from "up".
+    Arm(u8),
 }
 
 impl Art {
+    /// The outline as screen points, for everything but the two shapes egui
+    /// draws better itself.
+    fn points(self, view: View) -> Vec<egui::Pos2> {
+        match self {
+            Art::Poly(pts, mirror) => pts
+                .iter()
+                .map(|&(x, y)| view.art(if mirror { 2.0 * AXIS - x } else { x }, y))
+                .collect(),
+            Art::Tri(pts) => pts.iter().map(|&(x, y)| view.art(x, y)).collect(),
+            Art::Arm(turns) => DPAD_ARM
+                .iter()
+                .map(|&(x, y)| {
+                    let (dx, dy) = turn(turns, x, y);
+                    view.art(DPAD.0 + dx, DPAD.1 + dy)
+                })
+                .collect(),
+            Art::Circle { .. } | Art::Rect { .. } => Vec::new(),
+        }
+    }
+
     fn paint(self, p: &egui::Painter, view: View, fill: egui::Color32, stroke: egui::Stroke) {
         match self {
             Art::Rect { x, y, w, h, r } => {
@@ -123,23 +196,20 @@ impl Art {
             Art::Circle { x, y, r } => {
                 p.circle(view.art(x, y), view.len(r), fill, stroke);
             }
-            Art::Tri(pts) => {
-                let pts: Vec<_> = pts.iter().map(|&(x, y)| view.art(x, y)).collect();
-                p.add(egui::Shape::convex_polygon(pts, fill, stroke));
+            _ => {
+                let pts = self.points(view);
+                fill_poly(p, &pts, fill);
+                p.add(egui::Shape::closed_line(pts, stroke));
             }
-            Art::Shoulder { x, y, w, h } => {
-                // The corners round off over the top half, then the sides
-                // splay out to the bottom edge.
-                let (mid, bottom) = (y + h * 0.53, y + h);
-                let mut path = Path::new(view, x + 44.0, y);
-                path.line(x + w - 44.0, y);
-                path.cubic(x + w - 24.0, y, x + w - 8.0, y + h * 0.24, x + w - 6.0, mid);
-                path.line(x + w, bottom);
-                path.line(x, bottom);
-                path.line(x + 6.0, mid);
-                path.cubic(x + 8.0, y + h * 0.24, x + 24.0, y, x + 44.0, y);
-                p.add(egui::Shape::convex_polygon(path.points, fill, stroke));
-            }
+        }
+    }
+
+    /// Where a mark printed on this shape goes.
+    fn centre(self) -> (f32, f32) {
+        match self {
+            Art::Circle { x, y, .. } => (x, y),
+            Art::Rect { x, y, w, h, .. } => (x + w / 2.0, y + h / 2.0),
+            _ => (0.0, 0.0),
         }
     }
 }
@@ -148,16 +218,48 @@ impl Art {
 #[derive(Clone, Copy)]
 enum Mark {
     None,
-    /// Text inside the button (the shoulder buttons).
-    Inside(&'static str),
+    /// A caption at a fixed point in the drawing (the shoulder pads).
+    Text(&'static str, (f32, f32)),
+    /// Centred on the button, for the four face buttons.
     Triangle,
     Circle,
     Cross,
     Square,
 }
 
+impl Mark {
+    fn paint(self, p: &egui::Painter, view: View, art: Art, ink: egui::Color32) {
+        let (cx, cy) = art.centre();
+        let thin = view.stroke(LINE - 1.0, ink);
+        match self {
+            Mark::None => {}
+            Mark::Text(text, (x, y)) => {
+                let font = egui::FontId::proportional(view.len(42.0));
+                p.text(view.art(x, y), egui::Align2::CENTER_CENTER, text, font, ink);
+            }
+            Mark::Triangle => {
+                let pts = [(cx, cy - 26.0), (cx + 23.0, cy + 20.0), (cx - 23.0, cy + 20.0)];
+                let pts: Vec<_> = pts.iter().map(|&(x, y)| view.art(x, y)).collect();
+                p.add(egui::Shape::closed_line(pts, thin));
+            }
+            Mark::Circle => {
+                p.circle_stroke(view.art(cx, cy), view.len(26.0), thin);
+            }
+            Mark::Cross => {
+                p.line_segment([view.art(cx - 20.0, cy - 20.0), view.art(cx + 20.0, cy + 20.0)], thin);
+                p.line_segment([view.art(cx + 20.0, cy - 20.0), view.art(cx - 20.0, cy + 20.0)], thin);
+            }
+            Mark::Square => {
+                let rect =
+                    egui::Rect::from_min_max(view.art(cx - 20.0, cy - 20.0), view.art(cx + 20.0, cy + 20.0));
+                p.rect_stroke(rect, egui::CornerRadius::ZERO, thin, egui::StrokeKind::Middle);
+            }
+        }
+    }
+}
+
 /// How a leader line leaves its label box: horizontal first, or vertical
-/// first. Either way it turns exactly once before reaching the button.
+/// first. Either way it turns once before reaching the button.
 #[derive(Clone, Copy)]
 enum Route {
     Horizontal,
@@ -176,11 +278,11 @@ struct Slot {
     label: (f32, f32),
     route: Route,
     /// Canvas coordinate the leader turns at. `None` turns level with the
-    /// anchor, which is what all but two of them can do; the rest would take
-    /// the corner through another button.
+    /// anchor, which is what all but one of them can do; that one would take
+    /// the corner through the analog stick.
     elbow: Option<f32>,
-    /// Drawn before the two rings, the way the shoulders sit behind them on
-    /// the controller. Everything else goes on top.
+    /// Drawn before the two rings, the way the shoulder pads sit behind them
+    /// on the controller. Everything else goes on top.
     behind: bool,
 }
 
@@ -204,36 +306,31 @@ const fn behind(s: Slot) -> Slot {
 }
 
 /// The layout. Anchors sit on the edge of the button the line comes in
-/// from, so every leader turns at most once and none of them ends inside
-/// the shape it points at.
+/// from, so no leader ends inside the shape it points at.
 const SLOTS: [Slot; 16] = [
     // D-pad, labelled down the left margin.
-    slot(0, Art::Rect { x: 180.0, y: 160.0, w: 50.0, h: 62.0, r: 10.0 }, Mark::None, (180.0, 191.0), (85.0, 240.0), Route::Horizontal),
-    slot(1, Art::Rect { x: 180.0, y: 238.0, w: 50.0, h: 62.0, r: 10.0 }, Mark::None, (180.0, 269.0), (85.0, 345.0), Route::Horizontal),
-    slot(2, Art::Rect { x: 132.0, y: 208.0, w: 62.0, h: 50.0, r: 10.0 }, Mark::None, (132.0, 233.0), (85.0, 293.0), Route::Horizontal),
-    // Turning level with the anchor would put the corner in the left stick.
-    elbow(slot(3, Art::Rect { x: 216.0, y: 208.0, w: 62.0, h: 50.0, r: 10.0 }, Mark::None, (247.0, 258.0), (85.0, 400.0), Route::Horizontal), 410.0),
-    // Face buttons, labelled down the right margin. Every leader comes in on
-    // the side facing the margin, so none of them ends inside its button.
-    slot(4, Art::Circle { x: 695.0, y: 295.0, r: 33.0 }, Mark::Cross, (728.0, 295.0), (1155.0, 355.0), Route::Horizontal),
-    slot(5, Art::Circle { x: 760.0, y: 230.0, r: 33.0 }, Mark::Circle, (793.0, 230.0), (1155.0, 290.0), Route::Horizontal),
-    // Square is the far side of the cluster: its leader turns in the gap
-    // between the right stick and cross.
-    elbow(slot(6, Art::Circle { x: 630.0, y: 230.0, r: 33.0 }, Mark::Square, (663.0, 230.0), (1155.0, 400.0), Route::Horizontal), 827.0),
-    slot(7, Art::Circle { x: 695.0, y: 165.0, r: 33.0 }, Mark::Triangle, (728.0, 165.0), (1155.0, 232.0), Route::Horizontal),
-    // Shoulders: L1/R1 continue the side columns, L2/R2 go along the top.
-    // They stop at y=130, which keeps L1 off the d-pad and R1 off triangle
-    // while still meeting the body's top edge at y=120.
-    behind(slot(8, Art::Shoulder { x: 106.0, y: 68.0, w: 192.0, h: 62.0 }, Mark::Inside("L1"), (106.0, 130.0), (85.0, 190.0), Route::Horizontal)),
-    behind(slot(9, Art::Rect { x: 142.0, y: 20.0, w: 120.0, h: 50.0, r: 24.0 }, Mark::Inside("L2"), (202.0, 20.0), (372.0, 30.0), Route::Vertical)),
-    behind(slot(10, Art::Shoulder { x: 602.0, y: 68.0, w: 192.0, h: 62.0 }, Mark::Inside("R1"), (794.0, 130.0), (1155.0, 190.0), Route::Horizontal)),
-    behind(slot(11, Art::Rect { x: 638.0, y: 20.0, w: 120.0, h: 50.0, r: 24.0 }, Mark::Inside("R2"), (698.0, 20.0), (868.0, 30.0), Route::Vertical)),
-    // Stick clicks, below the sticks they belong to.
-    slot(12, Art::Circle { x: 315.0, y: 350.0, r: 66.0 }, Mark::None, (315.0, 416.0), (380.0, 640.0), Route::Vertical),
-    slot(13, Art::Circle { x: 585.0, y: 350.0, r: 66.0 }, Mark::None, (585.0, 416.0), (860.0, 640.0), Route::Vertical),
-    // Start and select reach up from the top margin, between the shoulders.
-    slot(14, Art::Tri([(500.0, 192.0), (550.0, 207.0), (500.0, 222.0)]), Mark::None, (525.0, 192.0), (720.0, 30.0), Route::Vertical),
-    slot(15, Art::Rect { x: 335.0, y: 188.0, w: 54.0, h: 30.0, r: 6.0 }, Mark::None, (362.0, 188.0), (545.0, 30.0), Route::Vertical),
+    slot(0, Art::Arm(0), Mark::None, (237.0, 364.0), (150.0, 350.0), Route::Horizontal),
+    slot(1, Art::Arm(2), Mark::None, (274.0, 542.0), (150.0, 560.0), Route::Horizontal),
+    slot(2, Art::Arm(3), Mark::None, (164.0, 432.0), (150.0, 440.0), Route::Horizontal),
+    slot(3, Art::Arm(1), Mark::None, (342.0, 469.0), (150.0, 660.0), Route::Horizontal),
+    // Face buttons, labelled down the right margin. Square is the far side
+    // of the cluster: its leader turns in the gap between the stick and
+    // cross rather than level with the button.
+    slot(4, Art::Circle { x: 1175.0, y: 535.0, r: 51.0 }, Mark::Cross, (1226.0, 535.0), (1898.0, 560.0), Route::Horizontal),
+    slot(5, Art::Circle { x: 1281.0, y: 432.0, r: 51.0 }, Mark::Circle, (1332.0, 432.0), (1898.0, 440.0), Route::Horizontal),
+    elbow(slot(6, Art::Circle { x: 1069.0, y: 432.0, r: 51.0 }, Mark::Square, (1069.0, 483.0), (1898.0, 660.0), Route::Horizontal), 1372.0),
+    slot(7, Art::Circle { x: 1175.0, y: 329.0, r: 51.0 }, Mark::Triangle, (1226.0, 329.0), (1898.0, 350.0), Route::Horizontal),
+    // Shoulder pads. L1/R1 continue the side columns, L2/R2 go along the top.
+    behind(slot(8, Art::Poly(&L1_PAD, false), Mark::Text("L1", (285.0, 197.0)), (150.0, 240.0), (150.0, 260.0), Route::Horizontal)),
+    behind(slot(9, Art::Poly(&L2_PAD, false), Mark::Text("L2", (288.0, 107.0)), (290.0, 60.0), (590.0, 45.0), Route::Vertical)),
+    behind(slot(10, Art::Poly(&L1_PAD, true), Mark::Text("R1", (1163.0, 197.0)), (1298.0, 240.0), (1898.0, 260.0), Route::Horizontal)),
+    behind(slot(11, Art::Poly(&L2_PAD, true), Mark::Text("R2", (1160.0, 107.0)), (1158.0, 60.0), (1458.0, 45.0), Route::Vertical)),
+    // Stick clicks, reached from below through the gap between the grips.
+    slot(12, Art::Circle { x: STICK.0, y: STICK.1, r: STICK_R[0] }, Mark::None, (STICK.0, 781.0), (730.0, 1160.0), Route::Vertical),
+    slot(13, Art::Circle { x: 2.0 * AXIS - STICK.0, y: STICK.1, r: STICK_R[0] }, Mark::None, (2.0 * AXIS - STICK.0, 781.0), (1318.0, 1160.0), Route::Vertical),
+    // Start and select reach down from the top margin, between the pads.
+    slot(14, Art::Tri([(812.0, 380.0), (892.0, 406.0), (812.0, 433.0)]), Mark::None, (812.0, 380.0), (1120.0, 45.0), Route::Vertical),
+    slot(15, Art::Rect { x: 553.0, y: 388.0, w: 81.0, h: 40.0, r: 12.0 }, Mark::None, (593.0, 388.0), (860.0, 45.0), Route::Vertical),
 ];
 
 /// The dialog's own state: the bindings being edited, and which button is
@@ -336,10 +433,10 @@ impl Binder {
         let visuals = ui.visuals().clone();
         let ink = visuals.strong_text_color();
         let line = view.stroke(LINE, ink);
-        let leader = view.stroke(LINE - 1.0, visuals.weak_text_color());
+        let leader = view.stroke(LINE - 2.0, visuals.weak_text_color());
 
         let painter = ui.painter_at(rect);
-        chassis(&painter, view, line, &visuals);
+        body(&painter, view, line);
 
         // Leader lines before the buttons, so a button's fill covers the end
         // of the line rather than the line running across the button.
@@ -350,21 +447,25 @@ impl Binder {
         let paint = |behind: bool| {
             for slot in SLOTS.iter().filter(|s| s.behind == behind) {
                 let armed = self.armed == Some(slot.idx);
-                let fill = if armed { visuals.selection.bg_fill } else { visuals.extreme_bg_color };
+                // Only an armed button is filled. The drawing's shapes are
+                // meant to cross each other -- the ring and the stick do --
+                // so an opaque fill would rub out the arc underneath.
+                let fill =
+                    if armed { visuals.selection.bg_fill } else { egui::Color32::TRANSPARENT };
                 slot.art.paint(&painter, view, fill, line);
                 slot.mark.paint(&painter, view, slot.art, ink);
             }
         };
-        // The rings cross the shoulders and the face buttons sit inside the
-        // right one, so the order is shoulders, rings, then everything else.
+        // The rings cross the shoulder pads and the face buttons sit inside
+        // the right one, so the order is pads, rings, then everything else.
         paint(true);
-        for x in [205.0, 695.0] {
-            painter.circle_stroke(view.art(x, 230.0), view.len(120.0), line);
+        for x in [DPAD.0, 2.0 * AXIS - DPAD.0] {
+            for r in [RING.0, RING.1] {
+                painter.circle_stroke(view.art(x, 433.0), view.len(r), line);
+            }
         }
         paint(false);
-        for x in [315.0, 585.0] {
-            painter.circle_stroke(view.art(x, 350.0), view.len(44.0), line);
-        }
+        chassis(&painter, view, line);
 
         let duplicates = self.duplicates();
         for slot in &SLOTS {
@@ -447,84 +548,41 @@ fn leader_points(view: View, slot: &Slot) -> Vec<egui::Pos2> {
     }
 }
 
-/// Everything on the drawing that is not a bindable button: the body, the
-/// two rings, and the parts this emulator has no binding for.
-fn chassis(p: &egui::Painter, view: View, line: egui::Stroke, visuals: &egui::Visuals) {
-    let mut body = Path::new(view, 185.0, 120.0);
-    body.cubic(145.0, 120.0, 110.0, 142.0, 92.0, 176.0);
-    body.line(55.0, 355.0);
-    body.cubic(47.0, 392.0, 55.0, 430.0, 77.0, 458.0);
-    body.cubic(95.0, 481.0, 121.0, 490.0, 144.0, 488.0);
-    body.cubic(170.0, 485.0, 189.0, 465.0, 203.0, 437.0);
-    body.line(243.0, 360.0);
-    body.cubic(250.0, 348.0, 262.0, 340.0, 276.0, 340.0);
-    body.line(624.0, 340.0);
-    body.cubic(638.0, 340.0, 650.0, 348.0, 657.0, 360.0);
-    body.line(697.0, 437.0);
-    body.cubic(711.0, 465.0, 730.0, 485.0, 756.0, 488.0);
-    body.cubic(779.0, 490.0, 805.0, 481.0, 823.0, 458.0);
-    body.cubic(845.0, 430.0, 853.0, 392.0, 845.0, 355.0);
-    body.line(808.0, 176.0);
-    body.cubic(790.0, 142.0, 755.0, 120.0, 715.0, 120.0);
-    body.line(562.0, 120.0);
-    body.cubic(549.0, 120.0, 538.0, 114.0, 530.0, 105.0);
-    body.cubic(507.0, 79.0, 468.0, 63.0, 450.0, 63.0);
-    body.cubic(432.0, 63.0, 393.0, 79.0, 370.0, 105.0);
-    body.cubic(362.0, 114.0, 351.0, 120.0, 338.0, 120.0);
-    p.add(egui::Shape::closed_line(body.points, line));
-
-    let mut bridge = Path::new(view, 287.0, 340.0);
-    bridge.cubic(315.0, 314.0, 356.0, 302.0, 450.0, 302.0);
-    bridge.cubic(544.0, 302.0, 585.0, 314.0, 613.0, 340.0);
-    p.add(egui::Shape::line(bridge.points, line));
-
-    // The analog toggle: drawn because the controller has one, not bound
-    // because this frontend has no analog/digital switch to bind it to.
-    Art::Rect { x: 427.0, y: 272.0, w: 46.0, h: 24.0, r: 6.0 }
-        .paint(p, view, visuals.extreme_bg_color, line);
-
-    let font = egui::FontId::proportional(view.len(18.0));
-    for (x, text) in [(362.0, "SELECT"), (525.0, "START")] {
-        p.text(view.art(x, 248.0), egui::Align2::CENTER_CENTER, text, font.clone(), line.color);
-    }
-    // A line lower than the other two, which it would otherwise crowd.
-    let small = egui::FontId::proportional(view.len(15.0));
-    p.text(view.art(450.0, 260.0), egui::Align2::CENTER_CENTER, "ANALOG", small, line.color);
+/// The body silhouette: the traced half plus its mirror image.
+fn body(p: &egui::Painter, view: View, line: egui::Stroke) {
+    let mut pts: Vec<_> = BODY_HALF.iter().map(|&(x, y)| view.art(x, y)).collect();
+    pts.extend(BODY_HALF.iter().rev().map(|&(x, y)| view.art(2.0 * AXIS - x, y)));
+    p.add(egui::Shape::closed_line(pts, line));
 }
 
-impl Mark {
-    fn paint(self, p: &egui::Painter, view: View, art: Art, ink: egui::Color32) {
-        let (cx, cy) = match art {
-            Art::Circle { x, y, .. } => (x, y),
-            Art::Rect { x, y, w, h, .. } => (x + w / 2.0, y + h / 2.0),
-            Art::Shoulder { x, y, w, h } => (x + w / 2.0, y + h * 0.40),
-            Art::Tri(_) => return,
-        };
-        let thin = view.stroke(LINE - 0.5, ink);
-        match self {
-            Mark::None => {}
-            Mark::Inside(text) => {
-                let font = egui::FontId::proportional(view.len(26.0));
-                p.text(view.art(cx, cy), egui::Align2::CENTER_CENTER, text, font, ink);
-            }
-            Mark::Triangle => {
-                let pts = [(cx, cy - 20.0), (cx + 17.0, cy + 13.0), (cx - 17.0, cy + 13.0)];
-                let pts: Vec<_> = pts.iter().map(|&(x, y)| view.art(x, y)).collect();
-                p.add(egui::Shape::closed_line(pts, thin));
-            }
-            Mark::Circle => {
-                p.circle_stroke(view.art(cx, cy), view.len(16.0), thin);
-            }
-            Mark::Cross => {
-                p.line_segment([view.art(cx - 14.0, cy - 14.0), view.art(cx + 14.0, cy + 14.0)], thin);
-                p.line_segment([view.art(cx + 14.0, cy - 14.0), view.art(cx - 14.0, cy + 14.0)], thin);
-            }
-            Mark::Square => {
-                let rect =
-                    egui::Rect::from_min_max(view.art(cx - 16.0, cy - 16.0), view.art(cx + 16.0, cy + 16.0));
-                p.rect_stroke(rect, egui::CornerRadius::ZERO, thin, egui::StrokeKind::Middle);
-            }
+/// Everything the dialog draws but does not bind: the stick recesses and
+/// the bar between them, the d-pad's direction arrows, the analog toggle
+/// and the three printed captions.
+fn chassis(p: &egui::Painter, view: View, line: egui::Stroke) {
+    for x in [STICK.0, 2.0 * AXIS - STICK.0] {
+        for r in &STICK_R[1..] {
+            p.circle_stroke(view.art(x, 637.0), view.len(*r), line);
         }
+    }
+    for (x, y, w, h) in [(664.0, 664.0, 120.0, 48.0), (693.0, 536.0, 62.0, 35.0)] {
+        Art::Rect { x, y, w, h, r: 10.0 }.paint(p, view, egui::Color32::TRANSPARENT, line);
+    }
+
+    // The solid arrowheads printed outside each d-pad arm.
+    for turns in 0..4u8 {
+        let pts: Vec<_> = [(0.0f32, -152.0f32), (13.0, -131.0), (-13.0, -131.0)]
+            .iter()
+            .map(|&(x, y)| {
+                let (dx, dy) = turn(turns, x, y);
+                view.art(DPAD.0 + dx, DPAD.1 + dy)
+            })
+            .collect();
+        p.add(egui::Shape::convex_polygon(pts, line.color, egui::Stroke::NONE));
+    }
+
+    let font = egui::FontId::proportional(view.len(29.0));
+    for (x, y, text) in [(593.0, 456.0, "SELECT"), (855.0, 458.0, "START"), (724.0, 511.0, "ANALOG")] {
+        p.text(view.art(x, y), egui::Align2::CENTER_CENTER, text, font.clone(), line.color);
     }
 }
 
@@ -563,6 +621,39 @@ mod tests {
         }
         for (i, (name, _)) in keys.pairs().iter().enumerate() {
             assert_eq!(*name, format!("probe{i}"));
+        }
+    }
+
+    /// The four d-pad arms are one traced shape turned about the pad's
+    /// centre, so they have to come out the same size and evenly spread.
+    #[test]
+    fn the_dpad_arms_are_quarter_turns_of_one_shape() {
+        let view = View { origin: egui::Pos2::ZERO, scale: 1.0 };
+        let centre = view.art(DPAD.0, DPAD.1);
+        let radii = |turns| {
+            let mut r: Vec<i32> = Art::Arm(turns)
+                .points(view)
+                .iter()
+                .map(|p| (*p - centre).length().round() as i32)
+                .collect();
+            r.sort();
+            r
+        };
+        // Same shape every time...
+        for turns in 1..4u8 {
+            assert_eq!(radii(turns), radii(0), "arm {turns} is not arm 0 turned");
+        }
+        // ...pointing a different way each time.
+        let mut aim: Vec<i32> = (0..4)
+            .map(|t| {
+                let pts = Art::Arm(t).points(view);
+                let v = pts.iter().fold(egui::Vec2::ZERO, |a, p| a + (*p - centre)) / pts.len() as f32;
+                (v.y.atan2(v.x).to_degrees().round() as i32 + 360) % 360
+            })
+            .collect();
+        aim.sort();
+        for pair in aim.windows(2) {
+            assert_eq!(pair[1] - pair[0], 90, "arms aim at {aim:?}");
         }
     }
 }
