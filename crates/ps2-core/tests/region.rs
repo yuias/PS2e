@@ -76,6 +76,10 @@ const SMODE1_NTSC: u64 = 0x0000_0007_4083_4504;
 const SMODE1_PAL: u64 = 0x0000_0007_4083_6504;
 /// One of the progressive modes: CMOD 0, no composite encoder.
 const SMODE1_VESA: u64 = 0x0014_020c_3080_1e04;
+/// Both mode values above carry SINT, which parks the CRTC's interrupt
+/// output for the length of the programming sequence; the kernel's last
+/// write clears it. A test that waits for a vblank has to clear it too.
+const SMODE1_SINT: u64 = 1 << 17;
 
 #[test]
 fn smode1_selects_the_region() {
@@ -103,6 +107,9 @@ fn a_switch_to_a_shorter_frame_keeps_the_vblanks_coming() {
     sys.bus.intc_stat &= !(1 << 2);
     sys.bus.write64(0xB200_0010, SMODE1_NTSC);
     assert_eq!(sys.region(), Region::Ntsc);
+    // Finish the sequence the way the kernel does: until SINT is clear the
+    // edge this waits for is masked, and the wrap under test is invisible.
+    sys.bus.write64(0xB200_0010, SMODE1_NTSC & !SMODE1_SINT);
 
     let started = sys.cycles;
     while sys.bus.intc_stat & (1 << 2) == 0 {
