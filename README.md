@@ -3,8 +3,8 @@
 A PlayStation 2 emulator written in Rust. Software-rasterized GS with the
 hardware VRAM layout, x86-64 recompilers for the EE, IOP and VU1, an IPU
 that decodes MPEG-2 video, SPU2 with reverb and AutoDMA streaming, CDVD with
-drive timing and mechacon NVRAM, memory cards, and an LLDB-compatible remote
-debugger on both cores.
+drive timing and mechacon NVRAM, memory cards, an LLDB-compatible remote
+debugger on both cores, and a lockstep automation interface.
 
 A PlayStation 2 BIOS image (4 MiB, e.g. SCPH-50000) is required and not
 included.
@@ -17,7 +17,8 @@ Requires a recent stable Rust toolchain.
 cargo build --release
 ```
 
-Produces `ps2e` in `target/release/`.
+Produces `ps2e` (emulator) and `ps2ctl` (automation client) in
+`target/release/`.
 
 ## Run
 
@@ -234,6 +235,54 @@ which are polled per instruction and so catch DMA writes too; read and
 access watchpoints are not. EE registers are 64-bit on the wire (mips64el);
 the IOP is the PS1-style 32-bit layout. Disassembly requires an LLVM build
 that includes the Mips target.
+
+## Automation (scripting / LLM)
+
+```
+ps2e --control-port 9002 [--disc <image>] [--load-state <path>]
+```
+
+The emulator runs in lockstep: it advances only when commanded, so every
+observation is deterministic and an operator can look at the result of one
+step before choosing the next. `ps2ctl` sends one command per invocation
+over TCP:
+
+```
+ps2ctl run 20s                # advance (frames by default; s/c suffixes)
+ps2ctl run to 158e9           # advance to an absolute EE cycle
+ps2ctl press circle 30        # hold buttons for 30 frames, then release
+ps2ctl input set up           # hold until changed; applied during run
+ps2ctl input clear            # release everything held
+ps2ctl frame shot.png         # dump the display, .png or .bmp
+ps2ctl vram v.bin             # dump the raw 4 MiB of GS VRAM
+ps2ctl peek 00100000 64       # hex dump EE memory (side-effect-free)
+ps2ctl peek iop 00010000 16   # the IOP's bus view instead
+ps2ctl poke 00100000 deadbeef # write RAM
+ps2ctl disc open              # open the tray, keeping the disc in it
+ps2ctl disc close game.iso    # close it on a new image (or bare: the old one)
+ps2ctl tty                    # kernel/IOP TTY since the last call
+ps2ctl cheat list             # pnach sections, and the master switch
+ps2ctl cheat apply on         # nothing applies until this is on
+ps2ctl cheat on 0             # toggle one section (in memory only)
+ps2ctl savestate s.st         # snapshot; loadstate restores it
+ps2ctl state                  # pcs, cycle, frame, held buttons, tray
+ps2ctl quit
+```
+
+`ps2ctl help` lists the full command set.
+
+A typical loop: `press`/`run` → `frame`/`peek`/`tty` → decide → repeat, with
+`savestate`/`loadstate` for branching exploration. The control port and the
+debugger can be active simultaneously; execution commands are refused while
+a debugger is attached.
+
+This is a separate mode from the `--cycles` batch run, not a modifier on it:
+a scripted `--press circle@150e9` and a client deciding when to press cannot
+both own the machine, so the batch-only flags are refused alongside
+`--control-port`. The cycle counts are the same ones the batch flags take,
+so a number read off `state` goes straight into a `--press` or
+`--save-state` recipe. A press still lands on the same frame either way, so
+a sequence worked out here reproduces as a batch run.
 
 ## Limitations
 

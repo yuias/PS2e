@@ -21,7 +21,7 @@ reimplementation project (`PS2BiosRebuild`).
 | Crate       | Role                                                                  |
 | ----------- | --------------------------------------------------------------------- |
 | `ps2-core`  | Platform-independent emulator core. No windowing, graphics API or I/O dependencies; wasm-safe. |
-| `ps2-app`   | Native front-end (the `ps2e` binary): headless CLI for bring-up (`--cycles`, screenshots, `--press` scripting, `--watch`, dumps, save states) and an eframe/wgpu window with keyboard and gilrs gamepad input, cpal audio and a TOML config (default without `--cycles`, forced with `--window`). |
+| `ps2-app`   | Native front-end (the `ps2e` binary): headless CLI for bring-up (`--cycles`, screenshots, `--press` scripting, `--watch`, dumps, save states), a lockstep automation port driven by the `ps2ctl` client (`--control-port`), and an eframe/wgpu window with keyboard and gilrs gamepad input, cpal audio and a TOML config (default without `--cycles` or `--control-port`, forced with `--window`). |
 | `ps2-debug` | gdb-remote debug stub (LLDB first-class), EE and IOP targets on separate TCP ports. `--debug-ee <port>` / `--debug-iop <port>`; `--wait-debugger` holds at the reset vector until attach. |
 
 Planned crates:

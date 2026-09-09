@@ -8,13 +8,18 @@
 //! audio buffer, and the UI is a thin client over published snapshots (see
 //! [`emu`]).
 //!
-//! `--debug-ee`/`--debug-iop` open LLDB/GDB gdb-remote stubs in both modes;
-//! `--wait-debugger` additionally holds execution at reset until a debugger
-//! attaches.
+//! `--control-port` is the third mode: the machine advances only when a
+//! command over that port says so, which is the interactive counterpart to
+//! `--cycles` scripting (see [`control`]).
+//!
+//! `--debug-ee`/`--debug-iop` open LLDB/GDB gdb-remote stubs in all three
+//! modes; `--wait-debugger` additionally holds execution at reset until a
+//! debugger attaches.
 
 mod audio;
 mod cheatfile;
 mod config;
+mod control;
 mod display;
 mod emu;
 mod gamepad;
@@ -78,6 +83,8 @@ struct Args {
     load_state: Option<String>,
     /// Write the SPU2 output (48 kHz stereo) as a WAV file (headless only).
     wav: Option<String>,
+    /// Lockstep control port for interactive automation (see [`control`]).
+    control_port: Option<u16>,
 }
 
 /// Default hold length for a scripted press, in EE cycles (~0.5 s).
@@ -149,6 +156,7 @@ fn parse_args() -> Result<Args, String> {
         save_state: None,
         load_state: None,
         wav: None,
+        control_port: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -203,6 +211,10 @@ fn parse_args() -> Result<Args, String> {
                 args.load_state = Some(it.next().ok_or("--load-state needs a path")?)
             }
             "--wav" => args.wav = Some(it.next().ok_or("--wav needs a path")?),
+            "--control-port" => {
+                args.control_port =
+                    Some(parse_port(it.next().ok_or("--control-port needs a port")?)?)
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: ps2e [--bios <path>] [--cycles <n>] [--window] [--log <filter>]\n\
@@ -232,13 +244,15 @@ fn parse_args() -> Result<Args, String> {
                      \x20                (circle, cross, up, down, start, ...; repeatable)\n\
                      --memcard        card image to load/persist (created if missing)\n\
                      --disc           disc image (2048-byte-sector ISO), streamed\n\
-                     --cheats         apply <disc>.pnach next to the image (headless;\n\
-                     \x20                the window has an Emulation menu checkbox)\n\
+                     --cheats         apply <disc>.pnach next to the image (headless and\n\
+                     \x20                --control-port; the window has a checkbox instead)\n\
                      --insert         open the drive and close it on a new image,\n\
                      \x20                <path>@<cycle> (headless)\n\
                      --save-state     write a save state, <path>@<cycle> (headless)\n\
                      --load-state     start from a save state, not the reset vector\n\
-                     --wav            write the SPU2 output as a 48 kHz stereo WAV (headless)"
+                     --wav            write the SPU2 output as a 48 kHz stereo WAV (headless)\n\
+                     --control-port   lockstep automation port; the machine advances only\n\
+                     \x20                on a command (drive it with ps2ctl; excludes --cycles)"
                 );
                 std::process::exit(0);
             }
@@ -258,6 +272,30 @@ fn parse_args() -> Result<Args, String> {
     }
     if let Some(dir) = &args.dump {
         std::fs::create_dir_all(dir).map_err(|e| format!("--dump: cannot create '{dir}': {e}"))?;
+    }
+    // Lockstep control is a third mode beside the window and the budgeted
+    // batch run, not a modifier on either. Everything that decides in
+    // advance what the run does has a control command instead, and letting
+    // a flag fire underneath a client would break the lockstep the mode
+    // exists for -- so these are rejected rather than quietly ignored.
+    if args.control_port.is_some() {
+        let batch_only = [
+            ("--cycles", args.cycles.is_some()),
+            ("--window", args.window),
+            ("--dump", args.dump.is_some()),
+            ("--screenshot", args.screenshot.is_some()),
+            ("--screenshot-every", args.screenshot_every.is_some()),
+            ("--watch", !args.watches.is_empty()),
+            ("--press", !args.presses.is_empty()),
+            ("--insert", args.insert.is_some()),
+            ("--save-state", args.save_state.is_some()),
+            ("--wav", args.wav.is_some()),
+        ];
+        if let Some((flag, _)) = batch_only.iter().find(|(_, given)| *given) {
+            return Err(format!(
+                "--control-port and {flag} are exclusive; the control port has a command for it"
+            ));
+        }
     }
     Ok(args)
 }
@@ -303,7 +341,7 @@ fn main() -> ExitCode {
         .init();
 
     let (cfg, cfg_path) = config::Config::load();
-    let windowed = args.window || args.cycles.is_none();
+    let windowed = args.window || (args.cycles.is_none() && args.control_port.is_none());
 
     let bios_path = args
         .bios
@@ -410,10 +448,86 @@ fn main() -> ExitCode {
 
     if windowed {
         run_windowed(sys, args, cfg, cfg_path, debugger, memcard_path, cheats)
+    } else if let Some(port) = args.control_port {
+        run_control(sys, &args, port, debugger, memcard_path, cheats)
     } else {
         run_headless(sys, &args, debugger, memcard_path, cheats)
     }
 }
+
+/// Lockstep automation: the machine advances only when a control command
+/// says so, so an operator can look at the result of one step before
+/// choosing the next. See [`control`].
+fn run_control(
+    mut sys: Ps2System,
+    args: &Args,
+    port: u16,
+    mut debugger: Option<ps2_debug::DebugServer>,
+    memcard_path: Option<PathBuf>,
+    cheats: Vec<ps2_core::cheats::Group>,
+) -> ExitCode {
+    let mut ctl = match control::ControlServer::bind(port) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot bind control port {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.internal_2x {
+        sys.bus.gs.set_internal_2x(true);
+    }
+    if let Some(disc) = &args.disc {
+        ctl.controller.set_cheats(cheatfile::path_for(Path::new(disc)), cheats);
+    }
+    // The list is installed either way; `--cheats` only decides whether the
+    // master switch starts on, the way `cheat apply` moves it later.
+    ctl.controller.install_cheats(&mut sys, args.cheats);
+    tracing::info!(port = ctl.port(), "lockstep control mode; drive it with ps2ctl");
+
+    let stdout = std::io::stdout();
+    loop {
+        if let Some(dbg) = &mut debugger {
+            dbg.pump(&mut sys, CONTROL_DEBUG_SLICE);
+        }
+        // Resolved after the pump, not before: a client that attaches on
+        // this iteration owns execution from here, or the control port
+        // would let one `run` through underneath it.
+        let debugger_owns = debugger.as_ref().is_some_and(|d| d.attached());
+        if !ctl.pump(&mut sys, debugger_owns) {
+            break;
+        }
+        // What a control command produced is already in the buffer `tty`
+        // reads; anything left came out of the debugger's own execution,
+        // which no command would ever collect.
+        if debugger.is_some() {
+            flush_tty(&stdout, &mut sys);
+        }
+        // Nothing to do between commands; a spin here would burn a core for
+        // the whole session, which can be hours of an operator thinking. A
+        // debugger that is running is the exception: sleeping between its
+        // slices would throttle it to a few million cycles a second.
+        let running = debugger.as_ref().is_some_and(|d| d.attached() && !d.halted());
+        if !running {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    if let Some(path) = &memcard_path
+        && sys.bus.sio2.memcard.dirty
+    {
+        if let Err(e) = std::fs::write(path, &sys.bus.sio2.memcard.data) {
+            eprintln!("error: memcard save failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        tracing::info!(path = %path.display(), "memory card image saved");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Cycles a debugger may execute per control-loop iteration while it owns
+/// the machine. Same order as the headless slice, so an LLDB session
+/// behaves the same in either mode.
+const CONTROL_DEBUG_SLICE: u64 = 1_000_000;
 
 fn run_windowed(
     sys: Ps2System,

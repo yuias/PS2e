@@ -10,6 +10,13 @@ description = "Native front-end for ps2-core: headless CLI plus an eframe/wgpu w
 name = "ps2e"
 path = "src/main.rs"
 
+# Control-port client. Declared rather than auto-discovered so it inherits
+# nothing from the `ps2e` target: it is a bare TCP client and links none of
+# the emulator, the window or the audio stack.
+[[bin]]
+name = "ps2ctl"
+path = "src/bin/ps2ctl.rs"
+
 [dependencies]
 ps2-core = { path = "../ps2-core", features = ["threads", "jit"] }
 ps2-debug = { path = "../ps2-debug" }
