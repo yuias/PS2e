@@ -558,7 +558,7 @@ impl Gs {
         // 32-bit pixel with a colour format and `mirror_upload_rect` cannot
         // duplicate them, so with an overlay in play they keep the per-word
         // path, which writes the overlay as it goes.
-        let mirrorable = !matches!(dpsm, PSMT8H | PSMT4HL | PSMT4HH) || self.raster.overlay.is_none();
+        let mirrorable = !matches!(dpsm, PSMT8H | PSMT4HL | PSMT4HH) || !self.raster.internal_2x();
         let handled = matches!(
             dpsm,
             PSMCT32
@@ -712,10 +712,10 @@ impl Gs {
         self.trx_y = y;
         // Mirror the rows this run touched into the overlay (full width:
         // duplicating from local memory is always safe).
-        if self.raster.overlay.is_some() {
+        if self.raster.internal_2x() {
             let y_last = if x > 0 { y } else { y.wrapping_sub(1) }.min(rrh - 1);
             if y_last != u32::MAX && y_last >= y_first {
-                self.mirror_upload_rect(dbp, dbw, dpsm, dsax, dsay + y_first, rrw, y_last - y_first + 1);
+                self.raster.mirror_upload_rect(&self.canvas, dbp, dbw, dpsm, dsax, dsay + y_first, rrw, y_last - y_first + 1);
             }
         }
     }
@@ -753,11 +753,7 @@ impl Gs {
                 let px = (data >> (i * bits)) as u32 & (((1u64 << bits) - 1) as u32);
                 let (x, y) = (dsax + gs.trx_x, dsay + gs.trx_y);
                 write(&gs.canvas, dbp, dbw, x, y, px);
-                if let Some(ov) = &gs.raster.overlay {
-                    for d in 0..4u32 {
-                        write(ov, dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
-                    }
-                }
+                gs.raster.mirror_pixel(dbp, dbw, x, y, |cv, bp, bw, x, y| write(cv, bp, bw, x, y, px));
                 gs.trx_x += 1;
                 if gs.trx_x >= rrw {
                     gs.trx_x = 0;
@@ -802,11 +798,7 @@ impl Gs {
                         | u32::from(self.trx24[2]) << 16;
                     let (x, y) = (dsax + self.trx_x, dsay + self.trx_y);
                     self.write_psmct32(dbp, dbw, x, y, px);
-                    if let Some(ov) = &self.raster.overlay {
-                        for d in 0..4u32 {
-                            ov.write_psmct32(dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
-                        }
-                    }
+                    self.raster.mirror_pixel(dbp, dbw, x, y, |cv, bp, bw, x, y| cv.write_psmct32(bp, bw, x, y, px));
                     self.trx_x += 1;
                     if self.trx_x >= rrw {
                         self.trx_x = 0;
@@ -939,7 +931,7 @@ impl Gs {
                 }
             }
         }
-        self.mirror_upload_rect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        self.raster.mirror_upload_rect(&self.canvas, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
 
     // --- VRAM accessors (see `Canvas`) -----------------------------------
@@ -960,55 +952,15 @@ impl Gs {
     /// Turn the internal-2x overlay on or off. It starts black and fills
     /// in as buffers are redrawn or uploaded (typically within a frame).
     pub fn set_internal_2x(&mut self, on: bool) {
-        if on == self.raster.overlay.is_some() {
+        if on == self.raster.internal_2x() {
             return;
         }
         self.flush_batch();
-        self.raster.overlay = on.then(|| Canvas::with_size(4 * VRAM_SIZE));
+        self.raster.set_internal_2x(on);
     }
 
     pub fn internal_2x(&self) -> bool {
-        self.raster.overlay.is_some()
-    }
-
-    /// Mirror a just-written rect of local memory into the overlay as 2x2
-    /// duplicates (IMAGE uploads and local copies; `psm` names the
-    /// destination format).
-    fn mirror_upload_rect(&self, bp: u32, bw: u32, psm: u32, x0: u32, y0: u32, w: u32, h: u32) {
-        let Some(ov) = &self.raster.overlay else { return };
-        let (bp2, bw2) = (bp * 4, bw * 2);
-        for y in y0..y0 + h {
-            for x in x0..x0 + w {
-                let dup = |f: &dyn Fn(u32, u32)| {
-                    for d in 0..4u32 {
-                        f(2 * x + (d & 1), 2 * y + (d >> 1));
-                    }
-                };
-                match psm {
-                    PSMCT32 | PSMCT24 => {
-                        let v = self.canvas.read_psmct32(bp, bw, x, y);
-                        dup(&|xx, yy| ov.write_psmct32(bp2, bw2, xx, yy, v));
-                    }
-                    PSMZ32 | PSMZ24 => {
-                        let v = self.canvas.read_psmz32(bp, bw, x, y);
-                        dup(&|xx, yy| ov.write_psmz32(bp2, bw2, xx, yy, v));
-                    }
-                    PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
-                        let v = self.canvas.read_psmct16(bp, bw, x, y, psm);
-                        dup(&|xx, yy| ov.write_psmct16(bp2, bw2, xx, yy, psm, v));
-                    }
-                    PSMT8 => {
-                        let v = self.canvas.read_psmt8(bp, bw, x, y);
-                        dup(&|xx, yy| ov.write_psmt8(bp2, bw2, xx, yy, v));
-                    }
-                    PSMT4 => {
-                        let v = self.canvas.read_psmt4(bp, bw, x, y);
-                        dup(&|xx, yy| ov.write_psmt4(bp2, bw2, xx, yy, v));
-                    }
-                    _ => return,
-                }
-            }
-        }
+        self.raster.internal_2x()
     }
 
     #[inline]
@@ -1498,10 +1450,7 @@ impl Gs {
     /// The canvas scanout reads and the display scale it implies: the
     /// overlay at 2x when present, else local memory at 1x.
     fn scanout(&self) -> (&Canvas, u32) {
-        match &self.raster.overlay {
-            Some(ov) => (ov, 2),
-            None => (&self.canvas, 1),
-        }
+        self.raster.scanout(&self.canvas)
     }
 
     /// Read one displayed line (`sy` in buffer lines, already scaled) as

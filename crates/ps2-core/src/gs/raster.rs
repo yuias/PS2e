@@ -75,7 +75,7 @@ pub(super) struct SoftRaster {
     /// duplicates, and scanout reads it instead of local memory. Local
     /// memory stays the source of truth for everything the emulated
     /// software can observe.
-    pub(super) overlay: Option<Canvas>,
+    overlay: Option<Canvas>,
     /// Scratch for the GS thread and for the worker-pool bands (empty
     /// pool = never split).
     #[serde(skip)]
@@ -660,6 +660,77 @@ impl Gs {
 }
 
 impl SoftRaster {
+    pub(super) fn internal_2x(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Allocate or drop the overlay. A new one starts black and fills in
+    /// as buffers are redrawn or uploaded; the queue must already be empty.
+    pub(super) fn set_internal_2x(&mut self, on: bool) {
+        self.overlay = on.then(|| Canvas::with_size(4 * VRAM_SIZE));
+    }
+
+    /// The buffer scanout reads and its scale: the overlay at 2x when it
+    /// is on, else local memory.
+    pub(super) fn scanout<'a>(&'a self, canvas: &'a Canvas) -> (&'a Canvas, u32) {
+        match &self.overlay {
+            Some(ov) => (ov, 2),
+            None => (canvas, 1),
+        }
+    }
+
+    /// Repeat a transfer's write of pixel `(x, y)` as its 2x2 duplicate in
+    /// the overlay. `write` is the writer that landed it in local memory,
+    /// taking `(buffer, bp, bw, x, y)`.
+    #[inline]
+    pub(super) fn mirror_pixel(&self, bp: u32, bw: u32, x: u32, y: u32, write: impl Fn(&Canvas, u32, u32, u32, u32)) {
+        if let Some(ov) = &self.overlay {
+            for d in 0..4u32 {
+                write(ov, bp * 4, bw * 2, 2 * x + (d & 1), 2 * y + (d >> 1));
+            }
+        }
+    }
+
+    /// Mirror a just-written rect of local memory into the overlay as 2x2
+    /// duplicates (IMAGE uploads and local copies; `psm` names the
+    /// destination format).
+    pub(super) fn mirror_upload_rect(&self, canvas: &Canvas, bp: u32, bw: u32, psm: u32, x0: u32, y0: u32, w: u32, h: u32) {
+        let Some(ov) = &self.overlay else { return };
+        let (bp2, bw2) = (bp * 4, bw * 2);
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let dup = |f: &dyn Fn(u32, u32)| {
+                    for d in 0..4u32 {
+                        f(2 * x + (d & 1), 2 * y + (d >> 1));
+                    }
+                };
+                match psm {
+                    PSMCT32 | PSMCT24 => {
+                        let v = canvas.read_psmct32(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmct32(bp2, bw2, xx, yy, v));
+                    }
+                    PSMZ32 | PSMZ24 => {
+                        let v = canvas.read_psmz32(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmz32(bp2, bw2, xx, yy, v));
+                    }
+                    PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => {
+                        let v = canvas.read_psmct16(bp, bw, x, y, psm);
+                        dup(&|xx, yy| ov.write_psmct16(bp2, bw2, xx, yy, psm, v));
+                    }
+                    PSMT8 => {
+                        let v = canvas.read_psmt8(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmt8(bp2, bw2, xx, yy, v));
+                    }
+                    PSMT4 => {
+                        let v = canvas.read_psmt4(bp, bw, x, y);
+                        dup(&|xx, yy| ov.write_psmt4(bp2, bw2, xx, yy, v));
+                    }
+                    _ => return,
+                }
+            }
+        }
+    }
+
     /// Draw a point under `env`. Points are rare: it is shaded in place,
     /// after the queue, so it keeps its order with it.
     fn draw_point(&mut self, host: &mut Host, env: DrawEnv, v: Vertex) {
