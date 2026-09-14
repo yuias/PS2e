@@ -810,13 +810,14 @@ impl Gs {
     fn scaled_pipe(&self, pipe: &PixelPipe) -> Option<PixelPipe> {
         self.overlay.as_ref()?;
         let mut p = pipe.clone();
-        p.scx0 *= 2;
-        p.scy0 *= 2;
-        p.scx1 = p.scx1 * 2 + 1;
-        p.scy1 = p.scy1 * 2 + 1;
-        p.fbp *= 4;
-        p.zbp *= 4;
-        p.fbw *= 2;
+        let e = &mut p.env;
+        e.scx0 *= 2;
+        e.scy0 *= 2;
+        e.scx1 = e.scx1 * 2 + 1;
+        e.scy1 = e.scy1 * 2 + 1;
+        e.fbp *= 4;
+        e.zbp *= 4;
+        e.fbw *= 2;
         Some(p)
     }
 
@@ -975,18 +976,30 @@ impl Gs {
         (level, if level == 0 { mmag } else { matches!(mmin, 1 | 4 | 5) })
     }
 
+    /// This rasterizer's pipe for the current drawing environment: the
+    /// palette block, and the loop selection the row code reads.
+    fn pixel_pipe(&mut self) -> PixelPipe {
+        let env = self.draw_env();
+        let clut_off = if env.tme && env.tex.clut_bits != 0 { self.refresh_clut(&env.tex) } else { 0 };
+        let z_touched = env.zte && !(env.ztst == 1 && env.zmsk);
+        // Fogging is only implemented on the generic per-pixel path.
+        let fast = env.tme && env.tfx == 0 && env.fbmsk == 0 && !env.fge;
+        let fast_decal = env.tme && env.tfx == 1 && env.fbmsk == 0 && !env.fge;
+        // Z may be written (ALWAYS) but never tested; the alpha test on a
+        // flat colour is decided once per row by the loop itself.
+        let flat_fill = !env.tme && (!z_touched || env.ztst == 1) && env.fbmsk == 0 && !env.fge;
+        PixelPipe { env, z_touched, clut_off, fast, fast_decal, flat_fill }
+    }
+
     /// Decode the drawing environment for the current context once per
     /// primitive; the per-pixel path only reads it.
-    fn pixel_pipe(&mut self) -> PixelPipe {
+    fn draw_env(&self) -> DrawEnv {
         let attrs = self.attrs();
         let ctx = self.ctx[((attrs >> 9) & 1) as usize];
         let test = ctx.test;
         let (level, bilinear) = Self::mip_select(&ctx);
         let tex = TexInfo::new(&ctx, self.texa, level);
-        let clut_off =
-            if attrs & (1 << 4) != 0 && tex.clut_bits != 0 { self.refresh_clut(&tex) } else { 0 };
-
-        let mut pipe = PixelPipe {
+        DrawEnv {
             kind: (self.prim & 7) as u8,
             scx0: (ctx.scissor & 0x7FF) as i32,
             scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
@@ -1027,26 +1040,7 @@ impl Gs {
             blend_c: ((ctx.alpha >> 4) & 3) as u8,
             blend_d: ((ctx.alpha >> 6) & 3) as u8,
             blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
-            z_touched: false,
-            clut_off,
-            fast: false,
-            fast_decal: false,
-            flat_fill: false,
-        };
-        let z_touched = pipe.zte && !(pipe.ztst == 1 && pipe.zmsk);
-        pipe.z_touched = z_touched;
-        pipe.fast = pipe.tme && pipe.tfx == 0 && pipe.fbmsk == 0;
-        pipe.fast_decal = pipe.tme && pipe.tfx == 1 && pipe.fbmsk == 0;
-        // Z may be written (ALWAYS) but never tested; the alpha test on a
-        // flat colour is decided once per row by the loop itself.
-        pipe.flat_fill = !pipe.tme && (!z_touched || pipe.ztst == 1) && pipe.fbmsk == 0;
-        if pipe.fge {
-            // Fogging is only implemented on the generic per-pixel path.
-            pipe.fast = false;
-            pipe.fast_decal = false;
-            pipe.flat_fill = false;
         }
-        pipe
     }
 
     /// A TEX0/TEX2 write: record the CLUT load its CLD asks for.
@@ -2459,7 +2453,7 @@ struct Row {
     z_base: usize,
 }
 
-impl PixelPipe {
+impl DrawEnv {
     /// Histogram key for the profile report: kind (3 bits), tme, bilinear,
     /// abe, texture psm (6), tfx (2), ate, Z read, Z write, frame mask,
     /// 24-bit frame, neutral vertex colour.
@@ -2745,9 +2739,43 @@ impl Modulate {
     }
 }
 
-/// Drawing environment decoded once per primitive (see `pixel_pipe`).
+/// A primitive's drawing environment as this rasterizer runs it: the
+/// register decode plus what the row loops derive from it once. Reads of
+/// the register fields go through `Deref`, so the loops need not care
+/// which half a field lives in.
 #[derive(Clone)]
 struct PixelPipe {
+    env: DrawEnv,
+    /// The Z buffer is read or written per pixel (ZTE with a real test,
+    /// or unmasked writes).
+    z_touched: bool,
+    /// Offset of this primitive's palette block in [`ClutPool`].
+    clut_off: u32,
+    /// Textured MODULATE drawing without a frame mask: eligible for the
+    /// specialised row loops (`Painter::fast_sprite_row`,
+    /// `Painter::fast_tri_row`).
+    fast: bool,
+    /// As `fast`, but the texture function is DECAL: the texel replaces the
+    /// vertex colour instead of scaling it. Sprites only — the triangle
+    /// loops still take MODULATE alone.
+    fast_decal: bool,
+    /// Untextured sprite with a constant colour per row (blended or not)
+    /// and no Z test: `Painter::flat_sprite_row`.
+    flat_fill: bool,
+}
+
+impl std::ops::Deref for PixelPipe {
+    type Target = DrawEnv;
+    #[inline(always)]
+    fn deref(&self) -> &DrawEnv {
+        &self.env
+    }
+}
+
+/// Drawing environment decoded from the registers once per primitive (see
+/// `Gs::draw_env`), independent of how it is rasterized.
+#[derive(Clone)]
+struct DrawEnv {
     /// Primitive kind being drawn (PRIM bits 0-2), for the pixel histogram.
     #[cfg_attr(not(feature = "profile"), allow(dead_code))]
     kind: u8,
@@ -2787,22 +2815,6 @@ struct PixelPipe {
     blend_c: u8,
     blend_d: u8,
     blend_fix: u32,
-    /// The Z buffer is read or written per pixel (ZTE with a real test,
-    /// or unmasked writes).
-    z_touched: bool,
-    /// Textured MODULATE drawing without a frame mask: eligible for the
-    /// specialised row loops (`Painter::fast_sprite_row`,
-    /// `Painter::fast_tri_row`).
-    /// Offset of this primitive's palette block in [`ClutPool`].
-    clut_off: u32,
-    fast: bool,
-    /// As `fast`, but the texture function is DECAL: the texel replaces the
-    /// vertex colour instead of scaling it. Sprites only — the triangle
-    /// loops still take MODULATE alone.
-    fast_decal: bool,
-    /// Untextured sprite with a constant colour per row (blended or not)
-    /// and no Z test: `Painter::flat_sprite_row`.
-    flat_fill: bool,
 }
 
 /// TEX0/CLAMP fields decoded once per primitive.
