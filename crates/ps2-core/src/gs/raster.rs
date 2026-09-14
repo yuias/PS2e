@@ -40,10 +40,8 @@ struct Frag {
     b: u32,
     a: u32,
     z: u32,
-    s: f32,
-    t: f32,
-    q: f32,
-    /// UV texel coordinates in 1/256 texel (FST only).
+    /// Texel coordinates in 1/256 texel, as UV addresses them or through
+    /// the STQ divide.
     u: i32,
     v: i32,
     /// Fog value (see [`Vertex::f`]).
@@ -96,22 +94,21 @@ fn fixed_div(n: i128, d: i128) -> i64 {
 /// the closed form are the same integer sums, so every loop sees the same
 /// value at the same pixel.
 #[derive(Clone, Copy)]
-struct Planes {
-    origin: [i64; PLANES],
-    dx: [i64; PLANES],
-    dy: [i64; PLANES],
+struct Planes<const N: usize = PLANES> {
+    origin: [i64; N],
+    dx: [i64; N],
+    dy: [i64; N],
 }
 
-impl Planes {
-    /// Planes through `a, b, c` (wound positive, `area` > 0), with the
-    /// edge functions `w` at the origin pixel's sample and their per-pixel
-    /// steps `ex`, `ey` as in [`TriGeom`].
-    fn tri(verts: [&Vertex; 3], area: i64, w: [i64; 3], ex: [i64; 3], ey: [i64; 3]) -> Self {
-        let va = verts.map(plane_attrs);
+impl<const N: usize> Planes<N> {
+    /// Planes through the attributes `va` of the vertices (wound positive,
+    /// `area` > 0), with the edge functions `w` at the origin pixel's
+    /// sample and their per-pixel steps `ex`, `ey` as in [`TriGeom`].
+    fn tri(va: [[i64; N]; 3], area: i64, w: [i64; 3], ex: [i64; 3], ey: [i64; 3]) -> Self {
         let sum = |k: [i64; 3], i: usize| -> i128 { (0..3).map(|j| k[j] as i128 * va[j][i] as i128).sum() };
         let area = area as i128;
-        let mut p = Planes { origin: [0; PLANES], dx: [0; PLANES], dy: [0; PLANES] };
-        for i in 0..PLANES {
+        let mut p = Planes { origin: [0; N], dx: [0; N], dy: [0; N] };
+        for i in 0..N {
             p.origin[i] = fixed_div(sum(w, i), area);
             p.dx[i] = fixed_div(sum(ex, i), area);
             p.dy[i] = fixed_div(sum(ey, i), area);
@@ -121,9 +118,9 @@ impl Planes {
 
     /// The attributes at the first pixel of row `k`.
     #[inline(always)]
-    fn row(&self, k: i64) -> [i64; PLANES] {
+    fn row(&self, k: i64) -> [i64; N] {
         let mut acc = self.origin;
-        for i in 0..PLANES {
+        for i in 0..N {
             acc[i] = acc[i].wrapping_add(self.dy[i].wrapping_mul(k));
         }
         acc
@@ -132,8 +129,8 @@ impl Planes {
 
 /// Step fixed-point attributes `n` pixels along a row.
 #[inline(always)]
-fn plane_step(acc: &mut [i64; PLANES], d: &[i64; PLANES], n: i64) {
-    for i in 0..PLANES {
+fn plane_step<const N: usize>(acc: &mut [i64; N], d: &[i64; N], n: i64) {
+    for i in 0..N {
         acc[i] = acc[i].wrapping_add(d[i].wrapping_mul(n));
     }
 }
@@ -155,8 +152,7 @@ fn plane_uv(acc: i64) -> i32 {
     (acc >> FRAC).clamp(-UV_LIMIT as i64, UV_LIMIT as i64) as i32
 }
 
-/// The integer attributes of a fragment at `acc`; S, T and Q are the
-/// caller's.
+/// The fragment at `acc`, texel coordinates as UV addresses them.
 #[inline(always)]
 fn plane_frag(acc: &[i64; PLANES]) -> Frag {
     Frag {
@@ -168,9 +164,209 @@ fn plane_frag(acc: &[i64; PLANES]) -> Frag {
         z: plane_z(acc[P_Z]),
         u: plane_uv(acc[P_U]),
         v: plane_uv(acc[P_V]),
-        s: 0.0,
-        t: 0.0,
-        q: 1.0,
+    }
+}
+
+/// S, T and Q of a primitive quantized to integers, one exponent per
+/// attribute shared by its vertices (value = mantissa * 2^-e), so that
+/// they interpolate as planes and divide in integers. The largest
+/// magnitude lands in [2^29, 2^30]: an f32 keeps 24 bits, so a vertex
+/// value within 2^6 of the largest is exact and the rest lose bits below
+/// 2^-30 of the largest, rounded half away from zero. Non-finite values
+/// read as 0. Works on the bits: it runs for every STQ primitive.
+fn quant<const N: usize>(v: [f32; N]) -> ([i64; N], i32) {
+    // |x| as significand * 2^p, and floor(log2 |x|).
+    let split = |x: f32| -> (i64, i32, i32) {
+        let b = x.to_bits() & 0x7FFF_FFFF;
+        let ex = (b >> 23) as i32;
+        if ex == 0 {
+            (b as i64, -149, 31 - b.leading_zeros() as i32 - 149)
+        } else {
+            ((b & 0x7F_FFFF | 0x80_0000) as i64, ex - 150, ex - 127)
+        }
+    };
+    let top = v.iter().filter(|x| x.is_finite() && **x != 0.0).map(|x| split(*x).2).max();
+    let Some(top) = top else {
+        return ([0; N], 0);
+    };
+    let e = 29 - top;
+    let fix = |x: f32| -> i64 {
+        if !x.is_finite() {
+            return 0;
+        }
+        let (sig, p, _) = split(x);
+        let sh = p + e;
+        let mag = if sh >= 0 {
+            sig << sh
+        } else if sh > -40 {
+            (sig + (1 << (-sh - 1))) >> -sh
+        } else {
+            0
+        };
+        if x < 0.0 { -mag } else { mag }
+    };
+    (v.map(fix), e)
+}
+
+/// `x * 2^sh` for `sh >= 0` while it stays below 2^126 in magnitude.
+#[inline(always)]
+fn shl_i128(x: i128, sh: i32) -> Option<i128> {
+    if x == 0 || (sh as u32) + 2 <= x.unsigned_abs().leading_zeros() { Some(x << sh) } else { None }
+}
+
+/// `floor(n * 2^sh / d)` for `d > 0`, saturated at [`UV_LIMIT`].
+#[inline(always)]
+fn uv_div(n: i128, d: i128, sh: i32) -> i32 {
+    let lim = UV_LIMIT as i128;
+    // A hardware 64-bit divide whenever both sides fit; same quotient.
+    let div = |n: i128, d: i128| -> i128 {
+        match (i64::try_from(n), i64::try_from(d)) {
+            (Ok(n), Ok(d)) => n.div_euclid(d) as i128,
+            _ => n.div_euclid(d),
+        }
+    };
+    let q = if sh >= 0 {
+        match shl_i128(n, sh) {
+            Some(n) => div(n, d),
+            // Past 2^126 over a divisor below 2^62: far beyond the limit.
+            None => n.signum() * lim,
+        }
+    } else {
+        match shl_i128(d, -sh) {
+            Some(d) => div(n, d),
+            // A divisor past 2^126 over |n| below 2^80.
+            None => -((n < 0) as i128),
+        }
+    };
+    q.clamp(-lim, lim) as i32
+}
+
+/// Fraction bits S and Q drop before the per-pixel divide, so that it
+/// fits in 64 bits: 2^-14 of a mantissa unit, 2^-44 of the largest value.
+const STQ_DROP: u32 = 16;
+
+/// The texel coordinate `floor(S * size * 256 / Q)` in 1/256 texel of S
+/// and Q in fixed point ([`FRAC`] bits over their [`quant`] exponents),
+/// less [`STQ_DROP`] bits. Q = 0 reads as 1.0, as a Q under 1e-9 did in
+/// float; so does a Q that drops to 0.
+#[inline(always)]
+fn stq_coord(s: i64, q: i64, es: i32, eq: i32, size: u32) -> i32 {
+    let (s, q) = if q < 0 { (s.wrapping_neg(), q.wrapping_neg()) } else { (s, q) };
+    let (s, q) = (s >> STQ_DROP, q >> STQ_DROP);
+    let a = eq - es;
+    // Every pixel addressed by STQ comes through here: stay in 64 bits
+    // while the numerator fits (floor(floor(n / 2^b) / q) = floor(n / (2^b q))).
+    if q != 0 && size <= 1 << 10 && s.unsigned_abs() < 1 << 44 {
+        let n = s * (size as i64 * 256);
+        let num = if a >= 0 {
+            if a + 2 > n.unsigned_abs().leading_zeros() as i32 && n != 0 {
+                None
+            } else {
+                Some(n << a.min(62))
+            }
+        } else {
+            Some(n >> (-a).min(63))
+        };
+        if let Some(num) = num {
+            return num.div_euclid(q).clamp(-UV_LIMIT as i64, UV_LIMIT as i64) as i32;
+        }
+    }
+    let n = s as i128 * (size as i128 * 256);
+    if q == 0 {
+        return uv_div(n, 1, -(es + (FRAC - STQ_DROP) as i32));
+    }
+    uv_div(n, q as i128, a)
+}
+
+/// Both texel coordinates of S, T, Q in fixed point with exponents `exp`.
+#[inline(always)]
+fn stq_coords(stq: &[i64; 3], exp: [i32; 3], ti: &TexInfo) -> (i32, i32) {
+    (stq_coord(stq[0], stq[2], exp[0], exp[2], ti.tw), stq_coord(stq[1], stq[2], exp[1], exp[2], ti.th))
+}
+
+/// The texel coordinate `(num + dnum * k) * size * 256 * 2^sh / den`
+/// (`den != 0`), linear in `k`, as a plane: its value at `k = 0` and its
+/// step, 1/256 texel with [`FRAC`] fraction bits, each rounded up as in
+/// [`fixed_div`] so a coordinate on a texel boundary stays on it. Over
+/// `lo..=hi` the plane is what [`plane_uv`] reads; where the coordinate
+/// leaves [`UV_LIMIT`] there, the plane runs between the saturated values
+/// at the two ends instead.
+fn stq_line(num: i128, dnum: i128, den: i128, sh: i32, size: u32, lo: i64, hi: i64) -> (i64, i64) {
+    let (num, dnum, den) = if den < 0 { (-num, -dnum, -den) } else { (num, dnum, den) };
+    let scale = size as i128 * 256;
+    let (num, dnum) = (num * scale, dnum * scale);
+    let exact = || -> Option<(i128, i128)> {
+        let ceil = |n: i128| -> Option<i128> {
+            let sh = sh + FRAC as i32;
+            let (n, d) = if sh >= 0 { (shl_i128(n, sh)?, den) } else { (n, shl_i128(den, -sh)?) };
+            Some((n + d - 1).div_euclid(d))
+        };
+        let (o, d) = (ceil(num)?, ceil(dnum)?);
+        let lim = ((UV_LIMIT - 1) as i128) << FRAC;
+        for k in [lo, hi] {
+            if d.checked_mul(k as i128)?.checked_add(o)?.abs() > lim {
+                return None;
+            }
+        }
+        Some((o, d))
+    };
+    if let Some((o, d)) = exact() {
+        return (o as i64, d as i64);
+    }
+    let end = |k: i64| uv_div(num + dnum * k as i128, den, sh) as i64;
+    let (a, b) = (end(lo), end(hi));
+    let d = if hi > lo { fixed_div((b - a) as i128, (hi - lo) as i128) } else { 0 };
+    ((a << FRAC).wrapping_sub(d.wrapping_mul(lo)), d)
+}
+
+/// How a span addresses the texture.
+#[derive(Clone, Copy)]
+enum SpanUv {
+    /// U and V linear along the span — UV addressing, or STQ with Q
+    /// constant along it: at the current pixel and their steps, 1/256
+    /// texel with [`FRAC`] fraction bits.
+    Linear { u: i64, du: i64, v: i64, dv: i64 },
+    /// STQ with Q varying: S, T, Q at the current pixel and their steps,
+    /// divided per pixel.
+    Divide { stq: [i64; 3], d: [i64; 3], exp: [i32; 3] },
+}
+
+impl SpanUv {
+    /// STQ at the first pixel of a span of `span + 1` pixels, with steps
+    /// `d` and exponents `exp`.
+    fn stq(stq: [i64; 3], d: &[i64; 3], exp: [i32; 3], span: i64, ti: &TexInfo) -> Self {
+        if d[2] != 0 {
+            return SpanUv::Divide { stq, d: *d, exp };
+        }
+        // The same numbers stq_coord divides, with Q = 0 as 1.0.
+        let [es, et, eq] = exp;
+        let (den, su, sv) = if stq[2] == 0 {
+            (1, -es - FRAC as i32, -et - FRAC as i32)
+        } else {
+            (stq[2] as i128, eq - es, eq - et)
+        };
+        let (u, du) = stq_line(stq[0] as i128, d[0] as i128, den, su, ti.tw, 0, span);
+        let (v, dv) = stq_line(stq[1] as i128, d[1] as i128, den, sv, ti.th, 0, span);
+        SpanUv::Linear { u, du, v, dv }
+    }
+
+    #[inline(always)]
+    fn uv(&self, ti: &TexInfo) -> (i32, i32) {
+        match self {
+            SpanUv::Linear { u, v, .. } => (plane_uv(*u), plane_uv(*v)),
+            SpanUv::Divide { stq, exp, .. } => stq_coords(stq, *exp, ti),
+        }
+    }
+
+    #[inline(always)]
+    fn step(&mut self, n: i64) {
+        match self {
+            SpanUv::Linear { u, du, v, dv } => {
+                *u = u.wrapping_add(du.wrapping_mul(n));
+                *v = v.wrapping_add(dv.wrapping_mul(n));
+            }
+            SpanUv::Divide { stq, d, .. } => plane_step(stq, d, n),
+        }
     }
 }
 
@@ -458,21 +654,13 @@ struct LineGeom {
 /// Sprite geometry needed per scanline.
 #[derive(Clone, Copy)]
 struct SpriteGeom {
-    x0: i32,
-    y0: i32,
-    inv_wid: f32,
-    inv_hei: f32,
-    inv_q: f32,
-    /// UV texel u at pixel column 0 and its per-column step, and v at
-    /// pixel row 0 and its per-row step: 1/256 texel with FRAC more bits.
+    /// Texel u at pixel column 0 and its per-column step, and v at pixel
+    /// row 0 and its per-row step: 1/256 texel with FRAC more bits. STQ
+    /// is linear too, Q being the second vertex's for the whole sprite.
     u_org: i64,
     u_dx: i64,
     v_org: i64,
     v_dy: i64,
-    s0: f32,
-    s1: f32,
-    t0: f32,
-    t1: f32,
     pxa: i32,
     pxb: i32,
     v1: Vertex,
@@ -481,7 +669,6 @@ struct SpriteGeom {
 /// Triangle geometry needed per scanline.
 #[derive(Clone, Copy)]
 struct TriGeom {
-    inv_area: f32,
     minx: i32,
     maxx: i32,
     miny: i32,
@@ -493,12 +680,10 @@ struct TriGeom {
     dy: [i64; 3],
     /// R, G, B, A, F, Z and UV in fixed point.
     planes: Planes,
-    /// S, T and Q per vertex (the fourth lane is unused) and their
-    /// per-pixel steps along a row: STQ still interpolates in float.
-    sa: [f32; 4],
-    sb: [f32; 4],
-    sc: [f32; 4],
-    d_stq: [f32; 4],
+    /// S, T and Q in fixed point over their [`quant`] exponents `stq_exp`
+    /// (zero unless the triangle addresses by STQ).
+    stq: Planes<3>,
+    stq_exp: [i32; 3],
 }
 
 impl Gs {
@@ -860,7 +1045,13 @@ impl SoftRaster {
     /// after the queue, so it keeps its order with it.
     fn draw_point(&mut self, host: &mut Host, env: DrawEnv, v: Vertex) {
         let pipe = self.pixel_pipe(host, env);
-        let frag = Frag { s: v.s, t: v.t, q: v.q, ..plane_frag(&plane_attrs(&v).map(|a| a << FRAC)) };
+        let mut frag = plane_frag(&plane_attrs(&v).map(|a| a << FRAC));
+        if pipe.tme && !pipe.fst {
+            let ([s], es) = quant([v.s]);
+            let ([t], et) = quant([v.t]);
+            let ([q], eq) = quant([v.q]);
+            (frag.u, frag.v) = stq_coords(&[s << FRAC, t << FRAC, q << FRAC], [es, et, eq], &pipe.tex);
+        }
         let (px, py) = (v.x >> 4, v.y >> 4);
         if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
             self.flush_batch(host);
@@ -969,38 +1160,38 @@ impl SoftRaster {
             (v1.v, v0.v, v1.t, v0.t)
         };
         let (wid, hei) = ((x1 - x0).max(1) as i128, (y1 - y0).max(1) as i128);
-        let geom = SpriteGeom {
-            x0,
-            y0,
-            inv_wid: 1.0 / (x1 - x0).max(1) as f32,
-            inv_hei: 1.0 / (y1 - y0).max(1) as f32,
-            inv_q: {
-                let q = if v1.q.abs() < 1e-9 { 1.0 } else { v1.q };
-                1.0 / q
-            },
+        let (pxa, pxb) = (px0.max(pipe.scx0), px_clip(px1).min(pipe.scx1 + 1));
+        let (rya, ryb) = (py0.max(pipe.scy0), px_clip(py1).min(pipe.scy1 + 1));
+        let ((u_org, u_dx), (v_org, v_dy)) = if !pipe.tme || pipe.fst {
             // u = 16 * (u0 + (u1 - u0) * (16 * px - x0) / wid) in 1/256
             // texel, and v likewise down the rows.
-            u_org: fixed_div(16 * (u0 as i128 * wid - (u1 - u0) as i128 * x0 as i128), wid),
-            u_dx: fixed_div(256 * (u1 - u0) as i128, wid),
-            v_org: fixed_div(16 * (tv0 as i128 * hei - (tv1 - tv0) as i128 * y0 as i128), hei),
-            v_dy: fixed_div(256 * (tv1 - tv0) as i128, hei),
-            s0,
-            s1,
-            t0,
-            t1,
-            pxa: px0.max(pipe.scx0),
-            pxb: px_clip(px1).min(pipe.scx1 + 1),
-            v1,
+            (
+                (fixed_div(16 * (u0 as i128 * wid - (u1 - u0) as i128 * x0 as i128), wid), fixed_div(256 * (u1 - u0) as i128, wid)),
+                (fixed_div(16 * (tv0 as i128 * hei - (tv1 - tv0) as i128 * y0 as i128), hei), fixed_div(256 * (tv1 - tv0) as i128, hei)),
+            )
+        } else {
+            // S at column px is (s0 * wid + (s1 - s0) * (16 * px - x0)) / wid
+            // in mantissa units, over Q; T likewise down the rows.
+            let ([s0, s1], es) = quant([s0, s1]);
+            let ([t0, t1], et) = quant([t0, t1]);
+            let ([q], eq) = quant([v1.q]);
+            let line = |a: i64, b: i64, e: i32, org: i32, len: i128, size: u32, lo: i32, hi: i32| {
+                let (num, dnum) = (a as i128 * len - (b - a) as i128 * org as i128, 16 * (b - a) as i128);
+                let (den, sh) = if q == 0 { (len, -e) } else { (q as i128 * len, eq - e) };
+                stq_line(num, dnum, den, sh, size, lo as i64, hi.max(lo) as i64)
+            };
+            (line(s0, s1, es, x0, wid, pipe.tex.tw, pxa, pxb - 1), line(t0, t1, et, y0, hei, pipe.tex.th, rya, ryb - 1))
         };
-        let (rya, ryb) = (py0.max(pipe.scy0), px_clip(py1).min(pipe.scy1 + 1));
+        let geom = SpriteGeom { u_org, u_dx, v_org, v_dy, pxa, pxb, v1 };
         let th = pipe.tex.th as f32;
         let tex_v = if pipe.fst {
             (tv0.min(tv1) as f32 / 16.0, tv0.max(tv1) as f32 / 16.0)
         } else {
-            let (a, b) = (t0 * geom.inv_q * th, t1 * geom.inv_q * th);
+            let q = if v1.q.abs() < 1e-9 { 1.0 } else { v1.q };
+            let (a, b) = (t0 / q * th, t1 / q * th);
             (a.min(b), a.max(b))
         };
-        let px = (ryb - rya).max(0) as i64 * (geom.pxb - geom.pxa).max(0) as i64;
+        let px = (ryb - rya).max(0) as i64 * (pxb - pxa).max(0) as i64;
         (geom, rya, ryb, px, tex_v)
     }
 
@@ -1018,27 +1209,18 @@ impl SoftRaster {
         // Edge functions are affine in (sx, sy): evaluate at the top-left
         // sample once and step by whole pixels (16 units) — exact in i64.
         let (sx0, sy0) = ((minx << 4) + 8, (miny << 4) + 8);
-        let stq = |v: &Vertex| [v.s, v.t, v.q, 0.0];
-        let inv_area = 1.0 / area as f32;
-        // Barycentric weights change by dx[i] * inv_area per pixel, so any
-        // attribute changes by the weighted sum of its vertex values.
-        let dl = [
-            -(c.y - b.y) as f32 * 16.0 * inv_area,
-            -(a.y - c.y) as f32 * 16.0 * inv_area,
-            -(b.y - a.y) as f32 * 16.0 * inv_area,
-        ];
-        let step = |pa: [f32; 4], pb: [f32; 4], pc: [f32; 4]| -> [f32; 4] {
-            let mut d = [0f32; 4];
-            for i in 0..4 {
-                d[i] = pa[i] * dl[0] + pb[i] * dl[1] + pc[i] * dl[2];
-            }
-            d
-        };
         let w = [edge(b.x, b.y, c.x, c.y, sx0, sy0), edge(c.x, c.y, a.x, a.y, sx0, sy0), edge(a.x, a.y, b.x, b.y, sx0, sy0)];
         let dx = [-(c.y - b.y) as i64 * 16, -(a.y - c.y) as i64 * 16, -(b.y - a.y) as i64 * 16];
         let dy = [(c.x - b.x) as i64 * 16, (a.x - c.x) as i64 * 16, (b.x - a.x) as i64 * 16];
+        let (stq, stq_exp) = if pipe.tme && !pipe.fst {
+            let ([s0, s1, s2], es) = quant([a.s, b.s, c.s]);
+            let ([t0, t1, t2], et) = quant([a.t, b.t, c.t]);
+            let ([q0, q1, q2], eq) = quant([a.q, b.q, c.q]);
+            (Planes::tri([[s0, t0, q0], [s1, t1, q1], [s2, t2, q2]], area, w, dx, dy), [es, et, eq])
+        } else {
+            (Planes { origin: [0; 3], dx: [0; 3], dy: [0; 3] }, [0; 3])
+        };
         let geom = TriGeom {
-            inv_area,
             minx,
             maxx,
             miny,
@@ -1047,11 +1229,9 @@ impl SoftRaster {
             w2: w[2],
             dx,
             dy,
-            planes: Planes::tri([&a, &b, &c], area, w, dx, dy),
-            sa: stq(&a),
-            sb: stq(&b),
-            sc: stq(&c),
-            d_stq: step(stq(&a), stq(&b), stq(&c)),
+            planes: Planes::tri([&a, &b, &c].map(plane_attrs), area, w, dx, dy),
+            stq,
+            stq_exp,
         };
         let th = pipe.tex.th as f32;
         let tex_v = if pipe.fst {
@@ -1436,33 +1616,21 @@ impl Painter<'_> {
         // its own earlier rows wrote is the accepted deviation).
         self.scratch.tex_rows[0].key.0 = u64::MAX;
         self.scratch.tex_rows[1].key.0 = u64::MAX;
-        let (v1, x0, y0) = (g.v1, g.x0, g.y0);
-        let (pxa, pxb) = (g.pxa, g.pxb);
-        let tw = pipe.tex.tw as f32;
-        let th = pipe.tex.th as f32;
-        // Texel-space u for a pixel column. A pixel is sampled at its own
-        // coordinate, not half a pixel into it: that is the point the
-        // coverage rule above rounds up to, and interpolating anywhere else
-        // drifts the texture off a sprite whose edge does not sit on a
-        // pixel boundary. UV addressing is fixed point (TEXEL fraction
-        // bits); STQ is still float.
+        let (v1, pxa, pxb) = (g.v1, g.pxa, g.pxb);
+        // Texel-space u for a pixel column, in fixed point (TEXEL fraction
+        // bits). A pixel is sampled at its own coordinate, not half a pixel
+        // into it: that is the point the coverage rule above rounds up to,
+        // and interpolating anywhere else drifts the texture off a sprite
+        // whose edge does not sit on a pixel boundary.
         let u_fixed = |px: i32| g.u_org.wrapping_add(g.u_dx.wrapping_mul(px as i64));
-        let fu_stq = |px: i32| -> f32 {
-            let fx = ((px << 4) - x0) as f32 * g.inv_wid;
-            (g.s0 + (g.s1 - g.s0) * fx) * g.inv_q * tw
-        };
-        let u_at = |px: i32| -> i32 { if pipe.fst { plane_uv(u_fixed(px)) } else { uv256(fu_stq(px)) } };
+        let u_at = |px: i32| -> i32 { plane_uv(u_fixed(px)) };
         for py in rows.iter() {
-            let fy = ((py << 4) - y0) as f32 * g.inv_hei;
             let frag = Frag {
                 r: v1.r as u32,
                 g: v1.g as u32,
                 b: v1.b as u32,
                 a: v1.a as u32,
                 z: v1.z,
-                s: 0.0,
-                t: g.t0 + (g.t1 - g.t0) * fy,
-                q: v1.q,
                 u: 0,
                 v: plane_uv(g.v_org.wrapping_add(g.v_dy.wrapping_mul(py as i64))),
                 f: v1.f as u32,
@@ -1471,7 +1639,7 @@ impl Painter<'_> {
             if pipe.tme && pxb > pxa {
                 // v is constant along the row: decode the one or two
                 // texture rows the row samples once, then blend from them.
-                let v = if pipe.fst { frag.v } else { uv256(frag.t * g.inv_q * th) };
+                let v = frag.v;
                 let (ua, ub) = (u_at(pxa), u_at(pxb - 1));
                 let (ulo, uhi) = (ua.min(ub), ua.max(ub));
                 let (y_row, wy, u_lo, u_hi) = if pipe.bilinear {
@@ -1487,15 +1655,7 @@ impl Painter<'_> {
                     }
                     let [row0, row1] = std::mem::take(&mut self.scratch.tex_rows);
                     if (pipe.fast || pipe.fast_decal) && pxb - pxa >= 2 {
-                        let (ua, du) = if pipe.fst {
-                            (u_fixed(pxa), g.u_dx)
-                        } else {
-                            // Fixed-point u stepped between the float endpoints.
-                            let one = (1u64 << TEXEL) as f64;
-                            let fa = f64::from(fu_stq(pxa));
-                            let fb = f64::from(fu_stq(pxb - 1));
-                            ((fa * one).floor() as i64, ((fb - fa) / f64::from(pxb - 1 - pxa) * one) as i64)
-                        };
+                        let (ua, du) = (u_fixed(pxa), g.u_dx);
                         let args = FastRow { row: &row, pxa, pxb, frag: &frag, row0: &row0.data, row1: &row1.data, u_lo, wy, ua, du, z: frag.z };
                         match (pipe.fast_decal, pipe.bilinear, pipe.abe, pipe.ate) {
                             (false, false, false, false) => self.fast_sprite_row::<false, false, false, false>(&args),
@@ -1544,8 +1704,7 @@ impl Painter<'_> {
             }
             let _p = crate::prof::scope(crate::prof::Slot::GsGeneric);
             for px in pxa..pxb {
-                let fx = ((px << 4) - x0) as f32 * g.inv_wid;
-                let frag = Frag { s: g.s0 + (g.s1 - g.s0) * fx, u: plane_uv(u_fixed(px)), ..frag };
+                let frag = Frag { u: u_at(px), ..frag };
                 let texel = if pipe.tme { self.sample(&frag) } else { 0 };
                 self.shade_row_px(&row, px as u32, frag, texel);
             }
@@ -1566,9 +1725,14 @@ impl Painter<'_> {
         let (fx1, fy1) = (b.x as f32 / 16.0, b.y as f32 / 16.0);
         let (dx, dy) = (fx1 - fx0, fy1 - fy0);
         let inv = 1.0 / g.steps as f32;
-        let lerp = |p: f32, q: f32, t: f32| p + (q - p) * t;
-        // The integer attributes step from a's value by (b - a) / steps in
-        // fixed point; flat shading holds b's colour and fog.
+        // The attributes step from a's value by (b - a) / steps in fixed
+        // point; flat shading holds b's colour and fog.
+        let stq_on = pipe.tme && !pipe.fst;
+        let (qs, es) = quant([a.s, b.s]);
+        let (qt, et) = quant([a.t, b.t]);
+        let (qq, eq) = quant([a.q, b.q]);
+        let stq_start = [qs[0] << FRAC, qt[0] << FRAC, qq[0] << FRAC];
+        let d_stq = [qs, qt, qq].map(|v| fixed_div((v[1] - v[0]) as i128, g.steps as i128));
         let (va, vb) = (plane_attrs(&a), plane_attrs(&b));
         let mut start = va.map(|x| x << FRAC);
         let mut d = [0i64; PLANES];
@@ -1593,7 +1757,12 @@ impl Painter<'_> {
             }
             let mut acc = start;
             plane_step(&mut acc, &d, i as i64);
-            let frag = Frag { s: lerp(a.s, b.s, t), t: lerp(a.t, b.t, t), q: lerp(a.q, b.q, t), ..plane_frag(&acc) };
+            let mut frag = plane_frag(&acc);
+            if stq_on {
+                let mut stq = stq_start;
+                plane_step(&mut stq, &d_stq, i as i64);
+                (frag.u, frag.v) = stq_coords(&stq, [es, et, eq], &pipe.tex);
+            }
             let texel = if pipe.tme { self.sample(&frag) } else { 0 };
             let row = Row::new(pipe, py as u32);
             self.shade_row_px(&row, px as u32, frag, texel);
@@ -1636,28 +1805,37 @@ impl Painter<'_> {
             let n = (xs - g.minx) as i64;
             let mut acc = g.planes.row(k);
             plane_step(&mut acc, &g.planes.dx, n);
-            let (mut w0, mut w1, mut w2) = (w[0] + g.dx[0] * n, w[1] + g.dx[1] * n, w[2] + g.dx[2] * n);
-            // STQ still interpolates in float, from the barycentrics.
             let stq_on = pipe.tme && !pipe.fst;
+            let mut uv = if stq_on {
+                let mut stq = g.stq.row(k);
+                plane_step(&mut stq, &g.stq.dx, n);
+                SpanUv::stq(stq, &g.stq.dx, g.stq_exp, (xe - xs) as i64, &pipe.tex)
+            } else {
+                SpanUv::Linear { u: acc[P_U], du: g.planes.dx[P_U], v: acc[P_V], dv: g.planes.dx[P_V] }
+            };
             if pipe.fast {
-                let stq = if stq_on {
-                    interp3(&g.sa, &g.sb, &g.sc, w0 as f32 * g.inv_area, w1 as f32 * g.inv_area, w2 as f32 * g.inv_area)
-                } else {
-                    [0.0; 4]
-                };
-                let args = FastTri { row: &row, xs, xe, acc, d: &g.planes.dx, stq, d_stq: g.d_stq };
+                let args = FastTri { row: &row, xs, xe, acc, d: &g.planes.dx, uv };
                 if self.sprite_like_tri_row(&args) {
                     continue;
                 }
-                match (pipe.bilinear, pipe.abe, pipe.ate) {
-                    (false, false, false) => self.fast_tri_row::<false, false, false>(&args),
-                    (false, false, true) => self.fast_tri_row::<false, false, true>(&args),
-                    (false, true, false) => self.fast_tri_row::<false, true, false>(&args),
-                    (false, true, true) => self.fast_tri_row::<false, true, true>(&args),
-                    (true, false, false) => self.fast_tri_row::<true, false, false>(&args),
-                    (true, false, true) => self.fast_tri_row::<true, false, true>(&args),
-                    (true, true, false) => self.fast_tri_row::<true, true, false>(&args),
-                    (true, true, true) => self.fast_tri_row::<true, true, true>(&args),
+                let div = matches!(uv, SpanUv::Divide { .. });
+                match (div, pipe.bilinear, pipe.abe, pipe.ate) {
+                    (false, false, false, false) => self.fast_tri_row::<false, false, false, false>(&args),
+                    (false, false, false, true) => self.fast_tri_row::<false, false, false, true>(&args),
+                    (false, false, true, false) => self.fast_tri_row::<false, false, true, false>(&args),
+                    (false, false, true, true) => self.fast_tri_row::<false, false, true, true>(&args),
+                    (false, true, false, false) => self.fast_tri_row::<false, true, false, false>(&args),
+                    (false, true, false, true) => self.fast_tri_row::<false, true, false, true>(&args),
+                    (false, true, true, false) => self.fast_tri_row::<false, true, true, false>(&args),
+                    (false, true, true, true) => self.fast_tri_row::<false, true, true, true>(&args),
+                    (true, false, false, false) => self.fast_tri_row::<true, false, false, false>(&args),
+                    (true, false, false, true) => self.fast_tri_row::<true, false, false, true>(&args),
+                    (true, false, true, false) => self.fast_tri_row::<true, false, true, false>(&args),
+                    (true, false, true, true) => self.fast_tri_row::<true, false, true, true>(&args),
+                    (true, true, false, false) => self.fast_tri_row::<true, true, false, false>(&args),
+                    (true, true, false, true) => self.fast_tri_row::<true, true, false, true>(&args),
+                    (true, true, true, false) => self.fast_tri_row::<true, true, true, false>(&args),
+                    (true, true, true, true) => self.fast_tri_row::<true, true, true, true>(&args),
                 }
                 continue;
             }
@@ -1665,16 +1843,11 @@ impl Painter<'_> {
             for px in xs..=xe {
                 let mut frag = plane_frag(&acc);
                 plane_step(&mut acc, &g.planes.dx, 1);
-                // Texture coordinates cost four lanes and two divides per
-                // pixel; a span that does not address by STQ never looks at
-                // them.
+                // A span that does not address by STQ never pays the divide.
                 if stq_on {
-                    let stq = interp3(&g.sa, &g.sb, &g.sc, w0 as f32 * g.inv_area, w1 as f32 * g.inv_area, w2 as f32 * g.inv_area);
-                    (frag.s, frag.t, frag.q) = (stq[0], stq[1], stq[2]);
+                    (frag.u, frag.v) = uv.uv(&pipe.tex);
+                    uv.step(1);
                 }
-                w0 += g.dx[0];
-                w1 += g.dx[1];
-                w2 += g.dx[2];
                 let texel = if pipe.tme { self.sample_cached(&frag) } else { 0 };
                 self.shade_row_px(&row, px as u32, frag, texel);
             }
@@ -1689,27 +1862,15 @@ impl Painter<'_> {
     fn sprite_like_tri_row(&mut self, a: &FastTri) -> bool {
         let pipe = self.pipe;
         let d = a.d;
-        if d[..4] != [0; 4] || (pipe.z_touched && d[P_Z] != 0) || (!pipe.fst && a.d_stq[2] != 0.0) {
+        let SpanUv::Linear { u: ua, du, .. } = a.uv else {
+            return false;
+        };
+        if d[..4] != [0; 4] || (pipe.z_touched && d[P_Z] != 0) {
             return false;
         }
-        let span = (a.xe - a.xs) as i64;
-        // The STQ endpoints in float, for the fixed-point step between them.
-        let stq_fu = |k: f32| -> (f32, f32) {
-            let q = if a.stq[2].abs() < 1e-9 { 1.0 } else { a.stq[2] };
-            let inv_q = 1.0 / q;
-            (
-                (a.stq[0] + a.d_stq[0] * k) * inv_q * pipe.tex.tw as f32,
-                (a.stq[1] + a.d_stq[1] * k) * inv_q * pipe.tex.th as f32,
-            )
-        };
-        let ((u_a, v_a), (u_b, v_b)) = if pipe.fst {
-            let mut end = a.acc;
-            plane_step(&mut end, d, span);
-            ((plane_uv(a.acc[P_U]), plane_uv(a.acc[P_V])), (plane_uv(end[P_U]), plane_uv(end[P_V])))
-        } else {
-            let ((fua, fva), (fub, fvb)) = (stq_fu(0.0), stq_fu(span as f32));
-            ((uv256(fua), uv256(fva)), (uv256(fub), uv256(fvb)))
-        };
+        let mut end = a.uv;
+        end.step((a.xe - a.xs) as i64);
+        let ((u_a, v_a), (u_b, v_b)) = (a.uv.uv(&pipe.tex), end.uv(&pipe.tex));
         let (ulo, uhi) = (u_a.min(u_b), u_a.max(u_b));
         // The texture row(s) must be the same at both ends (v is monotonic
         // along the span, so then everywhere between).
@@ -1733,14 +1894,6 @@ impl Painter<'_> {
             self.fill_tex_row(1, y_row + 1, u_lo, u_hi);
         }
         let [row0, row1] = std::mem::take(&mut self.scratch.tex_rows);
-        let (ua, du) = if pipe.fst {
-            (a.acc[P_U], d[P_U])
-        } else {
-            let (fua, fub) = (f64::from(stq_fu(0.0).0), f64::from(stq_fu(span as f32).0));
-            let one = (1u64 << TEXEL) as f64;
-            let du = if span > 0 { ((fub - fua) / span as f64 * one) as i64 } else { 0 };
-            ((fua * one).floor() as i64, du)
-        };
         let frag = plane_frag(&a.acc);
         let args = FastRow {
             row: a.row,
@@ -1772,9 +1925,10 @@ impl Painter<'_> {
     /// Textured MODULATE triangle span for `PixelPipe::fast` setups: the
     /// attributes step incrementally along the row, texels come through the
     /// row cache, and the filter / alpha test / blend are compile-time
-    /// choices (see [`Painter::fast_sprite_row`]).
+    /// choices (see [`Painter::fast_sprite_row`]). `DIV` is whether the span
+    /// divides STQ per pixel ([`SpanUv::Divide`]).
     #[inline(never)]
-    fn fast_tri_row<const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastTri) {
+    fn fast_tri_row<const DIV: bool, const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastTri) {
         let _p = crate::prof::scope(crate::prof::Slot::GsFastTri);
         let pipe = self.pipe;
         let row = a.row;
@@ -1788,7 +1942,6 @@ impl Painter<'_> {
             crate::prof::count_pixels(k, n);
         }
         let tcc = pipe.tcc;
-        let fst = pipe.fst;
         let (atst, aref, afail) = (pipe.atst, pipe.aref, pipe.afail);
         let blend = Blend::new(pipe);
         let canvas = self.canvas;
@@ -1796,15 +1949,11 @@ impl Painter<'_> {
         let ztest = ZTest::new(pipe);
         let d = a.d;
         let mut acc = a.acc;
-        let mut stq = a.stq;
-        let tf = TexFetch::new(&pipe.tex);
-        let uv_at = |acc: &[i64; PLANES], stq: &[f32; 4]| -> (i32, i32) {
-            if fst {
-                (plane_uv(acc[P_U]), plane_uv(acc[P_V]))
-            } else {
-                stq_uv256(stq[0], stq[1], stq[2], &pipe.tex)
-            }
+        let (mut lin, dlin, mut stq, dstq, exp) = match a.uv {
+            SpanUv::Linear { u, du, v, dv } => ([u, v], [du, dv], [0; 3], [0; 3], [0; 3]),
+            SpanUv::Divide { stq, d, exp } => ([0; 2], [0; 2], stq, d, exp),
         };
+        let tf = TexFetch::new(&pipe.tex);
         // The decoded-row cache pays off when the span stays on one or two
         // texture rows and is magnified (it decodes each texel once); a
         // mapping that walks v along the row, or a minified one that skips
@@ -1812,18 +1961,22 @@ impl Painter<'_> {
         // those sample VRAM directly.
         let direct = {
             let span = (a.xe - a.xs) as i64;
-            let mut acc_e = a.acc;
-            plane_step(&mut acc_e, d, span);
-            let mut stq_e = a.stq;
-            for i in 0..4 {
-                stq_e[i] += a.d_stq[i] * span as f32;
-            }
-            let (us, vs) = uv_at(&a.acc, &a.stq);
-            let (ue, ve) = uv_at(&acc_e, &stq_e);
+            let mut end = a.uv;
+            end.step(span);
+            let (us, vs) = a.uv.uv(&pipe.tex);
+            let (ue, ve) = end.uv(&pipe.tex);
             (ve as i64 - vs as i64).abs() >= 256 || (ue as i64 - us as i64).abs() > 256 * (2 * span + 8)
         };
         for px in a.xs..=a.xe {
-            let (u, v) = uv_at(&acc, &stq);
+            let (u, v) = if DIV {
+                let uv = stq_coords(&stq, exp, &pipe.tex);
+                plane_step(&mut stq, &dstq, 1);
+                uv
+            } else {
+                let uv = (plane_uv(lin[0]), plane_uv(lin[1]));
+                plane_step(&mut lin, &dlin, 1);
+                uv
+            };
             let texel = if direct {
                 if BIL { self.sample_bilinear_direct(tf, u, v) } else { self.texel(u >> 8, v >> 8) }
             } else if BIL {
@@ -1834,11 +1987,6 @@ impl Painter<'_> {
             let (cr, cg, cb, ca) = (plane_u8(acc[0]), plane_u8(acc[1]), plane_u8(acc[2]), plane_u8(acc[3]));
             let z = plane_z(acc[P_Z]) & pipe.zmask;
             plane_step(&mut acc, d, 1);
-            if !fst {
-                for i in 0..4 {
-                    stq[i] += a.d_stq[i];
-                }
-            }
             let ta = texel >> 24;
             let a8 = if tcc { ((ta * ca) >> 7).min(255) } else { ca };
             let (mut write_z, mut keep_dst_alpha) = (true, false);
@@ -2035,7 +2183,7 @@ impl Painter<'_> {
     /// and weights as the direct path.
     fn sample_cached(&mut self, frag: &Frag) -> u32 {
         let pipe = self.pipe;
-        let (u, v) = Self::frag_uv(pipe, frag);
+        let (u, v) = (frag.u, frag.v);
         if !pipe.bilinear {
             return self.cached_texel(0, u >> 8, v >> 8);
         }
@@ -2186,8 +2334,7 @@ impl Painter<'_> {
     /// stepped in fixed point, the Z / frame-mask / 24-bit paths are gone,
     /// the filter, alpha test and blend are compile-time choices and the
     /// colour modulation runs on SSE2 lanes. Same results as
-    /// [`Painter::shade_row_px`] for UV addressing, which steps the same
-    /// fixed-point u; STQ still derives its step from float endpoints.
+    /// [`Painter::shade_row_px`], which reads the same fixed-point u.
     #[inline(never)]
     fn fast_sprite_row<const DEC: bool, const BIL: bool, const ABE: bool, const ATE: bool>(&mut self, a: &FastRow) {
         let _p = crate::prof::scope(crate::prof::Slot::GsFastSprite);
@@ -2585,24 +2732,13 @@ impl Painter<'_> {
     #[inline(always)]
     fn sample(&self, frag: &Frag) -> u32 {
         let pipe = self.pipe;
-        let (u, v) = Self::frag_uv(pipe, frag);
+        let (u, v) = (frag.u, frag.v);
         // TEX1 MMAG selects the magnification filter; minification and
         // mipmaps are not modelled, so it decides for every sample.
         if !pipe.bilinear {
             return self.texel(u >> 8, v >> 8);
         }
         self.sample_bilinear_direct(TexFetch::new(&pipe.tex), u, v)
-    }
-
-    /// A fragment's texel coordinates in 1/256 texel: UV addressing as
-    /// interpolated, or STQ through the perspective divide.
-    #[inline(always)]
-    fn frag_uv(pipe: &PixelPipe, frag: &Frag) -> (i32, i32) {
-        if pipe.fst {
-            (frag.u, frag.v)
-        } else {
-            stq_uv256(frag.s, frag.t, frag.q, &pipe.tex)
-        }
     }
 
     /// Bilinear texel at `(u, v)` (1/256 texel) straight from VRAM: the
@@ -2769,9 +2905,8 @@ struct FastTri<'a> {
     /// Fixed-point attributes at the first pixel and their steps.
     acc: [i64; PLANES],
     d: &'a [i64; PLANES],
-    /// S, T, Q at the first pixel and their steps (float).
-    stq: [f32; 4],
-    d_stq: [f32; 4],
+    /// Texture addressing from the first pixel.
+    uv: SpanUv,
 }
 
 /// Texture addressing parameters copied out of the pipe for the fast
@@ -3290,38 +3425,6 @@ fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
     (rb & 0x00FF_00FF) | (ga & 0xFF00_FF00)
 }
 
-/// `a*l0 + b*l1 + c*l2` on four lanes, evaluated as the scalar form
-/// `(a*l0 + b*l1) + c*l2` per lane so results match it bit for bit.
-#[inline(always)]
-fn interp3(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4], l0: f32, l1: f32, l2: f32) -> [f32; 4] {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::x86_64::*;
-        // SAFETY: SSE baseline; unaligned loads/stores of the arrays.
-        unsafe {
-            let va = _mm_loadu_ps(a.as_ptr());
-            let vb = _mm_loadu_ps(b.as_ptr());
-            let vc = _mm_loadu_ps(c.as_ptr());
-            let v = _mm_add_ps(
-                _mm_add_ps(_mm_mul_ps(va, _mm_set1_ps(l0)), _mm_mul_ps(vb, _mm_set1_ps(l1))),
-                _mm_mul_ps(vc, _mm_set1_ps(l2)),
-            );
-            let mut out = [0f32; 4];
-            _mm_storeu_ps(out.as_mut_ptr(), v);
-            out
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        [
-            a[0] * l0 + b[0] * l1 + c[0] * l2,
-            a[1] * l0 + b[1] * l1 + c[1] * l2,
-            a[2] * l0 + b[2] * l1 + c[2] * l2,
-            a[3] * l0 + b[3] * l1 + c[3] * l2,
-        ]
-    }
-}
-
 /// RGB8 (R low) into three 21-bit lanes of a u64.
 #[inline(always)]
 fn spread21(c: u32) -> u64 {
@@ -3336,35 +3439,12 @@ fn spread21(c: u32) -> u64 {
 /// without it.
 const UV_LIMIT: i32 = 1 << 30;
 
-/// A float texel coordinate in 1/256 texel, floored and saturated at
-/// [`UV_LIMIT`]. NaN comes out as 0 rather than an out-of-range index.
-#[inline(always)]
-fn uv256(fu: f32) -> i32 {
-    floor_i32((fu * 256.0).clamp(-(UV_LIMIT as f32), UV_LIMIT as f32))
-}
-
-/// The texel coordinates in 1/256 texel S/Q and T/Q address.
-#[inline(always)]
-fn stq_uv256(s: f32, t: f32, q: f32, ti: &TexInfo) -> (i32, i32) {
-    let q = if q.abs() < 1e-9 { 1.0 } else { q };
-    let inv_q = 1.0 / q;
-    (uv256(s * inv_q * ti.tw as f32), uv256(t * inv_q * ti.th as f32))
-}
-
 /// A bilinear footprint from a 1/256-texel coordinate: the top-left tap
 /// (half a texel back) and its weight.
 #[inline(always)]
 fn bilinear_tap(c: i32) -> (i32, u32) {
     let x = c - 128;
     (x >> 8, (x & 0xFF) as u32)
-}
-
-/// `f32::floor` as an integer, without the libm call the SSE2 baseline
-/// needs for the intrinsic.
-#[inline(always)]
-fn floor_i32(x: f32) -> i32 {
-    let i = x as i32;
-    if (i as f32) > x { i - 1 } else { i }
 }
 
 #[inline]
@@ -3429,6 +3509,38 @@ fn warn_once(told: &std::sync::atomic::AtomicBool, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 64-bit shortcut of the per-pixel STQ divide gives what the
+    /// 128-bit divide gives, across signs, exponents, saturation and Q = 0.
+    #[test]
+    fn stq_coords_match_the_plain_divide() {
+        let ti = TexInfo::new(&Context { tex0: 10 | (6 << 4), ..Context::default() }, 0, 0);
+        let mut seed = 0x0DDB_A11C_AFE5_EED5u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..2_000_000u32 {
+            // Magnitudes from 0 up to past a 2^30 mantissa in FRAC bits.
+            let mut val = || {
+                let bits = rnd() % 62;
+                let v = (rnd() & ((1u64 << bits) - 1)) as i64;
+                if rnd() & 1 == 0 { v } else { -v }
+            };
+            let stq = [val(), val(), if i % 97 == 0 { 0 } else { val() }];
+            let exp = [(rnd() % 80) as i32 - 30, (rnd() % 80) as i32 - 30, (rnd() % 80) as i32 - 30];
+            let wide = |s: i64, q: i64, es: i32, eq: i32, size: u32| {
+                let (s, q) = if q < 0 { (s.wrapping_neg(), q.wrapping_neg()) } else { (s, q) };
+                let (s, q) = (s >> STQ_DROP, q >> STQ_DROP);
+                let n = s as i128 * (size as i128 * 256);
+                if q == 0 { uv_div(n, 1, -(es + (FRAC - STQ_DROP) as i32)) } else { uv_div(n, q as i128, eq - es) }
+            };
+            let want = (wide(stq[0], stq[2], exp[0], exp[2], ti.tw), wide(stq[1], stq[2], exp[1], exp[2], ti.th));
+            assert_eq!(stq_coords(&stq, exp, &ti), want, "{stq:?} {exp:?}");
+        }
+    }
 
     /// Every 16-bit texel, under AEM off and on, next to neighbours that
     /// exercise both alpha levels: the SIMD blend has to stay equal to the

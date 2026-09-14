@@ -2040,11 +2040,11 @@ mod tests {
     /// The specialised row loops (fast triangle and sprite spans, sprite-like
     /// triangle spans, flat fills) take every attribute from the same
     /// fixed-point planes as the per-pixel pipeline, so drawing a scene
-    /// without them leaves local memory byte for byte the same. UV
-    /// addressing only: STQ still interpolates in float.
+    /// without them leaves local memory byte for byte the same, by UV and
+    /// by STQ (Q varying, Q constant across a quad, and Q = 0).
     #[test]
     fn row_loops_match_the_per_pixel_pipeline() {
-        let scene = |generic_only: bool, pass: u64, kind: &str| {
+        let scene = |generic_only: bool, pass: u64, kind: &str, stq: bool| {
             let mut gs = Gs::new();
             gs.raster.generic_only = generic_only;
             let mut seed = 0x9E37_79B9_7F4A_7C15u64;
@@ -2068,8 +2068,23 @@ mod tests {
             // TEX0_1: tbp 3000, tbw 1, PSMCT32, 64x64, TCC, MODULATE.
             gs.write_reg(0x06, 3000 | (1 << 14) | (6 << 26) | (6 << 30) | (1 << 34));
             gs.write_reg(0x42, 0x44); // ALPHA_1: (Cs - Cd) * As + Cd
+            // ST and Q for one vertex: S/Q and T/Q over about three texture
+            // widths, and now and then Q = 0.
+            let st_q = |gs: &mut Gs, rnd: &mut dyn FnMut(u64) -> u64, q: f32| -> u64 {
+                let scale = if q == 0.0 { 1.0 } else { q };
+                let (s, t) = (rnd(3000) as f32 / 1000.0 * scale, rnd(3000) as f32 / 1000.0 * scale);
+                gs.write_reg(0x02, s.to_bits() as u64 | (t.to_bits() as u64) << 32); // ST
+                (q.to_bits() as u64) << 32
+            };
+            let random_q = |rnd: &mut dyn FnMut(u64) -> u64| if rnd(16) == 0 { 0.0 } else { (rnd(8) + 1) as f32 / 4.0 };
             let vertex = |gs: &mut Gs, rnd: &mut dyn FnMut(u64) -> u64, x: u64, y: u64| {
-                gs.write_reg(0x01, rnd(1 << 32));
+                let q = if stq {
+                    let q = random_q(rnd);
+                    st_q(gs, rnd, q)
+                } else {
+                    0
+                };
+                gs.write_reg(0x01, rnd(1 << 32) | q);
                 gs.write_reg(0x03, rnd(64 * 16 * 3) | (rnd(64 * 16 * 3) << 16));
                 gs.write_reg(0x05, x | (y << 16) | (rnd(1 << 32) << 32));
             };
@@ -2079,7 +2094,7 @@ mod tests {
             // failure, GEQUAL Z test.
             let test = if ate { 1 | (6 << 1) | (0x40 << 4) | (1 << 12) } else { 0 };
             gs.write_reg(0x47, test | if zte { (1 << 16) | (2 << 17) } else { 0 });
-            let attrs = (1 << 4) | (1 << 8) | ((abe as u64) << 6); // TME, FST, ABE
+            let attrs = (1 << 4) | ((!stq as u64) << 8) | ((abe as u64) << 6); // TME, FST, ABE
             for _ in 0..24 {
                 match kind {
                     "gouraud triangles" => {
@@ -2097,6 +2112,8 @@ mod tests {
                         let (u0, v0) = (rnd(64 * 16), rnd(64 * 16));
                         let (du, dv) = (rnd(64 * 16 * 2), rnd(64 * 16));
                         let (rgba, z) = (rnd(1 << 32), rnd(1 << 32));
+                        // One Q for the whole quad, so its spans are linear.
+                        let q = if stq { random_q(&mut rnd) } else { 0.0 };
                         gs.write_reg(0x00, 3 | attrs);
                         for (x, y, u, v) in [
                             (x0, y0, u0, v0),
@@ -2106,7 +2123,8 @@ mod tests {
                             (x0 + w, y0 + h, u0 + du, v0 + dv),
                             (x0, y0 + h, u0, v0 + dv),
                         ] {
-                            gs.write_reg(0x01, rgba);
+                            let q = if stq { st_q(&mut gs, &mut rnd, q) } else { 0 };
+                            gs.write_reg(0x01, rgba | q);
                             gs.write_reg(0x03, u | (v << 16));
                             gs.write_reg(0x05, x | (y << 16) | (z << 32));
                         }
@@ -2124,12 +2142,15 @@ mod tests {
             gs.vram_snapshot()
         };
         let mut wrong = Vec::new();
-        for pass in 0..16 {
-            for kind in ["gouraud triangles", "sprite-like quads", "textured sprites", "untextured sprites"] {
-                let (fast, generic) = (scene(false, pass, kind), scene(true, pass, kind));
-                let n = fast.iter().zip(generic.iter()).filter(|(a, b)| a != b).count();
-                if n > 0 {
-                    wrong.push(format!("{kind}, pass {pass:#06b} (ZTE ATE ABE bilinear): {n} bytes differ"));
+        for stq in [false, true] {
+            for pass in 0..16 {
+                for kind in ["gouraud triangles", "sprite-like quads", "textured sprites", "untextured sprites"] {
+                    let (fast, generic) = (scene(false, pass, kind, stq), scene(true, pass, kind, stq));
+                    let n = fast.iter().zip(generic.iter()).filter(|(a, b)| a != b).count();
+                    if n > 0 {
+                        let by = if stq { "STQ" } else { "UV" };
+                        wrong.push(format!("{kind} by {by}, pass {pass:#06b} (ZTE ATE ABE bilinear): {n} bytes differ"));
+                    }
                 }
             }
         }
