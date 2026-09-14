@@ -220,7 +220,7 @@ enum Shape {
 impl Shape {
     /// The same shape in the overlay's doubled coordinate space.
     fn scaled(self) -> Self {
-        let s = Gs::scale_vertex;
+        let s = SoftRaster::scale_vertex;
         match self {
             Shape::Line { a, b, gouraud } => Shape::Line { a: s(a), b: s(b), gouraud },
             Shape::Sprite { v0, v1 } => Shape::Sprite { v0: s(v0), v1: s(v1) },
@@ -380,38 +380,10 @@ impl Gs {
     pub(super) fn draw_point(&mut self) {
         let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         let v = self.vq[0];
-        let pipe = self.pixel_pipe();
-        let frag = Frag {
-            r: v.r as f32,
-            g: v.g as f32,
-            b: v.b as f32,
-            a: v.a as f32,
-            z: v.z,
-            s: v.s,
-            t: v.t,
-            q: v.q,
-            u: v.u as f32 / 16.0,
-            v: v.v as f32 / 16.0,
-            f: v.f as f32,
-        };
-        let (px, py) = (v.x >> 4, v.y >> 4);
-        if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
-            // Points are rare: draw in place, keeping order with the queue.
-            self.flush_batch();
-            let mut p = Painter {
-                canvas: &self.canvas,
-                tex: &self.canvas,
-                clut: self.raster.clut.block(pipe.clut_off as usize),
-                pipe: &pipe,
-                scratch: &mut self.raster.scratch,
-            };
-            let texel = if pipe.tme { p.sample(&frag) } else { 0 };
-            let row = Row::new(&pipe, py as u32);
-            p.shade_row_px(&row, px as u32, frag, texel);
-            self.mirror_rect(&pipe, px, px, py, py + 1);
-        }
+        let env = self.draw_env();
+        let (raster, mut host) = self.raster_host();
+        raster.draw_point(&mut host, env, v);
         self.prims_drawn += 1;
-        self.merge_scratch();
     }
 
     /// Rasterize a line with a pixel-step DDA over the major axis. As on
@@ -424,7 +396,7 @@ impl Gs {
         let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
         self.log_target(self.prim, "line", 2);
         let (a, b) = (self.vq[0], self.vq[1]);
-        let pipe = self.pixel_pipe();
+        let env = self.draw_env();
         tracing::trace!(target: "ps2_core::gs::line",
             v0 = format_args!("({},{},z={:#x})", a.x as f32 / 16.0, a.y as f32 / 16.0, a.z),
             v1 = format_args!("({},{})", b.x as f32 / 16.0, b.y as f32 / 16.0),
@@ -433,60 +405,68 @@ impl Gs {
             fbp = (self.ctx[((self.prim >> 9) & 1) as usize].frame & 0x1FF) * 32,
             "line");
         let gouraud = self.prim & 8 != 0;
-        if self.draw_shape(pipe, Shape::Line { a, b, gouraud }) {
+        let (raster, mut host) = self.raster_host();
+        if raster.draw(&mut host, env, Shape::Line { a, b, gouraud }) {
             self.prims_drawn += 1;
         }
     }
 
-    /// Rasterizer geometry for `shape` under `pipe`: the queued primitive,
-    /// its row range and pixel estimate, and the texel rows it samples
-    /// (see [`Gs::enqueue`]). `None` = nothing to draw.
-    fn setup(pipe: &PixelPipe, shape: Shape) -> Option<(Prim, i32, i32, i64, Option<(f32, f32)>)> {
-        match shape {
-            Shape::Line { a, b, gouraud } => {
-                Self::line_prim(pipe, a, b, gouraud).map(|(g, s, e, px)| (Prim::Line(g), s, e, px, None))
-            }
-            Shape::Sprite { v0, v1 } => {
-                let (g, s, e, px, tex_v) = Self::sprite_prim(pipe, v0, v1);
-                Some((Prim::Sprite(g), s, e, px, Some(tex_v)))
-            }
-            Shape::Tri { a, b, c } => {
-                Self::tri_prim(pipe, a, b, c).map(|(g, s, e, px, tex_v)| (Prim::Tri(g), s, e, px, Some(tex_v)))
-            }
+    pub(super) fn draw_sprite(&mut self) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
+        let v0 = self.vq[0];
+        let v1 = self.vq[1];
+        let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
+        let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
+        // 12.4 in, pixels out: draw [x0, x1) rounding up from the left, so
+        // a pixel is covered when its own coordinate is inside the sprite.
+        let px0 = (x0 + 15) >> 4;
+        let px1 = (x1 + 15) >> 4;
+        let py0 = (y0 + 15) >> 4;
+        let py1 = (y1 + 15) >> 4;
+        let attrs = self.attrs();
+        let tme = attrs & (1 << 4) != 0;
+        self.prims_drawn += 1;
+        if tme {
+            self.prims_textured += 1;
         }
+        self.log_target(attrs, "sprite", 2);
+        if px1 - px0 <= 24 && py1 - py0 <= 24 {
+            self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
+        }
+        let env = self.draw_env();
+        let (raster, mut host) = self.raster_host();
+        raster.draw(&mut host, env, Shape::Sprite { v0, v1 });
     }
 
-    /// Queue `shape`, plus its internal-2x twin when the overlay is on.
-    /// `false` = clipped away, nothing queued.
-    fn draw_shape(&mut self, pipe: PixelPipe, shape: Shape) -> bool {
-        let Some((prim, start, end, px, tex_v)) = Self::setup(&pipe, shape) else {
-            return false;
+    pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
+        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
+        let (v0, v1, v2) = (self.vq[i0], self.vq[i1], self.vq[i2]);
+        self.prims_drawn += 1;
+        let attrs = self.attrs();
+        if attrs & (1 << 4) != 0 {
+            self.prims_textured += 1;
+        }
+        self.log_target(attrs, "triangle", 3);
+        // 12.4 edge functions; area in 8.8.
+        let area = edge(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
+        if area == 0 {
+            return;
+        }
+        let (a, b, c) = if area < 0 {
+            (v0, v2, v1)
+        } else {
+            (v0, v1, v2)
         };
-        let twin = self.scaled_pipe(&pipe).map(|p2| (p2, pipe.clone()));
-        let queued = self.enqueue(pipe, prim, start, end, px, tex_v);
-        if let Some((p2, pipe)) = twin {
-            if !queued {
-                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, start, end);
-            } else if let Some((g2, s2, e2, px2, _)) = Self::setup(&p2, shape.scaled()) {
-                self.enqueue_hi(p2, g2, s2, e2, px2);
-            }
+        let minx = (a.x.min(b.x).min(c.x) >> 4).max(0);
+        let maxx = ((a.x.max(b.x).max(c.x) + 15) >> 4).min(4095);
+        let miny = (a.y.min(b.y).min(c.y) >> 4).max(0);
+        let maxy = ((a.y.max(b.y).max(c.y) + 15) >> 4).min(4095);
+        if maxx - minx <= 24 && maxy - miny <= 24 {
+            self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
         }
-        true
-    }
-
-    /// Line geometry and its row/pixel extent for [`Gs::enqueue`].
-    fn line_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, gouraud: bool) -> Option<(LineGeom, i32, i32, i64)> {
-        let (fy0, fy1) = (a.y as f32 / 16.0, b.y as f32 / 16.0);
-        let steps = ((b.x - a.x) as f32 / 16.0)
-            .abs()
-            .max((fy1 - fy0).abs())
-            .round() as i32;
-        if steps <= 0 {
-            return None;
-        }
-        let start = (fy0.min(fy1).floor() as i32).max(pipe.scy0);
-        let end = ((fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1)).max(start);
-        Some((LineGeom { a, b, gouraud, steps }, start, end, steps as i64))
+        let env = self.draw_env();
+        let (raster, mut host) = self.raster_host();
+        raster.draw(&mut host, env, Shape::Tri { a, b, c });
     }
 
     /// Bring-up aid: describe each distinct render-target setup once.
@@ -545,94 +525,243 @@ impl Gs {
             "small prim");
     }
 
-    /// Fold the main scratch's counters into the statistics.
-    fn merge_scratch(&mut self) {
-        self.pixels_shaded += std::mem::take(&mut self.raster.scratch.pixels);
-        for (h, s) in self.tex_psm_hist.iter_mut().zip(self.raster.scratch.tex_samples.iter_mut()) {
-            *h += std::mem::take(s);
+    /// TEX1's mipmap level for this primitive, and the filter that goes
+    /// with it.
+    ///
+    /// Only the fixed-LOD form is modelled. `LCM = 1` makes the LOD the K
+    /// field outright, so the level is constant over the primitive and can
+    /// be folded into [`TexInfo`] instead of costing anything per pixel --
+    /// which is how every mipmapped draw seen so far picks its distance
+    /// ring. `LCM = 0` derives the LOD from Q per pixel; nothing needs it
+    /// yet, so it stays at level 0.
+    fn mip_select(ctx: &Context) -> (u32, bool) {
+        let tex1 = ctx.tex1;
+        let mmag = (tex1 >> 5) & 1 != 0;
+        let mxl = ((tex1 >> 2) & 7) as i32;
+        let mmin = ((tex1 >> 6) & 7) as u32;
+        // Without a mipmap chain MMAG decides for every sample, as it did
+        // before levels existed: minification alone is not modelled.
+        if mxl == 0 || mmin < 2 {
+            return (0, mmag);
+        }
+        if tex1 & 1 == 0 {
+            warn_once(&MIP_LCM, "TEX1 LCM=0 (LOD computed from Q) is not modelled; sampling level 0");
+            return (0, mmag);
+        }
+        if tex1 & (1 << 9) == 0 {
+            warn_once(&MIP_MTBA, "TEX1 MTBA=0 (explicit MIPTBP1/2 bases) is not modelled; sampling level 0");
+            return (0, mmag);
+        }
+        // K is signed 12-bit in 1/16 LOD units. The MIPMAP_NEAREST filters
+        // round to a level; the MIPMAP_LINEAR ones blend two, and taking
+        // the lower of the pair is the approximation here.
+        let k = ((((tex1 >> 32) & 0xFFF) as i32) << 20) >> 20;
+        let level = if mmin == 2 || mmin == 4 { (k + 8) >> 4 } else { k >> 4 };
+        if mmin == 3 || mmin == 5 {
+            warn_once(&MIP_BLEND, "TEX1 MMIN blends two levels; sampling the lower one");
+        }
+        let level = level.clamp(0, mxl) as u32;
+        // MMAG applies where the texture is magnified, which for a fixed
+        // LOD means level 0; below it the MMIN filter decides.
+        (level, if level == 0 { mmag } else { matches!(mmin, 1 | 4 | 5) })
+    }
+
+    /// Decode the drawing environment for the current context once per
+    /// primitive; the per-pixel path only reads it.
+    fn draw_env(&self) -> DrawEnv {
+        let attrs = self.attrs();
+        let ctx = self.ctx[((attrs >> 9) & 1) as usize];
+        let test = ctx.test;
+        let (level, bilinear) = Self::mip_select(&ctx);
+        let tex = TexInfo::new(&ctx, self.texa, level);
+        DrawEnv {
+            kind: (self.prim & 7) as u8,
+            scx0: (ctx.scissor & 0x7FF) as i32,
+            scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
+            scy0: ((ctx.scissor >> 32) & 0x7FF) as i32,
+            scy1: ((ctx.scissor >> 48) & 0x7FF) as i32,
+            tme: attrs & (1 << 4) != 0,
+            fst: attrs & (1 << 8) != 0,
+            abe: attrs & (1 << 6) != 0,
+            fge: attrs & (1 << 5) != 0,
+            fogcol: (self.fogcol & 0xFF_FFFF) as u32,
+            tfx: ((ctx.tex0 >> 35) & 3) as u8,
+            tcc: ctx.tex0 & (1 << 34) != 0,
+            bilinear,
+            tex,
+            ate: test & 1 != 0,
+            atst: ((test >> 1) & 7) as u8,
+            aref: ((test >> 4) & 0xFF) as u32,
+            afail: ((test >> 12) & 3) as u8,
+            zte: test & (1 << 16) != 0,
+            ztst: ((test >> 17) & 3) as u8,
+            zbp: ((ctx.zbuf & 0x1FF) * 32) as u32,
+            zmsk: ctx.zbuf & (1 << 32) != 0,
+            // Z buffer depth: PSMZ32 keeps 32 bits, PSMZ24 24, PSMZ16(S) 16;
+            // the upper bits of the stored word belong to whatever else
+            // shares the memory (Amagami parks 8-bit textures over its Z24
+            // buffer).
+            zmask: match (ctx.zbuf >> 24) & 0xF {
+                0x0 => u32::MAX,
+                0x1 => 0x00FF_FFFF,
+                _ => 0xFFFF,
+            },
+            fbp: ((ctx.frame & 0x1FF) * 32) as u32,
+            fbw: ((ctx.frame >> 16) & 0x3F) as u32,
+            fb24: ((ctx.frame >> 24) & 0x3F) as u32 == PSMCT24,
+            fbmsk: (ctx.frame >> 32) as u32,
+            blend_a: (ctx.alpha & 3) as u8,
+            blend_b: ((ctx.alpha >> 2) & 3) as u8,
+            blend_c: ((ctx.alpha >> 4) & 3) as u8,
+            blend_d: ((ctx.alpha >> 6) & 3) as u8,
+            blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
+        }
+    }
+}
+
+/// What [`SoftRaster`] borrows from the rest of [`Gs`] for one call: local
+/// memory it draws into and samples, the CLUT unit palettes are decoded
+/// from, and the statistics it counts into.
+pub(super) struct Host<'a> {
+    pub(super) canvas: &'a Canvas,
+    pub(super) clut_unit: &'a mut clut::Unit,
+    pub(super) pixels_shaded: &'a mut u64,
+    pub(super) prims_split: &'a mut u64,
+    pub(super) tex_psm_hist: &'a mut [u64; 64],
+}
+
+impl Gs {
+    /// The rasterizer, split off from what it borrows.
+    fn raster_host(&mut self) -> (&mut SoftRaster, Host<'_>) {
+        let host = Host {
+            canvas: &self.canvas,
+            clut_unit: &mut self.clut_unit,
+            pixels_shaded: &mut self.pixels_shaded,
+            prims_split: &mut self.prims_split,
+            tex_psm_hist: &mut self.tex_psm_hist,
+        };
+        (&mut self.raster, host)
+    }
+
+    pub(super) fn flush_batch(&mut self) {
+        let (raster, mut host) = self.raster_host();
+        raster.flush_batch(&mut host);
+    }
+
+    pub(super) fn clut_write(&mut self, tex0: u64) {
+        let (raster, mut host) = self.raster_host();
+        raster.clut_write(&mut host, tex0);
+    }
+
+    pub(super) fn clut_memory_changing(&mut self) {
+        let (raster, mut host) = self.raster_host();
+        raster.clut_memory_changing(&mut host);
+    }
+}
+
+impl SoftRaster {
+    /// Draw a point under `env`. Points are rare: it is shaded in place,
+    /// after the queue, so it keeps its order with it.
+    fn draw_point(&mut self, host: &mut Host, env: DrawEnv, v: Vertex) {
+        let pipe = self.pixel_pipe(host, env);
+        let frag = Frag {
+            r: v.r as f32,
+            g: v.g as f32,
+            b: v.b as f32,
+            a: v.a as f32,
+            z: v.z,
+            s: v.s,
+            t: v.t,
+            q: v.q,
+            u: v.u as f32 / 16.0,
+            v: v.v as f32 / 16.0,
+            f: v.f as f32,
+        };
+        let (px, py) = (v.x >> 4, v.y >> 4);
+        if px >= pipe.scx0 && px <= pipe.scx1 && py >= pipe.scy0 && py <= pipe.scy1 {
+            self.flush_batch(host);
+            let mut p = Painter {
+                canvas: host.canvas,
+                tex: host.canvas,
+                clut: self.clut.block(pipe.clut_off as usize),
+                pipe: &pipe,
+                scratch: &mut self.scratch,
+            };
+            let texel = if pipe.tme { p.sample(&frag) } else { 0 };
+            let row = Row::new(&pipe, py as u32);
+            p.shade_row_px(&row, px as u32, frag, texel);
+            self.mirror_rect(host, &pipe, px, px, py, py + 1);
+        }
+        self.merge_scratch(host);
+    }
+
+    /// Queue `shape` drawn under `env`, plus its internal-2x twin when the
+    /// overlay is on. `false` = clipped away, nothing queued.
+    fn draw(&mut self, host: &mut Host, env: DrawEnv, shape: Shape) -> bool {
+        let pipe = self.pixel_pipe(host, env);
+        let Some((prim, start, end, px, tex_v)) = Self::setup(&pipe, shape) else {
+            return false;
+        };
+        let twin = self.scaled_pipe(&pipe).map(|p2| (p2, pipe.clone()));
+        let queued = self.enqueue(host, pipe, prim, start, end, px, tex_v);
+        if let Some((p2, pipe)) = twin {
+            if !queued {
+                self.mirror_rect(host, &pipe, pipe.scx0, pipe.scx1, start, end);
+            } else if let Some((g2, s2, e2, px2, _)) = Self::setup(&p2, shape.scaled()) {
+                self.enqueue_hi(host, p2, g2, s2, e2, px2);
+            }
+        }
+        true
+    }
+
+    /// This rasterizer's pipe for a primitive drawn under `env`: the
+    /// palette block, and the loop selection the row code reads.
+    fn pixel_pipe(&mut self, host: &mut Host, env: DrawEnv) -> PixelPipe {
+        let clut_off = if env.tme && env.tex.clut_bits != 0 { self.refresh_clut(host, &env.tex) } else { 0 };
+        let z_touched = env.zte && !(env.ztst == 1 && env.zmsk);
+        // Fogging is only implemented on the generic per-pixel path.
+        let fast = env.tme && env.tfx == 0 && env.fbmsk == 0 && !env.fge;
+        let fast_decal = env.tme && env.tfx == 1 && env.fbmsk == 0 && !env.fge;
+        // Z may be written (ALWAYS) but never tested; the alpha test on a
+        // flat colour is decided once per row by the loop itself.
+        let flat_fill = !env.tme && (!z_touched || env.ztst == 1) && env.fbmsk == 0 && !env.fge;
+        PixelPipe { env, z_touched, clut_off, fast, fast_decal, flat_fill }
+    }
+
+    /// Rasterizer geometry for `shape` under `pipe`: the queued primitive,
+    /// its row range and pixel estimate, and the texel rows it samples
+    /// (see [`SoftRaster::enqueue`]). `None` = nothing to draw.
+    fn setup(pipe: &PixelPipe, shape: Shape) -> Option<(Prim, i32, i32, i64, Option<(f32, f32)>)> {
+        match shape {
+            Shape::Line { a, b, gouraud } => {
+                Self::line_prim(pipe, a, b, gouraud).map(|(g, s, e, px)| (Prim::Line(g), s, e, px, None))
+            }
+            Shape::Sprite { v0, v1 } => {
+                let (g, s, e, px, tex_v) = Self::sprite_prim(pipe, v0, v1);
+                Some((Prim::Sprite(g), s, e, px, Some(tex_v)))
+            }
+            Shape::Tri { a, b, c } => {
+                Self::tri_prim(pipe, a, b, c).map(|(g, s, e, px, tex_v)| (Prim::Tri(g), s, e, px, Some(tex_v)))
+            }
         }
     }
 
-    /// Texel rows one page of `psm` holds, and the block distance between
-    /// consecutive rows of pages. Mirrors the arithmetic in `layout`'s
-    /// `addr*`: getting this wrong under-states where a texture lives and
-    /// lets a read-after-write hazard through.
-    fn tex_page_geom(psm: u32, tbw: u32) -> (u32, u32) {
-        let bw = tbw.max(1);
-        match psm {
-            // 128x64 texel pages, addressed with half the declared width.
-            PSMT8 => (64, (bw >> 1) * 32),
-            // 128x128 texel pages, likewise.
-            PSMT4 => (128, (bw >> 1) * 32),
-            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => (64, bw * 32),
-            // 32-bit pages, including the ones packed into their alpha.
-            _ => (32, bw * 32),
-        }
-    }
-
-    /// Block range the texture may be sampled from (conservative): `tex_v`
-    /// is the texel row range the primitive samples (`None` = unknown,
-    /// assume the whole declared height). `None` result = untextured.
-    fn tex_blocks(pipe: &PixelPipe, tex_v: Option<(f32, f32)>) -> Option<std::ops::Range<u32>> {
-        if !pipe.tme {
+    /// Line geometry and its row/pixel extent for [`SoftRaster::enqueue`].
+    fn line_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, gouraud: bool) -> Option<(LineGeom, i32, i32, i64)> {
+        let (fy0, fy1) = (a.y as f32 / 16.0, b.y as f32 / 16.0);
+        let steps = ((b.x - a.x) as f32 / 16.0)
+            .abs()
+            .max((fy1 - fy0).abs())
+            .round() as i32;
+        if steps <= 0 {
             return None;
         }
-        let ti = &pipe.tex;
-        // REGION_CLAMP and REGION_REPEAT map a sample to a row `wrap` picks
-        // from MINV/MAXV, which can sit past the declared height — so they
-        // neither trust the sampled range nor stop at `th`.
-        let (v_lo, v_hi) = match (ti.wmt, tex_v) {
-            // Sampled range plus one for the bilinear tap, when it cannot wrap.
-            (0 | 1, Some((lo, hi))) if lo >= 0.0 && hi + 1.0 < ti.th as f32 => {
-                (lo as u32, hi as u32 + 1)
-            }
-            (2, _) => (0, ti.th.max(ti.maxv.max(ti.minv).max(0) as u32 + 1)),
-            (3, _) => (0, ti.th.max((ti.minv | ti.maxv).max(0) as u32 + 1)),
-            _ => (0, ti.th),
-        };
-        let (page_rows, stride) = Self::tex_page_geom(ti.psm, ti.tbw);
-        // A single-page-wide buffer has a zero stride; it still spans a page.
-        let span = stride.max(32);
-        Some(ti.tbp + (v_lo / page_rows) * stride..ti.tbp + (v_hi / page_rows) * stride + span)
+        let start = (fy0.min(fy1).floor() as i32).max(pipe.scy0);
+        let end = ((fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1)).max(start);
+        Some((LineGeom { a, b, gouraud, steps }, start, end, steps as i64))
     }
 
-    /// Block ranges a primitive covering rows `0..rows` writes: frame and Z
-    /// buffer, `None` where fully masked. Only written buffers can feed
-    /// back into a texture.
-    fn written_blocks(pipe: &PixelPipe, rows: i32) -> (Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>) {
-        let target_pages = ((rows.max(0) as u32).div_ceil(32)) * pipe.fbw.max(1);
-        let fb = (pipe.fbmsk != u32::MAX).then(|| pipe.fbp..pipe.fbp + target_pages * 32);
-        let zb = (pipe.zte && !pipe.zmsk).then(|| pipe.zbp..pipe.zbp + target_pages * 32);
-        (fb, zb)
-    }
-
-    pub(super) fn draw_sprite(&mut self) {
-        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
-        let v0 = self.vq[0];
-        let v1 = self.vq[1];
-        let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
-        let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
-        // 12.4 in, pixels out: draw [x0, x1) rounding up from the left, so
-        // a pixel is covered when its own coordinate is inside the sprite.
-        let px0 = (x0 + 15) >> 4;
-        let px1 = (x1 + 15) >> 4;
-        let py0 = (y0 + 15) >> 4;
-        let py1 = (y1 + 15) >> 4;
-        let attrs = self.attrs();
-        let tme = attrs & (1 << 4) != 0;
-        self.prims_drawn += 1;
-        if tme {
-            self.prims_textured += 1;
-        }
-        self.log_target(attrs, "sprite", 2);
-        if px1 - px0 <= 24 && py1 - py0 <= 24 {
-            self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
-        }
-        let pipe = self.pixel_pipe();
-        self.draw_shape(pipe, Shape::Sprite { v0, v1 });
-    }
-
-    /// Sprite geometry and its row/pixel extent for [`Gs::enqueue`].
+    /// Sprite geometry and its row/pixel extent for [`SoftRaster::enqueue`].
     fn sprite_prim(pipe: &PixelPipe, v0: Vertex, v1: Vertex) -> (SpriteGeom, i32, i32, i64, (f32, f32)) {
         let (x0, x1) = (v0.x.min(v1.x), v0.x.max(v1.x));
         let (y0, y1) = (v0.y.min(v1.y), v0.y.max(v1.y));
@@ -687,37 +816,7 @@ impl Gs {
         (geom, rya, ryb, px, tex_v)
     }
 
-    pub(super) fn draw_triangle(&mut self, i0: usize, i1: usize, i2: usize) {
-        let _p = crate::prof::scope(crate::prof::Slot::GsDraw);
-        let (v0, v1, v2) = (self.vq[i0], self.vq[i1], self.vq[i2]);
-        self.prims_drawn += 1;
-        let attrs = self.attrs();
-        if attrs & (1 << 4) != 0 {
-            self.prims_textured += 1;
-        }
-        self.log_target(attrs, "triangle", 3);
-        // 12.4 edge functions; area in 8.8.
-        let area = edge(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
-        if area == 0 {
-            return;
-        }
-        let (a, b, c) = if area < 0 {
-            (v0, v2, v1)
-        } else {
-            (v0, v1, v2)
-        };
-        let minx = (a.x.min(b.x).min(c.x) >> 4).max(0);
-        let maxx = ((a.x.max(b.x).max(c.x) + 15) >> 4).min(4095);
-        let miny = (a.y.min(b.y).min(c.y) >> 4).max(0);
-        let maxy = ((a.y.max(b.y).max(c.y) + 15) >> 4).min(4095);
-        if maxx - minx <= 24 && maxy - miny <= 24 {
-            self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
-        }
-        let pipe = self.pixel_pipe();
-        self.draw_shape(pipe, Shape::Tri { a, b, c });
-    }
-
-    /// Triangle geometry and its row/pixel extent for [`Gs::enqueue`];
+    /// Triangle geometry and its row/pixel extent for [`SoftRaster::enqueue`];
     /// `a, b, c` are already wound positive. `None` = clipped out.
     fn tri_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, c: Vertex) -> Option<(TriGeom, i32, i32, i64, (f32, f32))> {
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
@@ -785,6 +884,67 @@ impl Gs {
         Some((geom, miny, maxy + 1, px, tex_v))
     }
 
+    /// Fold the main scratch's counters into the statistics.
+    fn merge_scratch(&mut self, host: &mut Host) {
+        *host.pixels_shaded += std::mem::take(&mut self.scratch.pixels);
+        for (h, s) in host.tex_psm_hist.iter_mut().zip(self.scratch.tex_samples.iter_mut()) {
+            *h += std::mem::take(s);
+        }
+    }
+
+    /// Texel rows one page of `psm` holds, and the block distance between
+    /// consecutive rows of pages. Mirrors the arithmetic in `layout`'s
+    /// `addr*`: getting this wrong under-states where a texture lives and
+    /// lets a read-after-write hazard through.
+    fn tex_page_geom(psm: u32, tbw: u32) -> (u32, u32) {
+        let bw = tbw.max(1);
+        match psm {
+            // 128x64 texel pages, addressed with half the declared width.
+            PSMT8 => (64, (bw >> 1) * 32),
+            // 128x128 texel pages, likewise.
+            PSMT4 => (128, (bw >> 1) * 32),
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => (64, bw * 32),
+            // 32-bit pages, including the ones packed into their alpha.
+            _ => (32, bw * 32),
+        }
+    }
+
+    /// Block range the texture may be sampled from (conservative): `tex_v`
+    /// is the texel row range the primitive samples (`None` = unknown,
+    /// assume the whole declared height). `None` result = untextured.
+    fn tex_blocks(pipe: &PixelPipe, tex_v: Option<(f32, f32)>) -> Option<std::ops::Range<u32>> {
+        if !pipe.tme {
+            return None;
+        }
+        let ti = &pipe.tex;
+        // REGION_CLAMP and REGION_REPEAT map a sample to a row `wrap` picks
+        // from MINV/MAXV, which can sit past the declared height — so they
+        // neither trust the sampled range nor stop at `th`.
+        let (v_lo, v_hi) = match (ti.wmt, tex_v) {
+            // Sampled range plus one for the bilinear tap, when it cannot wrap.
+            (0 | 1, Some((lo, hi))) if lo >= 0.0 && hi + 1.0 < ti.th as f32 => {
+                (lo as u32, hi as u32 + 1)
+            }
+            (2, _) => (0, ti.th.max(ti.maxv.max(ti.minv).max(0) as u32 + 1)),
+            (3, _) => (0, ti.th.max((ti.minv | ti.maxv).max(0) as u32 + 1)),
+            _ => (0, ti.th),
+        };
+        let (page_rows, stride) = Self::tex_page_geom(ti.psm, ti.tbw);
+        // A single-page-wide buffer has a zero stride; it still spans a page.
+        let span = stride.max(32);
+        Some(ti.tbp + (v_lo / page_rows) * stride..ti.tbp + (v_hi / page_rows) * stride + span)
+    }
+
+    /// Block ranges a primitive covering rows `0..rows` writes: frame and Z
+    /// buffer, `None` where fully masked. Only written buffers can feed
+    /// back into a texture.
+    fn written_blocks(pipe: &PixelPipe, rows: i32) -> (Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>) {
+        let target_pages = ((rows.max(0) as u32).div_ceil(32)) * pipe.fbw.max(1);
+        let fb = (pipe.fbmsk != u32::MAX).then(|| pipe.fbp..pipe.fbp + target_pages * 32);
+        let zb = (pipe.zte && !pipe.zmsk).then(|| pipe.zbp..pipe.zbp + target_pages * 32);
+        (fb, zb)
+    }
+
     /// Queue a decoded primitive, flushing first when it would read what
     /// the queue wrote, when it would write what the queue read, or when it
     /// would write memory the queue already writes through a different
@@ -795,51 +955,51 @@ impl Gs {
     /// A primitive sampling its own target runs inline — its result depends
     /// on draw order within itself — and `false` is returned so the caller
     /// mirrors the 1x result into the overlay instead of queueing a 2x twin.
-    fn enqueue(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) -> bool {
+    fn enqueue(&mut self, host: &mut Host, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64, tex_v: Option<(f32, f32)>) -> bool {
         let tex = Self::tex_blocks(&pipe, tex_v);
         let (fb, zb) = Self::written_blocks(&pipe, end);
         let targets = [(&fb, pipe.fbp), (&zb, pipe.zbp)];
         if targets.iter().any(|(w, base)| {
-            w.as_ref().is_some_and(|w| self.raster.batch.aliases(w, *base, pipe.fbw))
+            w.as_ref().is_some_and(|w| self.batch.aliases(w, *base, pipe.fbw))
         }) {
-            self.flush_batch();
+            self.flush_batch(host);
         }
         if let Some(t) = &tex {
-            if self.raster.batch.after_write(t) {
-                self.flush_batch();
+            if self.batch.after_write(t) {
+                self.flush_batch(host);
             }
             let overlaps = |w: &Option<std::ops::Range<u32>>| {
                 w.as_ref().is_some_and(|w| t.start < w.end && w.start < t.end)
             };
             if overlaps(&fb) || overlaps(&zb) {
-                self.flush_batch();
+                self.flush_batch(host);
                 let mut p = Painter {
-                    canvas: &self.canvas,
-                    tex: &self.canvas,
-                    clut: self.raster.clut.block(pipe.clut_off as usize),
+                    canvas: host.canvas,
+                    tex: host.canvas,
+                    clut: self.clut.block(pipe.clut_off as usize),
                     pipe: &pipe,
-                    scratch: &mut self.raster.scratch,
+                    scratch: &mut self.scratch,
                 };
                 Self::run_prim(&mut p, &prim, Rows::all(start, end));
-                self.merge_scratch();
+                self.merge_scratch(host);
                 return false;
             }
         }
-        if targets.iter().any(|(w, _)| w.as_ref().is_some_and(|w| self.raster.batch.before_read(w))) {
-            self.flush_batch();
+        if targets.iter().any(|(w, _)| w.as_ref().is_some_and(|w| self.batch.before_read(w))) {
+            self.flush_batch(host);
         }
         if let Some(t) = tex {
-            self.raster.batch.note_read(t);
+            self.batch.note_read(t);
         }
         for (r, base) in [(fb, pipe.fbp), (zb, pipe.zbp)] {
             if let Some(r) = r {
-                self.raster.batch.note_write(r, base, pipe.fbw);
+                self.batch.note_write(r, base, pipe.fbw);
             }
         }
-        self.raster.batch.px += px;
-        self.raster.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
-        if self.raster.batch.px >= BATCH_MAX_PIXELS {
-            self.flush_batch();
+        self.batch.px += px;
+        self.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
+        if self.batch.px >= BATCH_MAX_PIXELS {
+            self.flush_batch(host);
         }
         true
     }
@@ -847,11 +1007,11 @@ impl Gs {
     /// Queue the internal-2x twin of a primitive just queued at 1x. It
     /// shares the queue (order among twins matches the 1x order) but skips
     /// the dependency checks — those were decided by its 1x sibling.
-    fn enqueue_hi(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64) {
-        self.raster.batch.px += px;
-        self.raster.batch.queued.push(Queued { pipe, prim, start, end, hi: true });
-        if self.raster.batch.px >= BATCH_MAX_PIXELS {
-            self.flush_batch();
+    fn enqueue_hi(&mut self, host: &mut Host, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64) {
+        self.batch.px += px;
+        self.batch.queued.push(Queued { pipe, prim, start, end, hi: true });
+        if self.batch.px >= BATCH_MAX_PIXELS {
+            self.flush_batch(host);
         }
     }
 
@@ -859,7 +1019,7 @@ impl Gs {
     /// doubled coordinate space (`None` when the overlay is off). Texture
     /// fields stay in 1x space — sampling reads local memory.
     fn scaled_pipe(&self, pipe: &PixelPipe) -> Option<PixelPipe> {
-        self.raster.overlay.as_ref()?;
+        self.overlay.as_ref()?;
         let mut p = pipe.clone();
         let e = &mut p.env;
         e.scx0 *= 2;
@@ -881,20 +1041,20 @@ impl Gs {
     /// written Z) from local memory into the overlay as 2x2 duplicates —
     /// for primitives whose 2x twin cannot be rasterized because they
     /// sample their own target.
-    fn mirror_rect(&mut self, pipe: &PixelPipe, x0: i32, x1: i32, y0: i32, y1: i32) {
-        let Some(ov) = &self.raster.overlay else { return };
+    fn mirror_rect(&self, host: &Host, pipe: &PixelPipe, x0: i32, x1: i32, y0: i32, y1: i32) {
+        let Some(ov) = &self.overlay else { return };
         let write_z = pipe.zte && !pipe.zmsk;
         for y in y0.max(0)..y1 {
             for x in x0.max(0)..=x1 {
                 let (x, y) = (x as u32, y as u32);
                 if pipe.fbmsk != u32::MAX {
-                    let v = self.canvas.read_psmct32(pipe.fbp, pipe.fbw, x, y);
+                    let v = host.canvas.read_psmct32(pipe.fbp, pipe.fbw, x, y);
                     for d in 0..4u32 {
                         ov.write_psmct32(pipe.fbp * 4, pipe.fbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), v);
                     }
                 }
                 if write_z {
-                    let z = self.canvas.read_psmz32(pipe.zbp, pipe.fbw, x, y);
+                    let z = host.canvas.read_psmz32(pipe.zbp, pipe.fbw, x, y);
                     for d in 0..4u32 {
                         ov.write_psmz32(pipe.zbp * 4, pipe.fbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), z);
                     }
@@ -918,29 +1078,29 @@ impl Gs {
     /// primitive whose reads or writes cross another queued primitive's: a
     /// lane reaches a later primitive's write long before another lane
     /// reaches an earlier primitive's read of the same memory.
-    pub(super) fn flush_batch(&mut self) {
-        if self.raster.batch.queued.is_empty() {
+    fn flush_batch(&mut self, host: &mut Host) {
+        if self.batch.queued.is_empty() {
             return;
         }
         // A primitive queued after a recorded CLUT load may write the
         // memory that load reads; the load came first, so read it now.
-        if self.clut_unit.pending() && self.raster.batch.writes.iter().any(|w| self.clut_unit.pending_in(&(w.start..w.end))) {
-            self.materialise_clut();
+        if host.clut_unit.pending() && self.batch.writes.iter().any(|w| host.clut_unit.pending_in(&(w.start..w.end))) {
+            Self::materialise_clut(host);
         }
-        let queued = std::mem::take(&mut self.raster.batch.queued);
-        let px = std::mem::take(&mut self.raster.batch.px);
-        self.raster.batch.writes.clear();
-        self.raster.batch.reads.clear();
+        let queued = std::mem::take(&mut self.batch.queued);
+        let px = std::mem::take(&mut self.batch.px);
+        self.batch.writes.clear();
+        self.batch.reads.clear();
         #[cfg(feature = "threads")]
-        if px >= PARALLEL_MIN_PIXELS && self.raster.pool.len() >= PARALLEL_LANES {
-            self.prims_split += queued.len() as u64;
-            let canvas = &self.canvas;
-            let overlay = self.raster.overlay.as_ref();
-            let clut = &self.raster.clut;
+        if px >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES {
+            *host.prims_split += queued.len() as u64;
+            let canvas = host.canvas;
+            let overlay = self.overlay.as_ref();
+            let clut = &self.clut;
             let q = &queued;
             let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
             rayon::scope(|s| {
-                for (lane, scratch) in self.raster.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
+                for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
                     s.spawn(move |_| {
                         for item in q {
                             let fb = if item.hi { overlay.unwrap_or(canvas) } else { canvas };
@@ -951,14 +1111,14 @@ impl Gs {
                     });
                 }
             });
-            for s in self.raster.pool.iter_mut() {
-                self.pixels_shaded += std::mem::take(&mut s.pixels);
-                for (h, n) in self.tex_psm_hist.iter_mut().zip(s.tex_samples.iter_mut()) {
+            for s in self.pool.iter_mut() {
+                *host.pixels_shaded += std::mem::take(&mut s.pixels);
+                for (h, n) in host.tex_psm_hist.iter_mut().zip(s.tex_samples.iter_mut()) {
                     *h += std::mem::take(n);
                 }
             }
-            self.raster.clut.reset();
-            self.raster.batch.queued = {
+            self.clut.reset();
+            self.batch.queued = {
                 let mut v = queued;
                 v.clear();
                 v
@@ -967,196 +1127,88 @@ impl Gs {
         }
         let _ = px;
         for item in &queued {
-            let fb = if item.hi { self.raster.overlay.as_ref().unwrap_or(&self.canvas) } else { &self.canvas };
+            let fb = if item.hi { self.overlay.as_ref().unwrap_or(host.canvas) } else { host.canvas };
             let mut p = Painter {
                 canvas: fb,
-                tex: &self.canvas,
-                clut: self.raster.clut.block(item.pipe.clut_off as usize),
+                tex: host.canvas,
+                clut: self.clut.block(item.pipe.clut_off as usize),
                 pipe: &item.pipe,
-                scratch: &mut self.raster.scratch,
+                scratch: &mut self.scratch,
             };
             Self::run_prim(&mut p, &item.prim, Rows::all(item.start, item.end));
         }
-        self.merge_scratch();
-        self.raster.clut.reset();
-        self.raster.batch.queued = {
+        self.merge_scratch(host);
+        self.clut.reset();
+        self.batch.queued = {
             let mut v = queued;
             v.clear();
             v
         };
     }
 
-    /// TEX1's mipmap level for this primitive, and the filter that goes
-    /// with it.
-    ///
-    /// Only the fixed-LOD form is modelled. `LCM = 1` makes the LOD the K
-    /// field outright, so the level is constant over the primitive and can
-    /// be folded into [`TexInfo`] instead of costing anything per pixel --
-    /// which is how every mipmapped draw seen so far picks its distance
-    /// ring. `LCM = 0` derives the LOD from Q per pixel; nothing needs it
-    /// yet, so it stays at level 0.
-    fn mip_select(ctx: &Context) -> (u32, bool) {
-        let tex1 = ctx.tex1;
-        let mmag = (tex1 >> 5) & 1 != 0;
-        let mxl = ((tex1 >> 2) & 7) as i32;
-        let mmin = ((tex1 >> 6) & 7) as u32;
-        // Without a mipmap chain MMAG decides for every sample, as it did
-        // before levels existed: minification alone is not modelled.
-        if mxl == 0 || mmin < 2 {
-            return (0, mmag);
-        }
-        if tex1 & 1 == 0 {
-            warn_once(&MIP_LCM, "TEX1 LCM=0 (LOD computed from Q) is not modelled; sampling level 0");
-            return (0, mmag);
-        }
-        if tex1 & (1 << 9) == 0 {
-            warn_once(&MIP_MTBA, "TEX1 MTBA=0 (explicit MIPTBP1/2 bases) is not modelled; sampling level 0");
-            return (0, mmag);
-        }
-        // K is signed 12-bit in 1/16 LOD units. The MIPMAP_NEAREST filters
-        // round to a level; the MIPMAP_LINEAR ones blend two, and taking
-        // the lower of the pair is the approximation here.
-        let k = ((((tex1 >> 32) & 0xFFF) as i32) << 20) >> 20;
-        let level = if mmin == 2 || mmin == 4 { (k + 8) >> 4 } else { k >> 4 };
-        if mmin == 3 || mmin == 5 {
-            warn_once(&MIP_BLEND, "TEX1 MMIN blends two levels; sampling the lower one");
-        }
-        let level = level.clamp(0, mxl) as u32;
-        // MMAG applies where the texture is magnified, which for a fixed
-        // LOD means level 0; below it the MMIN filter decides.
-        (level, if level == 0 { mmag } else { matches!(mmin, 1 | 4 | 5) })
-    }
-
-    /// This rasterizer's pipe for the current drawing environment: the
-    /// palette block, and the loop selection the row code reads.
-    fn pixel_pipe(&mut self) -> PixelPipe {
-        let env = self.draw_env();
-        let clut_off = if env.tme && env.tex.clut_bits != 0 { self.refresh_clut(&env.tex) } else { 0 };
-        let z_touched = env.zte && !(env.ztst == 1 && env.zmsk);
-        // Fogging is only implemented on the generic per-pixel path.
-        let fast = env.tme && env.tfx == 0 && env.fbmsk == 0 && !env.fge;
-        let fast_decal = env.tme && env.tfx == 1 && env.fbmsk == 0 && !env.fge;
-        // Z may be written (ALWAYS) but never tested; the alpha test on a
-        // flat colour is decided once per row by the loop itself.
-        let flat_fill = !env.tme && (!z_touched || env.ztst == 1) && env.fbmsk == 0 && !env.fge;
-        PixelPipe { env, z_touched, clut_off, fast, fast_decal, flat_fill }
-    }
-
-    /// Decode the drawing environment for the current context once per
-    /// primitive; the per-pixel path only reads it.
-    fn draw_env(&self) -> DrawEnv {
-        let attrs = self.attrs();
-        let ctx = self.ctx[((attrs >> 9) & 1) as usize];
-        let test = ctx.test;
-        let (level, bilinear) = Self::mip_select(&ctx);
-        let tex = TexInfo::new(&ctx, self.texa, level);
-        DrawEnv {
-            kind: (self.prim & 7) as u8,
-            scx0: (ctx.scissor & 0x7FF) as i32,
-            scx1: ((ctx.scissor >> 16) & 0x7FF) as i32,
-            scy0: ((ctx.scissor >> 32) & 0x7FF) as i32,
-            scy1: ((ctx.scissor >> 48) & 0x7FF) as i32,
-            tme: attrs & (1 << 4) != 0,
-            fst: attrs & (1 << 8) != 0,
-            abe: attrs & (1 << 6) != 0,
-            fge: attrs & (1 << 5) != 0,
-            fogcol: (self.fogcol & 0xFF_FFFF) as u32,
-            tfx: ((ctx.tex0 >> 35) & 3) as u8,
-            tcc: ctx.tex0 & (1 << 34) != 0,
-            bilinear,
-            tex,
-            ate: test & 1 != 0,
-            atst: ((test >> 1) & 7) as u8,
-            aref: ((test >> 4) & 0xFF) as u32,
-            afail: ((test >> 12) & 3) as u8,
-            zte: test & (1 << 16) != 0,
-            ztst: ((test >> 17) & 3) as u8,
-            zbp: ((ctx.zbuf & 0x1FF) * 32) as u32,
-            zmsk: ctx.zbuf & (1 << 32) != 0,
-            // Z buffer depth: PSMZ32 keeps 32 bits, PSMZ24 24, PSMZ16(S) 16;
-            // the upper bits of the stored word belong to whatever else
-            // shares the memory (Amagami parks 8-bit textures over its Z24
-            // buffer).
-            zmask: match (ctx.zbuf >> 24) & 0xF {
-                0x0 => u32::MAX,
-                0x1 => 0x00FF_FFFF,
-                _ => 0xFFFF,
-            },
-            fbp: ((ctx.frame & 0x1FF) * 32) as u32,
-            fbw: ((ctx.frame >> 16) & 0x3F) as u32,
-            fb24: ((ctx.frame >> 24) & 0x3F) as u32 == PSMCT24,
-            fbmsk: (ctx.frame >> 32) as u32,
-            blend_a: (ctx.alpha & 3) as u8,
-            blend_b: ((ctx.alpha >> 2) & 3) as u8,
-            blend_c: ((ctx.alpha >> 4) & 3) as u8,
-            blend_d: ((ctx.alpha >> 6) & 3) as u8,
-            blend_fix: ((ctx.alpha >> 32) & 0xFF) as u32,
-        }
-    }
-
     /// A TEX0/TEX2 write: record the CLUT load its CLD asks for.
-    pub(super) fn clut_write(&mut self, tex0: u64) {
-        let load = match self.clut_unit.request(tex0) {
+    fn clut_write(&mut self, host: &mut Host, tex0: u64) {
+        let load = match host.clut_unit.request(tex0) {
             clut::Request::Load(l) => l,
             clut::Request::None => return,
         };
         // The load reads its memory as of now, so queued drawing into it
         // lands first.
-        if self.raster.batch.after_write(&load.blocks()) {
-            self.flush_batch();
+        if self.batch.after_write(&load.blocks()) {
+            self.flush_batch(host);
         }
-        if self.clut_unit.full() {
-            self.materialise_clut();
+        if host.clut_unit.full() {
+            Self::materialise_clut(host);
         }
-        self.clut_unit.record(load);
+        host.clut_unit.record(load);
     }
 
     /// Local memory is about to change: settle every recorded load's
     /// bytes first, and stop matching palettes decoded from that memory.
-    pub(super) fn clut_memory_changing(&mut self) {
-        self.materialise_clut();
-        self.raster.clut.forget_keys();
+    fn clut_memory_changing(&mut self, host: &mut Host) {
+        Self::materialise_clut(host);
+        self.clut.forget_keys();
     }
 
-    fn materialise_clut(&mut self) {
-        let canvas = &self.canvas;
-        self.clut_unit.materialise(|l, e| clut_raw(canvas, l, e));
+    fn materialise_clut(host: &mut Host) {
+        let canvas = host.canvas;
+        host.clut_unit.materialise(|l, e| clut_raw(canvas, l, e));
     }
 
     /// Make sure a decoded block exists for this palette setup and return
     /// its offset. The CSA window is part of the key, so a block only ever
     /// holds entries one texture actually reads.
-    fn refresh_clut(&mut self, ti: &TexInfo) -> u32 {
+    fn refresh_clut(&mut self, host: &mut Host, ti: &TexInfo) -> u32 {
         let entries = if ti.clut_bits == 8 { 256 } else { 16 };
         let view = clut::View { cpsm: ((ti.tex0 >> 51) & 0xF) as u8, first: ti.clut_base as u16, count: entries as u16 };
-        let source = match self.clut_unit.source(&view) {
+        let source = match host.clut_unit.source(&view) {
             clut::Source::Mixed => {
-                self.materialise_clut();
+                Self::materialise_clut(host);
                 clut::Source::Buffer
             }
             s => s,
         };
         let key = match source {
             clut::Source::Load(l) => l.key_bits() | (ti.clut_view_bits() << 29),
-            _ => (1 << 63) | (self.clut_unit.epoch() as u64) | (ti.clut_view_bits() << 32),
+            _ => (1 << 63) | (host.clut_unit.epoch() as u64) | (ti.clut_view_bits() << 32),
         };
-        if let Some(off) = self.raster.clut.find(key) {
+        if let Some(off) = self.clut.find(key) {
             return off as u32;
         }
-        let off = match self.raster.clut.alloc(key) {
+        let off = match self.clut.alloc(key) {
             Some(off) => off,
             None => {
                 // Out of blocks: drawing the batch frees every one of them.
-                self.flush_batch();
-                self.raster.clut.alloc(key).expect("a drawn batch frees the pool")
+                self.flush_batch(host);
+                self.clut.alloc(key).expect("a drawn batch frees the pool")
             }
         };
         for e in ti.clut_base..ti.clut_base + entries {
             let raw = match source {
-                clut::Source::Load(l) => clut_raw(&self.canvas, &l, e as u32),
-                _ => self.clut_unit.entry(view.cpsm, e),
+                clut::Source::Load(l) => clut_raw(host.canvas, &l, e as u32),
+                _ => host.clut_unit.entry(view.cpsm, e),
             };
-            self.raster.clut.data[off + e] = if view.cpsm == 0 { raw } else { expand16(raw as u16, ti.texa) };
+            self.clut.data[off + e] = if view.cpsm == 0 { raw } else { expand16(raw as u16, ti.texa) };
         }
         off as u32
     }
