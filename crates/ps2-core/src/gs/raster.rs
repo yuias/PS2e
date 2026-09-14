@@ -2009,6 +2009,10 @@ impl Painter<'_> {
             crate::prof::count_pixels(k, n);
         }
         let (r, g, b, a) = (frag.r as u32, frag.g as u32, frag.b as u32, frag.a as u32);
+        // The colour is constant, so the alpha test decides the whole row;
+        // AFAIL picks what a failing row still updates, as in
+        // `shade_row_px`.
+        let (mut write_fb, mut alpha_z, mut keep_dst_alpha) = (true, true, false);
         if pipe.ate {
             let aref = pipe.aref;
             let pass = match pipe.atst {
@@ -2021,12 +2025,20 @@ impl Painter<'_> {
                 6 => a > aref,
                 _ => a != aref,
             };
-            if !pass && (pipe.afail == 0 || pipe.afail == 2) {
-                return;
+            if !pass {
+                match pipe.afail {
+                    0 => return,
+                    1 => alpha_z = false,
+                    2 => write_fb = false,
+                    _ => {
+                        alpha_z = false;
+                        keep_dst_alpha = true;
+                    }
+                }
             }
         }
         let out = r | (g << 8) | (b << 16) | (a.min(255) << 24);
-        let write_z = pipe.zte && !pipe.zmsk;
+        let write_z = pipe.zte && !pipe.zmsk && alpha_z;
         let z = frag.z & pipe.zmask;
         let z_merge = pipe.zmask != u32::MAX;
         let canvas = self.canvas;
@@ -2041,7 +2053,15 @@ impl Painter<'_> {
                 canvas.wr32(o, z);
             }
         };
-        if pipe.abe || pipe.fb24 {
+        if !write_fb {
+            if write_z {
+                for px in pxa..pxb {
+                    put_z(px);
+                }
+            }
+            return;
+        }
+        if pipe.abe || pipe.fb24 || keep_dst_alpha {
             // Destination-dependent: blend the constant colour per pixel.
             let blend = Blend::new(pipe);
             for px in pxa..pxb {
@@ -2051,7 +2071,7 @@ impl Painter<'_> {
                 if pipe.abe {
                     v = blend.apply(out, dst, a);
                 }
-                if pipe.fb24 {
+                if pipe.fb24 || keep_dst_alpha {
                     v = (v & 0xFF_FFFF) | (dst & 0xFF00_0000);
                 }
                 canvas.wr32(o, v);

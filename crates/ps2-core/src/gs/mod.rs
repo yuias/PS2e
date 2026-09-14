@@ -1995,4 +1995,47 @@ mod tests {
         assert!(rm > r0 && rm < rx && gm > g0 && gm < gx && bm > b0 && bm < bx, "mid F lands strictly between");
         assert_eq!((a0, am, ax), (77, 77, 77), "fog never touches alpha");
     }
+
+    /// A failing alpha test on an untextured sprite (the constant-colour
+    /// row loop) still updates what AFAIL names: nothing, the frame, Z, or
+    /// the frame's RGB.
+    #[test]
+    fn untextured_sprite_alpha_fail_updates_what_afail_names() {
+        const FB0: u32 = 0x1122_3344;
+        const Z0: u32 = 0x5566_7788;
+        const Z: u32 = 0xABCD;
+        let draw = |afail: u64| {
+            let mut gs = Gs::new();
+            gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+            gs.write_reg(0x4C, 1 << 16); // FRAME_1: bp 0, fbw 1, PSMCT32
+            gs.write_reg(0x4E, 10); // ZBUF_1: zbp 10, PSMZ32, writes on
+            gs.write_reg(0x40, (63u64 << 16) | (63u64 << 48)); // SCISSOR_1: 0..63 x 0..63
+            gs.write_reg(0x18, 0); // XYOFFSET_1: none
+            // TEST_1: ATE, ATST NEVER, AFAIL, ZTE, ZTST ALWAYS.
+            gs.write_reg(0x47, 1 | (afail << 12) | (1 << 16) | (1 << 17));
+            gs.write_psmct32(0, 1, 1, 1, FB0);
+            gs.write_psmz32(320, 1, 1, 1, Z0);
+            gs.write_reg(0x00, 0x06); // sprite, flat
+            gs.write_reg(0x01, 10 | (20 << 8) | (30 << 16) | (40 << 24));
+            gs.write_reg(0x05, (Z as u64) << 32); // vertex 0: (0, 0)
+            gs.write_reg(0x05, (4u64 * 16) | (4u64 * 16 << 16) | ((Z as u64) << 32)); // vertex 1: (4, 4)
+            gs.flush_pending();
+            (gs.read_psmct32(0, 1, 1, 1), gs.read_psmz32(320, 1, 1, 1))
+        };
+        let colour = 0x281E_140A;
+        let want = [
+            ("KEEP", (FB0, Z0)),
+            ("FB_ONLY", (colour, Z0)),
+            ("ZB_ONLY", (FB0, Z)),
+            ("RGB_ONLY", ((colour & 0xFF_FFFF) | (FB0 & 0xFF00_0000), Z0)),
+        ];
+        let wrong: Vec<String> = (0..4)
+            .filter_map(|afail| {
+                let (name, want) = want[afail as usize];
+                let (fb, z) = draw(afail);
+                ((fb, z) != want).then(|| format!("{name}: frame {fb:#010x} z {z:#010x}, want {:#010x} {:#010x}", want.0, want.1))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("; "));
+    }
 }
