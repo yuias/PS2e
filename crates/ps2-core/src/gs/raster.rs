@@ -1768,7 +1768,7 @@ impl Painter<'_> {
             v += a.d_v;
             zf += a.d_z;
             let ta = texel >> 24;
-            let a8 = if tcc { (ta * ca) >> 7 } else { ca };
+            let a8 = if tcc { ((ta * ca) >> 7).min(255) } else { ca };
             let (mut write_z, mut keep_dst_alpha) = (true, false);
             if ATE {
                 let pass = match atst {
@@ -2285,11 +2285,11 @@ impl Painter<'_> {
             u += a.du;
             let ta = texel >> 24;
             // DECAL takes the texel's alpha as it stands; MODULATE scales
-            // the vertex alpha by it.
+            // the vertex alpha by it, saturating as `Modulate` does.
             let a8 = if DEC {
                 if tcc { ta } else { ca }
             } else if tcc {
-                (ta * ca) >> 7
+                ((ta * ca) >> 7).min(255)
             } else {
                 ca
             };

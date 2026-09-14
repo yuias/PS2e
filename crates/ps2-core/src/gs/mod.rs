@@ -1996,6 +1996,47 @@ mod tests {
         assert_eq!((a0, am, ax), (77, 77, 77), "fog never touches alpha");
     }
 
+    /// MODULATE with TCC saturates the fragment alpha at 255 before the
+    /// alpha test sees it, on the textured sprite and triangle row loops as
+    /// on the per-pixel pipeline: texel and vertex alpha 0xFF make 0xFF,
+    /// which fails GREATER 0xFF, not 0x1FB, which would pass.
+    #[test]
+    fn modulated_alpha_saturates_before_the_alpha_test() {
+        let written = |prim: u64| {
+            let mut gs = Gs::new();
+            for y in 0..4 {
+                for x in 0..4 {
+                    gs.write_psmct32(3000, 1, x, y, 0xFF10_1010);
+                }
+            }
+            gs.write_psmct32(0, 1, 3, 3, 0x1234_5678);
+            gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+            gs.write_reg(0x4C, 1 << 16); // FRAME_1: bp 0, fbw 1, PSMCT32
+            gs.write_reg(0x40, (63u64 << 16) | (63u64 << 48)); // SCISSOR_1: 0..63 x 0..63
+            gs.write_reg(0x18, 0); // XYOFFSET_1: none
+            // TEX0_1: tbp 3000, tbw 1, PSMCT32, 4x4, TCC, MODULATE.
+            gs.write_reg(0x06, 3000 | (1 << 14) | (2 << 26) | (2 << 30) | (1 << 34));
+            gs.write_reg(0x47, 1 | (6 << 1) | (0xFF << 4)); // TEST_1: ATE, GREATER 0xFF, KEEP
+            gs.write_reg(0x00, prim | (1 << 4) | (1 << 8)); // TME, FST
+            // Opaque vertices; gouraud triangles get distinct colours so no
+            // span looks like a sprite.
+            let kicks: &[(u64, u64, u64)] = if prim == 6 {
+                &[(0, 0, 0x80), (8, 8, 0x80)]
+            } else {
+                &[(0, 0, 0x40), (16, 0, 0x80), (0, 16, 0xC0)]
+            };
+            for &(x, y, c) in kicks {
+                gs.write_reg(0x01, 0xFF00_0000 | c * 0x0001_0101);
+                gs.write_reg(0x03, (x * 4) | ((y * 4) << 16));
+                gs.write_reg(0x05, (x * 16) | ((y * 16) << 16));
+            }
+            gs.flush_pending();
+            gs.read_psmct32(0, 1, 3, 3) != 0x1234_5678
+        };
+        assert!(!written(6), "sprite");
+        assert!(!written(3 | (1 << 3)), "gouraud triangle");
+    }
+
     /// A failing alpha test on an untextured sprite (the constant-colour
     /// row loop) still updates what AFAIL names: nothing, the frame, Z, or
     /// the frame's RGB.
