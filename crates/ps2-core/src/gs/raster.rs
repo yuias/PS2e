@@ -156,6 +156,28 @@ pub(super) const PARALLEL_LANES: usize = 14;
 /// Pixel estimate that triggers a batch flush on its own.
 const BATCH_MAX_PIXELS: i64 = 1 << 20;
 
+/// A primitive as the vertex kick hands it over: vertices only, before any
+/// rasterizer setup.
+#[derive(Clone, Copy)]
+enum Shape {
+    Line { a: Vertex, b: Vertex, gouraud: bool },
+    Sprite { v0: Vertex, v1: Vertex },
+    /// Wound positive.
+    Tri { a: Vertex, b: Vertex, c: Vertex },
+}
+
+impl Shape {
+    /// The same shape in the overlay's doubled coordinate space.
+    fn scaled(self) -> Self {
+        let s = Gs::scale_vertex;
+        match self {
+            Shape::Line { a, b, gouraud } => Shape::Line { a: s(a), b: s(b), gouraud },
+            Shape::Sprite { v0, v1 } => Shape::Sprite { v0: s(v0), v1: s(v1) },
+            Shape::Tri { a, b, c } => Shape::Tri { a: s(a), b: s(b), c: s(c) },
+        }
+    }
+}
+
 /// Queued primitive geometry (decoded, self-contained).
 enum Prim {
     Tri(TriGeom),
@@ -360,20 +382,45 @@ impl Gs {
             fbp = (self.ctx[((self.prim >> 9) & 1) as usize].frame & 0x1FF) * 32,
             "line");
         let gouraud = self.prim & 8 != 0;
-        let Some((geom, start, end, px)) = Self::line_prim(&pipe, a, b, gouraud) else {
-            return;
-        };
-        self.prims_drawn += 1;
-        let queued = self.enqueue(pipe.clone(), Prim::Line(geom), start, end, px, None);
-        if let Some(p2) = self.scaled_pipe(&pipe) {
-            if !queued {
-                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, start, end);
-            } else if let Some((g2, s2, e2, px2)) =
-                Self::line_prim(&p2, Self::scale_vertex(a), Self::scale_vertex(b), gouraud)
-            {
-                self.enqueue_hi(p2, Prim::Line(g2), s2, e2, px2);
+        if self.draw_shape(pipe, Shape::Line { a, b, gouraud }) {
+            self.prims_drawn += 1;
+        }
+    }
+
+    /// Rasterizer geometry for `shape` under `pipe`: the queued primitive,
+    /// its row range and pixel estimate, and the texel rows it samples
+    /// (see [`Gs::enqueue`]). `None` = nothing to draw.
+    fn setup(pipe: &PixelPipe, shape: Shape) -> Option<(Prim, i32, i32, i64, Option<(f32, f32)>)> {
+        match shape {
+            Shape::Line { a, b, gouraud } => {
+                Self::line_prim(pipe, a, b, gouraud).map(|(g, s, e, px)| (Prim::Line(g), s, e, px, None))
+            }
+            Shape::Sprite { v0, v1 } => {
+                let (g, s, e, px, tex_v) = Self::sprite_prim(pipe, v0, v1);
+                Some((Prim::Sprite(g), s, e, px, Some(tex_v)))
+            }
+            Shape::Tri { a, b, c } => {
+                Self::tri_prim(pipe, a, b, c).map(|(g, s, e, px, tex_v)| (Prim::Tri(g), s, e, px, Some(tex_v)))
             }
         }
+    }
+
+    /// Queue `shape`, plus its internal-2x twin when the overlay is on.
+    /// `false` = clipped away, nothing queued.
+    fn draw_shape(&mut self, pipe: PixelPipe, shape: Shape) -> bool {
+        let Some((prim, start, end, px, tex_v)) = Self::setup(&pipe, shape) else {
+            return false;
+        };
+        let twin = self.scaled_pipe(&pipe).map(|p2| (p2, pipe.clone()));
+        let queued = self.enqueue(pipe, prim, start, end, px, tex_v);
+        if let Some((p2, pipe)) = twin {
+            if !queued {
+                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, start, end);
+            } else if let Some((g2, s2, e2, px2, _)) = Self::setup(&p2, shape.scaled()) {
+                self.enqueue_hi(p2, g2, s2, e2, px2);
+            }
+        }
+        true
     }
 
     /// Line geometry and its row/pixel extent for [`Gs::enqueue`].
@@ -531,17 +578,7 @@ impl Gs {
             self.log_small_prim("sprite", attrs, px1 - px0, py1 - py0, &v0, &v1);
         }
         let pipe = self.pixel_pipe();
-        let (geom, rya, ryb, px, tex_v) = Self::sprite_prim(&pipe, v0, v1);
-        let queued = self.enqueue(pipe.clone(), Prim::Sprite(geom), rya, ryb, px, Some(tex_v));
-        if let Some(p2) = self.scaled_pipe(&pipe) {
-            if !queued {
-                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, rya, ryb);
-            } else {
-                let (g2, s2, e2, px2, _) =
-                    Self::sprite_prim(&p2, Self::scale_vertex(v0), Self::scale_vertex(v1));
-                self.enqueue_hi(p2, Prim::Sprite(g2), s2, e2, px2);
-            }
-        }
+        self.draw_shape(pipe, Shape::Sprite { v0, v1 });
     }
 
     /// Sprite geometry and its row/pixel extent for [`Gs::enqueue`].
@@ -626,19 +663,7 @@ impl Gs {
             self.log_small_prim("triangle", attrs, maxx - minx, maxy - miny, &a, &b);
         }
         let pipe = self.pixel_pipe();
-        let Some((geom, s, e, px, tex_v)) = Self::tri_prim(&pipe, a, b, c) else {
-            return;
-        };
-        let queued = self.enqueue(pipe.clone(), Prim::Tri(geom), s, e, px, Some(tex_v));
-        if let Some(p2) = self.scaled_pipe(&pipe) {
-            if !queued {
-                self.mirror_rect(&pipe, pipe.scx0, pipe.scx1, s, e);
-            } else if let Some((g2, s2, e2, px2, _)) =
-                Self::tri_prim(&p2, Self::scale_vertex(a), Self::scale_vertex(b), Self::scale_vertex(c))
-            {
-                self.enqueue_hi(p2, Prim::Tri(g2), s2, e2, px2);
-            }
-        }
+        self.draw_shape(pipe, Shape::Tri { a, b, c });
     }
 
     /// Triangle geometry and its row/pixel extent for [`Gs::enqueue`];
