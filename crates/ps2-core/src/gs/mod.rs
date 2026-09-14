@@ -2037,6 +2037,105 @@ mod tests {
         assert!(!written(3 | (1 << 3)), "gouraud triangle");
     }
 
+    /// The specialised row loops (fast triangle and sprite spans, sprite-like
+    /// triangle spans, flat fills) take every attribute from the same
+    /// fixed-point planes as the per-pixel pipeline, so drawing a scene
+    /// without them leaves local memory byte for byte the same. UV
+    /// addressing only: STQ still interpolates in float.
+    #[test]
+    fn row_loops_match_the_per_pixel_pipeline() {
+        let scene = |generic_only: bool, pass: u64, kind: &str| {
+            let mut gs = Gs::new();
+            gs.raster.generic_only = generic_only;
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let mut rnd = move |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            };
+            // A 64x64 PSMCT32 texture at block 3000 with alpha all over.
+            for y in 0..64 {
+                for x in 0..64 {
+                    gs.write_psmct32(3000, 1, x, y, rnd(1 << 32) as u32);
+                }
+            }
+            gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+            gs.write_reg(0x4C, 4 << 16); // FRAME_1: bp 0, fbw 4 (256 px), PSMCT32
+            gs.write_reg(0x4E, 40); // ZBUF_1: zbp 40, PSMZ32
+            gs.write_reg(0x40, (255u64 << 16) | (255u64 << 48)); // SCISSOR_1: 0..255 x 0..255
+            gs.write_reg(0x18, 0); // XYOFFSET_1: none
+            // TEX0_1: tbp 3000, tbw 1, PSMCT32, 64x64, TCC, MODULATE.
+            gs.write_reg(0x06, 3000 | (1 << 14) | (6 << 26) | (6 << 30) | (1 << 34));
+            gs.write_reg(0x42, 0x44); // ALPHA_1: (Cs - Cd) * As + Cd
+            let vertex = |gs: &mut Gs, rnd: &mut dyn FnMut(u64) -> u64, x: u64, y: u64| {
+                gs.write_reg(0x01, rnd(1 << 32));
+                gs.write_reg(0x03, rnd(64 * 16 * 3) | (rnd(64 * 16 * 3) << 16));
+                gs.write_reg(0x05, x | (y << 16) | (rnd(1 << 32) << 32));
+            };
+            let (bilinear, abe, ate, zte) = (pass & 1 != 0, pass & 2 != 0, pass & 4 != 0, pass & 8 != 0);
+            gs.write_reg(0x14, (bilinear as u64) << 5); // TEX1_1: MMAG
+            // TEST_1: GEQUAL alpha test against 0x40 keeping the frame on
+            // failure, GEQUAL Z test.
+            let test = if ate { 1 | (6 << 1) | (0x40 << 4) | (1 << 12) } else { 0 };
+            gs.write_reg(0x47, test | if zte { (1 << 16) | (2 << 17) } else { 0 });
+            let attrs = (1 << 4) | (1 << 8) | ((abe as u64) << 6); // TME, FST, ABE
+            for _ in 0..24 {
+                match kind {
+                    "gouraud triangles" => {
+                        // Anywhere, slivers included.
+                        gs.write_reg(0x00, 3 | (1 << 3) | attrs);
+                        for _ in 0..3 {
+                            let (x, y) = (rnd(300 * 16), rnd(300 * 16));
+                            vertex(&mut gs, &mut rnd, x, y);
+                        }
+                    }
+                    "sprite-like quads" => {
+                        // Flat-coloured, axis-aligned quads as two triangles.
+                        let (x0, y0) = (rnd(200) * 16, rnd(200) * 16);
+                        let (w, h) = ((rnd(60) + 1) * 16, (rnd(60) + 1) * 16);
+                        let (u0, v0) = (rnd(64 * 16), rnd(64 * 16));
+                        let (du, dv) = (rnd(64 * 16 * 2), rnd(64 * 16));
+                        let (rgba, z) = (rnd(1 << 32), rnd(1 << 32));
+                        gs.write_reg(0x00, 3 | attrs);
+                        for (x, y, u, v) in [
+                            (x0, y0, u0, v0),
+                            (x0 + w, y0, u0 + du, v0),
+                            (x0, y0 + h, u0, v0 + dv),
+                            (x0 + w, y0, u0 + du, v0),
+                            (x0 + w, y0 + h, u0 + du, v0 + dv),
+                            (x0, y0 + h, u0, v0 + dv),
+                        ] {
+                            gs.write_reg(0x01, rgba);
+                            gs.write_reg(0x03, u | (v << 16));
+                            gs.write_reg(0x05, x | (y << 16) | (z << 32));
+                        }
+                    }
+                    _ => {
+                        let tme = if kind == "textured sprites" { attrs } else { (abe as u64) << 6 };
+                        gs.write_reg(0x00, 6 | tme);
+                        for _ in 0..2 {
+                            let (x, y) = (rnd(270 * 16), rnd(270 * 16));
+                            vertex(&mut gs, &mut rnd, x, y);
+                        }
+                    }
+                }
+            }
+            gs.vram_snapshot()
+        };
+        let mut wrong = Vec::new();
+        for pass in 0..16 {
+            for kind in ["gouraud triangles", "sprite-like quads", "textured sprites", "untextured sprites"] {
+                let (fast, generic) = (scene(false, pass, kind), scene(true, pass, kind));
+                let n = fast.iter().zip(generic.iter()).filter(|(a, b)| a != b).count();
+                if n > 0 {
+                    wrong.push(format!("{kind}, pass {pass:#06b} (ZTE ATE ABE bilinear): {n} bytes differ"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// A failing alpha test on an untextured sprite (the constant-colour
     /// row loop) still updates what AFAIL names: nothing, the frame, Z, or
     /// the frame's RGB.
