@@ -65,6 +65,57 @@ impl Default for Scratch {
     }
 }
 
+/// The software rasterizer's own state, next to what it shares with the
+/// rest of [`Gs`] (local memory, the CLUT unit, the statistics).
+#[derive(Serialize, Deserialize)]
+pub(super) struct SoftRaster {
+    /// Internal-2x overlay: a 4x-size shadow of local memory in the same
+    /// page/block layout at doubled coordinates (`bp*4, bw*2, x*2, y*2`).
+    /// Primitives are rasterized into it at true 2x, transfers land as 2x2
+    /// duplicates, and scanout reads it instead of local memory. Local
+    /// memory stays the source of truth for everything the emulated
+    /// software can observe.
+    pub(super) overlay: Option<Canvas>,
+    /// Scratch for the GS thread and for the worker-pool bands (empty
+    /// pool = never split).
+    #[serde(skip)]
+    scratch: Scratch,
+    #[serde(skip, default = "lane_pool")]
+    pub(super) pool: Vec<Scratch>,
+    /// Decoded primitives queued for one parallel pass.
+    #[serde(skip)]
+    batch: Batch,
+    /// Decoded palettes, one block per setup the queue still needs. A
+    /// single block would have to be rewritten whenever the palette
+    /// changed, and every rewrite would have to flush the queue that
+    /// references it — which a mission second asks for a million times.
+    /// Not state: a load starts with it empty.
+    #[serde(skip)]
+    clut: ClutPool,
+}
+
+impl Default for SoftRaster {
+    fn default() -> Self {
+        Self {
+            overlay: None,
+            scratch: Scratch::default(),
+            pool: lane_pool(),
+            batch: Batch::default(),
+            clut: ClutPool::default(),
+        }
+    }
+}
+
+/// Per-lane scratch, as a fresh rasterizer builds it (a state load
+/// restores it rather than carrying it).
+fn lane_pool() -> Vec<Scratch> {
+    if cfg!(feature = "threads") {
+        (0..PARALLEL_LANES).map(|_| Scratch::default()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Rows a task handles: `py` in `start..end` with `(py >> 1) % lanes ==
 /// lane` — two-row bands so a 32-bit column pair never straddles tasks.
 #[derive(Clone, Copy)]
@@ -350,9 +401,9 @@ impl Gs {
             let mut p = Painter {
                 canvas: &self.canvas,
                 tex: &self.canvas,
-                clut: self.clut.block(pipe.clut_off as usize),
+                clut: self.raster.clut.block(pipe.clut_off as usize),
                 pipe: &pipe,
-                scratch: &mut self.scratch,
+                scratch: &mut self.raster.scratch,
             };
             let texel = if pipe.tme { p.sample(&frag) } else { 0 };
             let row = Row::new(&pipe, py as u32);
@@ -496,8 +547,8 @@ impl Gs {
 
     /// Fold the main scratch's counters into the statistics.
     fn merge_scratch(&mut self) {
-        self.pixels_shaded += std::mem::take(&mut self.scratch.pixels);
-        for (h, s) in self.tex_psm_hist.iter_mut().zip(self.scratch.tex_samples.iter_mut()) {
+        self.pixels_shaded += std::mem::take(&mut self.raster.scratch.pixels);
+        for (h, s) in self.tex_psm_hist.iter_mut().zip(self.raster.scratch.tex_samples.iter_mut()) {
             *h += std::mem::take(s);
         }
     }
@@ -749,12 +800,12 @@ impl Gs {
         let (fb, zb) = Self::written_blocks(&pipe, end);
         let targets = [(&fb, pipe.fbp), (&zb, pipe.zbp)];
         if targets.iter().any(|(w, base)| {
-            w.as_ref().is_some_and(|w| self.batch.aliases(w, *base, pipe.fbw))
+            w.as_ref().is_some_and(|w| self.raster.batch.aliases(w, *base, pipe.fbw))
         }) {
             self.flush_batch();
         }
         if let Some(t) = &tex {
-            if self.batch.after_write(t) {
+            if self.raster.batch.after_write(t) {
                 self.flush_batch();
             }
             let overlaps = |w: &Option<std::ops::Range<u32>>| {
@@ -765,29 +816,29 @@ impl Gs {
                 let mut p = Painter {
                     canvas: &self.canvas,
                     tex: &self.canvas,
-                    clut: self.clut.block(pipe.clut_off as usize),
+                    clut: self.raster.clut.block(pipe.clut_off as usize),
                     pipe: &pipe,
-                    scratch: &mut self.scratch,
+                    scratch: &mut self.raster.scratch,
                 };
                 Self::run_prim(&mut p, &prim, Rows::all(start, end));
                 self.merge_scratch();
                 return false;
             }
         }
-        if targets.iter().any(|(w, _)| w.as_ref().is_some_and(|w| self.batch.before_read(w))) {
+        if targets.iter().any(|(w, _)| w.as_ref().is_some_and(|w| self.raster.batch.before_read(w))) {
             self.flush_batch();
         }
         if let Some(t) = tex {
-            self.batch.note_read(t);
+            self.raster.batch.note_read(t);
         }
         for (r, base) in [(fb, pipe.fbp), (zb, pipe.zbp)] {
             if let Some(r) = r {
-                self.batch.note_write(r, base, pipe.fbw);
+                self.raster.batch.note_write(r, base, pipe.fbw);
             }
         }
-        self.batch.px += px;
-        self.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
-        if self.batch.px >= BATCH_MAX_PIXELS {
+        self.raster.batch.px += px;
+        self.raster.batch.queued.push(Queued { pipe, prim, start, end, hi: false });
+        if self.raster.batch.px >= BATCH_MAX_PIXELS {
             self.flush_batch();
         }
         true
@@ -797,9 +848,9 @@ impl Gs {
     /// shares the queue (order among twins matches the 1x order) but skips
     /// the dependency checks — those were decided by its 1x sibling.
     fn enqueue_hi(&mut self, pipe: PixelPipe, prim: Prim, start: i32, end: i32, px: i64) {
-        self.batch.px += px;
-        self.batch.queued.push(Queued { pipe, prim, start, end, hi: true });
-        if self.batch.px >= BATCH_MAX_PIXELS {
+        self.raster.batch.px += px;
+        self.raster.batch.queued.push(Queued { pipe, prim, start, end, hi: true });
+        if self.raster.batch.px >= BATCH_MAX_PIXELS {
             self.flush_batch();
         }
     }
@@ -808,7 +859,7 @@ impl Gs {
     /// doubled coordinate space (`None` when the overlay is off). Texture
     /// fields stay in 1x space — sampling reads local memory.
     fn scaled_pipe(&self, pipe: &PixelPipe) -> Option<PixelPipe> {
-        self.overlay.as_ref()?;
+        self.raster.overlay.as_ref()?;
         let mut p = pipe.clone();
         let e = &mut p.env;
         e.scx0 *= 2;
@@ -831,7 +882,7 @@ impl Gs {
     /// for primitives whose 2x twin cannot be rasterized because they
     /// sample their own target.
     fn mirror_rect(&mut self, pipe: &PixelPipe, x0: i32, x1: i32, y0: i32, y1: i32) {
-        let Some(ov) = &self.overlay else { return };
+        let Some(ov) = &self.raster.overlay else { return };
         let write_z = pipe.zte && !pipe.zmsk;
         for y in y0.max(0)..y1 {
             for x in x0.max(0)..=x1 {
@@ -868,28 +919,28 @@ impl Gs {
     /// lane reaches a later primitive's write long before another lane
     /// reaches an earlier primitive's read of the same memory.
     pub(super) fn flush_batch(&mut self) {
-        if self.batch.queued.is_empty() {
+        if self.raster.batch.queued.is_empty() {
             return;
         }
         // A primitive queued after a recorded CLUT load may write the
         // memory that load reads; the load came first, so read it now.
-        if self.clut_unit.pending() && self.batch.writes.iter().any(|w| self.clut_unit.pending_in(&(w.start..w.end))) {
+        if self.clut_unit.pending() && self.raster.batch.writes.iter().any(|w| self.clut_unit.pending_in(&(w.start..w.end))) {
             self.materialise_clut();
         }
-        let queued = std::mem::take(&mut self.batch.queued);
-        let px = std::mem::take(&mut self.batch.px);
-        self.batch.writes.clear();
-        self.batch.reads.clear();
+        let queued = std::mem::take(&mut self.raster.batch.queued);
+        let px = std::mem::take(&mut self.raster.batch.px);
+        self.raster.batch.writes.clear();
+        self.raster.batch.reads.clear();
         #[cfg(feature = "threads")]
-        if px >= PARALLEL_MIN_PIXELS && self.pool.len() >= PARALLEL_LANES {
+        if px >= PARALLEL_MIN_PIXELS && self.raster.pool.len() >= PARALLEL_LANES {
             self.prims_split += queued.len() as u64;
             let canvas = &self.canvas;
-            let overlay = self.overlay.as_ref();
-            let clut = &self.clut;
+            let overlay = self.raster.overlay.as_ref();
+            let clut = &self.raster.clut;
             let q = &queued;
             let _p = crate::prof::scope(crate::prof::Slot::GsJoin);
             rayon::scope(|s| {
-                for (lane, scratch) in self.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
+                for (lane, scratch) in self.raster.pool.iter_mut().take(PARALLEL_LANES).enumerate() {
                     s.spawn(move |_| {
                         for item in q {
                             let fb = if item.hi { overlay.unwrap_or(canvas) } else { canvas };
@@ -900,14 +951,14 @@ impl Gs {
                     });
                 }
             });
-            for s in self.pool.iter_mut() {
+            for s in self.raster.pool.iter_mut() {
                 self.pixels_shaded += std::mem::take(&mut s.pixels);
                 for (h, n) in self.tex_psm_hist.iter_mut().zip(s.tex_samples.iter_mut()) {
                     *h += std::mem::take(n);
                 }
             }
-            self.clut.reset();
-            self.batch.queued = {
+            self.raster.clut.reset();
+            self.raster.batch.queued = {
                 let mut v = queued;
                 v.clear();
                 v
@@ -916,19 +967,19 @@ impl Gs {
         }
         let _ = px;
         for item in &queued {
-            let fb = if item.hi { self.overlay.as_ref().unwrap_or(&self.canvas) } else { &self.canvas };
+            let fb = if item.hi { self.raster.overlay.as_ref().unwrap_or(&self.canvas) } else { &self.canvas };
             let mut p = Painter {
                 canvas: fb,
                 tex: &self.canvas,
-                clut: self.clut.block(item.pipe.clut_off as usize),
+                clut: self.raster.clut.block(item.pipe.clut_off as usize),
                 pipe: &item.pipe,
-                scratch: &mut self.scratch,
+                scratch: &mut self.raster.scratch,
             };
             Self::run_prim(&mut p, &item.prim, Rows::all(item.start, item.end));
         }
         self.merge_scratch();
-        self.clut.reset();
-        self.batch.queued = {
+        self.raster.clut.reset();
+        self.raster.batch.queued = {
             let mut v = queued;
             v.clear();
             v
@@ -1051,7 +1102,7 @@ impl Gs {
         };
         // The load reads its memory as of now, so queued drawing into it
         // lands first.
-        if self.batch.after_write(&load.blocks()) {
+        if self.raster.batch.after_write(&load.blocks()) {
             self.flush_batch();
         }
         if self.clut_unit.full() {
@@ -1064,7 +1115,7 @@ impl Gs {
     /// bytes first, and stop matching palettes decoded from that memory.
     pub(super) fn clut_memory_changing(&mut self) {
         self.materialise_clut();
-        self.clut.forget_keys();
+        self.raster.clut.forget_keys();
     }
 
     fn materialise_clut(&mut self) {
@@ -1089,15 +1140,15 @@ impl Gs {
             clut::Source::Load(l) => l.key_bits() | (ti.clut_view_bits() << 29),
             _ => (1 << 63) | (self.clut_unit.epoch() as u64) | (ti.clut_view_bits() << 32),
         };
-        if let Some(off) = self.clut.find(key) {
+        if let Some(off) = self.raster.clut.find(key) {
             return off as u32;
         }
-        let off = match self.clut.alloc(key) {
+        let off = match self.raster.clut.alloc(key) {
             Some(off) => off,
             None => {
                 // Out of blocks: drawing the batch frees every one of them.
                 self.flush_batch();
-                self.clut.alloc(key).expect("a drawn batch frees the pool")
+                self.raster.clut.alloc(key).expect("a drawn batch frees the pool")
             }
         };
         for e in ti.clut_base..ti.clut_base + entries {
@@ -1105,7 +1156,7 @@ impl Gs {
                 clut::Source::Load(l) => clut_raw(&self.canvas, &l, e as u32),
                 _ => self.clut_unit.entry(view.cpsm, e),
             };
-            self.clut.data[off + e] = if view.cpsm == 0 { raw } else { expand16(raw as u16, ti.texa) };
+            self.raster.clut.data[off + e] = if view.cpsm == 0 { raw } else { expand16(raw as u16, ti.texa) };
         }
         off as u32
     }

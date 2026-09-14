@@ -147,22 +147,10 @@ pub struct Gs {
     seen_targets: std::collections::HashMap<u64, u32>,
     /// Registers already reported as unhandled (warn once, not per write).
     warned_regs: [u64; 4],
-    /// Rasterizer scratch for the GS thread and for the worker-pool bands
-    /// (see raster.rs; empty pool = never split).
-    #[serde(skip)]
-    scratch: raster::Scratch,
-    #[serde(skip, default = "raster_pool")]
-    pool: Vec<raster::Scratch>,
-    /// Decoded primitives queued for one parallel pass (see raster.rs).
-    #[serde(skip)]
-    batch: raster::Batch,
-    /// Internal-2x overlay: a 4x-size shadow of local memory in the same
-    /// page/block layout at doubled coordinates (`bp*4, bw*2, x*2, y*2`).
-    /// Primitives are rasterized into it at true 2x, transfers land as 2x2
-    /// duplicates, and scanout reads it instead of local memory. Local
-    /// memory stays the source of truth for everything the emulated
-    /// software can observe.
-    overlay: Option<Canvas>,
+    /// The software rasterizer's own state. It serializes to exactly the
+    /// internal-2x overlay, at the position the overlay held as a field of
+    /// its own, so save states kept their layout when it moved here.
+    raster: raster::SoftRaster,
     /// Woven interlaced display for [`Gs::framebuffer_woven`], and its size.
     woven: Vec<u8>,
     /// Per-pixel motion flags of the last composited frame (see
@@ -173,26 +161,9 @@ pub struct Gs {
     /// [`Deinterlace::Bwdif`]'s temporal taps.
     history: [Vec<u8>; 2],
     woven_dims: (u32, u32),
-    /// Decoded palettes, one block per setup the queue still needs. A
-    /// single block would have to be rewritten whenever the palette
-    /// changed, and every rewrite would have to flush the queue that
-    /// references it — which a mission second asks for a million times.
-    /// Not state: a load starts with it empty.
-    #[serde(skip, default = "raster::ClutPool::default")]
-    clut: raster::ClutPool,
     /// The texture unit's CLUT buffer, which TEX0's CLD loads and the
     /// blocks above are decoded from.
     clut_unit: clut::Unit,
-}
-
-/// Per-lane rasterizer scratch, as [`Gs::new`] builds it (a state load
-/// restores it rather than carrying it).
-fn raster_pool() -> Vec<raster::Scratch> {
-    if cfg!(feature = "threads") {
-        (0..raster::PARALLEL_LANES).map(|_| raster::Scratch::default()).collect()
-    } else {
-        Vec::new()
-    }
 }
 
 impl Default for Gs {
@@ -303,19 +274,11 @@ impl Gs {
             seen_tex0: std::collections::HashSet::new(),
             seen_targets: std::collections::HashMap::new(),
             warned_regs: [0; 4],
-            scratch: raster::Scratch::default(),
-            pool: if cfg!(feature = "threads") {
-                (0..raster::PARALLEL_LANES).map(|_| raster::Scratch::default()).collect()
-            } else {
-                Vec::new()
-            },
-            batch: raster::Batch::default(),
-            overlay: None,
+            raster: raster::SoftRaster::default(),
             woven: Vec::new(),
             motion: Vec::new(),
             history: [Vec::new(), Vec::new()],
             woven_dims: (0, 0),
-            clut: raster::ClutPool::default(),
             clut_unit: clut::Unit::default(),
         }
     }
@@ -595,7 +558,7 @@ impl Gs {
         // 32-bit pixel with a colour format and `mirror_upload_rect` cannot
         // duplicate them, so with an overlay in play they keep the per-word
         // path, which writes the overlay as it goes.
-        let mirrorable = !matches!(dpsm, PSMT8H | PSMT4HL | PSMT4HH) || self.overlay.is_none();
+        let mirrorable = !matches!(dpsm, PSMT8H | PSMT4HL | PSMT4HH) || self.raster.overlay.is_none();
         let handled = matches!(
             dpsm,
             PSMCT32
@@ -749,7 +712,7 @@ impl Gs {
         self.trx_y = y;
         // Mirror the rows this run touched into the overlay (full width:
         // duplicating from local memory is always safe).
-        if self.overlay.is_some() {
+        if self.raster.overlay.is_some() {
             let y_last = if x > 0 { y } else { y.wrapping_sub(1) }.min(rrh - 1);
             if y_last != u32::MAX && y_last >= y_first {
                 self.mirror_upload_rect(dbp, dbw, dpsm, dsax, dsay + y_first, rrw, y_last - y_first + 1);
@@ -790,7 +753,7 @@ impl Gs {
                 let px = (data >> (i * bits)) as u32 & (((1u64 << bits) - 1) as u32);
                 let (x, y) = (dsax + gs.trx_x, dsay + gs.trx_y);
                 write(&gs.canvas, dbp, dbw, x, y, px);
-                if let Some(ov) = &gs.overlay {
+                if let Some(ov) = &gs.raster.overlay {
                     for d in 0..4u32 {
                         write(ov, dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
                     }
@@ -839,7 +802,7 @@ impl Gs {
                         | u32::from(self.trx24[2]) << 16;
                     let (x, y) = (dsax + self.trx_x, dsay + self.trx_y);
                     self.write_psmct32(dbp, dbw, x, y, px);
-                    if let Some(ov) = &self.overlay {
+                    if let Some(ov) = &self.raster.overlay {
                         for d in 0..4u32 {
                             ov.write_psmct32(dbp * 4, dbw * 2, 2 * x + (d & 1), 2 * y + (d >> 1), px);
                         }
@@ -997,22 +960,22 @@ impl Gs {
     /// Turn the internal-2x overlay on or off. It starts black and fills
     /// in as buffers are redrawn or uploaded (typically within a frame).
     pub fn set_internal_2x(&mut self, on: bool) {
-        if on == self.overlay.is_some() {
+        if on == self.raster.overlay.is_some() {
             return;
         }
         self.flush_batch();
-        self.overlay = on.then(|| Canvas::with_size(4 * VRAM_SIZE));
+        self.raster.overlay = on.then(|| Canvas::with_size(4 * VRAM_SIZE));
     }
 
     pub fn internal_2x(&self) -> bool {
-        self.overlay.is_some()
+        self.raster.overlay.is_some()
     }
 
     /// Mirror a just-written rect of local memory into the overlay as 2x2
     /// duplicates (IMAGE uploads and local copies; `psm` names the
     /// destination format).
     fn mirror_upload_rect(&self, bp: u32, bw: u32, psm: u32, x0: u32, y0: u32, w: u32, h: u32) {
-        let Some(ov) = &self.overlay else { return };
+        let Some(ov) = &self.raster.overlay else { return };
         let (bp2, bw2) = (bp * 4, bw * 2);
         for y in y0..y0 + h {
             for x in x0..x0 + w {
@@ -1186,7 +1149,7 @@ impl Gs {
                 // go to the worker pool when there is one.
                 let missing = field;
                 let bands =
-                    if cfg!(feature = "threads") && !self.pool.is_empty() { raster::PARALLEL_LANES } else { 1 };
+                    if cfg!(feature = "threads") && !self.raster.pool.is_empty() { raster::PARALLEL_LANES } else { 1 };
                 let rows_per_band = (h as usize).div_ceil(bands);
                 let run_band = |band: usize, out_band: &mut [u8]| {
                     let y0 = band * rows_per_band;
@@ -1535,7 +1498,7 @@ impl Gs {
     /// The canvas scanout reads and the display scale it implies: the
     /// overlay at 2x when present, else local memory at 1x.
     fn scanout(&self) -> (&Canvas, u32) {
-        match &self.overlay {
+        match &self.raster.overlay {
             Some(ov) => (ov, 2),
             None => (&self.canvas, 1),
         }
