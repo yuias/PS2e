@@ -2964,7 +2964,8 @@ unsafe fn bilerp16_sse2(p: [u16; 4], texa: u64, wx: u32, wy: u32) -> u32 {
         let msb = _mm_srai_epi16(t, 15);
         let mut a = _mm_or_si128(_mm_and_si128(msb, ta1), _mm_andnot_si128(msb, ta0));
         if texa & (1 << 15) != 0 {
-            let zero = _mm_cmpeq_epi16(_mm_and_si128(t, _mm_set1_epi16(0x7FFF)), _mm_setzero_si128());
+            // The whole word: a set MSB keeps TA1 even when RGB is zero.
+            let zero = _mm_cmpeq_epi16(t, _mm_setzero_si128());
             a = _mm_andnot_si128(zero, a);
         }
         // Channel-major -> pixel-major: [r g b a] per texel, texels 0,1 in
@@ -3129,6 +3130,29 @@ fn warn_once(told: &std::sync::atomic::AtomicBool, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every 16-bit texel, under AEM off and on, next to neighbours that
+    /// exercise both alpha levels: the SIMD blend has to stay equal to the
+    /// scalar expansion it replaces.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bilerp16_matches_expand16() {
+        let texa = 0x40_0000_0000 | 0x20;
+        for aem in [0, 1 << 15] {
+            let texa = texa | aem;
+            for px in 0..=u16::MAX {
+                let p = [px, 0x8000, 0x7FFF, 0x0000];
+                for (wx, wy) in [(0, 0), (256, 0), (0, 256), (97, 181)] {
+                    let e = p.map(|t| expand16(t, texa));
+                    // SAFETY: SSE2 is baseline on x86_64.
+                    let (want, got) = unsafe {
+                        (bilerp_sse2(e[0], e[1], e[2], e[3], wx, wy), bilerp16_sse2(p, texa, wx, wy))
+                    };
+                    assert_eq!(got, want, "texel {px:#06x} aem {aem:#x} w ({wx},{wy})");
+                }
+            }
+        }
+    }
 
     /// Ace Combat 5's terrain atlas: 512x512 PSMT8 at block 9216, TBW 8,
     /// with MTBA generating the chain. Each level takes a quarter of the
