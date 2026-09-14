@@ -1962,6 +1962,32 @@ mod tests {
         }
     }
 
+    /// A line steps once per pixel of its major axis and places each pixel
+    /// at the exact point along it rounded half away from zero, leaving the
+    /// end point's pixel undrawn. From (0, 0) to (11.875, 19) step 12 lands
+    /// on x = 7.5 exactly, which a float DDA summed to just under and
+    /// rounded down.
+    #[test]
+    fn line_pixels_round_the_exact_point_half_away() {
+        let mut gs = Gs::new();
+        gs.write_reg(0x1A, 1); // PRMODECONT: use PRIM
+        gs.write_reg(0x4C, 1 << 16); // FRAME_1: bp 0, fbw 1, PSMCT32
+        gs.write_reg(0x40, (63u64 << 16) | (63u64 << 48)); // SCISSOR_1: 0..63 x 0..63
+        gs.write_reg(0x18, 0); // XYOFFSET_1: none
+        gs.write_reg(0x00, 1); // line
+        for (x, y) in [(0u64, 0u64), (190, 304)] {
+            gs.write_reg(0x01, 0xFFFF_FFFF);
+            gs.write_reg(0x05, x | (y << 16));
+        }
+        gs.flush_pending();
+        let lit = |x: u32, y: u32| gs.read_psmct32(0, 1, x, y) != 0;
+        let row = |y: u32| (0..16).filter(|&x| lit(x, y)).collect::<Vec<_>>();
+        assert_eq!(row(0), vec![0]);
+        assert_eq!(row(12), vec![8], "7.5 rounds away from zero");
+        assert_eq!(row(18), vec![11]);
+        assert!(row(19).is_empty(), "the end point's pixel is not drawn");
+    }
+
     /// PRIM's FGE fades the fragment towards FOGCOL as F falls (RGB only —
     /// alpha is untouched). F comes flat from the sprite's second vertex,
     /// set through the FOG register's latch (XYZ2 leaves it alone).

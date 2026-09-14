@@ -1124,16 +1124,13 @@ impl SoftRaster {
 
     /// Line geometry and its row/pixel extent for [`SoftRaster::enqueue`].
     fn line_prim(pipe: &PixelPipe, a: Vertex, b: Vertex, gouraud: bool) -> Option<(LineGeom, i32, i32, i64)> {
-        let (fy0, fy1) = (a.y as f32 / 16.0, b.y as f32 / 16.0);
-        let steps = ((b.x - a.x) as f32 / 16.0)
-            .abs()
-            .max((fy1 - fy0).abs())
-            .round() as i32;
+        // One step per pixel of the major axis (12.4 in), rounded.
+        let steps = ((b.x - a.x).abs().max((b.y - a.y).abs()) + 8) >> 4;
         if steps <= 0 {
             return None;
         }
-        let start = (fy0.min(fy1).floor() as i32).max(pipe.scy0);
-        let end = ((fy0.max(fy1).ceil() as i32 + 1).min(pipe.scy1 + 1)).max(start);
+        let start = (a.y.min(b.y) >> 4).max(pipe.scy0);
+        let end = ((((a.y.max(b.y) + 15) >> 4) + 1).min(pipe.scy1 + 1)).max(start);
         Some((LineGeom { a, b, gouraud, steps }, start, end, steps as i64))
     }
 
@@ -1721,10 +1718,12 @@ impl Painter<'_> {
     fn line_rows(&mut self, g: &LineGeom, rows: Rows) {
         let pipe = self.pipe;
         let (a, b) = (g.a, g.b);
-        let (fx0, fy0) = (a.x as f32 / 16.0, a.y as f32 / 16.0);
-        let (fx1, fy1) = (b.x as f32 / 16.0, b.y as f32 / 16.0);
-        let (dx, dy) = (fx1 - fx0, fy1 - fy0);
-        let inv = 1.0 / g.steps as f32;
+        // Pixel i sits at a + (b - a) * i / steps, rounded half away from
+        // zero; in 12.4 units over 16 * steps that is an exact integer
+        // ratio.
+        let steps = g.steps as i64;
+        let den = 16 * steps;
+        let at = |p: i32, q: i32, i: i64| round_div(p as i64 * steps + (q - p) as i64 * i, den) as i32;
         // The attributes step from a's value by (b - a) / steps in fixed
         // point; flat shading holds b's colour and fog.
         let stq_on = pipe.tme && !pipe.fst;
@@ -1746,9 +1745,7 @@ impl Painter<'_> {
             }
         }
         for i in 0..g.steps {
-            let t = i as f32 * inv;
-            let px = (fx0 + dx * t).round() as i32;
-            let py = (fy0 + dy * t).round() as i32;
+            let (px, py) = (at(a.x, b.x, i as i64), at(a.y, b.y, i as i64));
             if px < pipe.scx0 || px > pipe.scx1 || py < pipe.scy0 || py > pipe.scy1 {
                 continue;
             }
@@ -3445,6 +3442,13 @@ const UV_LIMIT: i32 = 1 << 30;
 fn bilinear_tap(c: i32) -> (i32, u32) {
     let x = c - 128;
     (x >> 8, (x & 0xFF) as u32)
+}
+
+/// `n / d` rounded half away from zero, for `d > 0`.
+#[inline(always)]
+fn round_div(n: i64, d: i64) -> i64 {
+    let q = (n.abs() + d / 2) / d;
+    if n < 0 { -q } else { q }
 }
 
 #[inline]
