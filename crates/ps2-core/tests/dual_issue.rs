@@ -60,7 +60,7 @@ fn delay_loop_dual_issues() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jit_counts_like_the_interpreter() {
     let interp = cycles_to_finish(system(false));
     let jit = cycles_to_finish(system(true));
