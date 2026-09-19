@@ -449,7 +449,7 @@ fn main() -> ExitCode {
     if windowed {
         run_windowed(sys, args, cfg, cfg_path, debugger, memcard_path, cheats)
     } else if let Some(port) = args.control_port {
-        run_control(sys, &args, port, debugger, memcard_path, cheats)
+        run_control(sys, &args, port, debugger, memcard_path, cheats, region)
     } else {
         run_headless(sys, &args, debugger, memcard_path, cheats)
     }
@@ -465,6 +465,7 @@ fn run_control(
     mut debugger: Option<ps2_debug::DebugServer>,
     memcard_path: Option<PathBuf>,
     cheats: Vec<ps2_core::cheats::Group>,
+    region: Region,
 ) -> ExitCode {
     let mut ctl = match control::ControlServer::bind(port) {
         Ok(c) => c,
@@ -482,6 +483,9 @@ fn run_control(
     // The list is installed either way; `--cheats` only decides whether the
     // master switch starts on, the way `cheat apply` moves it later.
     ctl.controller.install_cheats(&mut sys, args.cheats);
+    // `reset` power-cycles to this timing, not whatever SetGsCrt left in
+    // SMODE1, so it always returns to the console's own configured region.
+    ctl.controller.set_region(region);
     tracing::info!(port = ctl.port(), "lockstep control mode; drive it with ps2ctl");
 
     let stdout = std::io::stdout();

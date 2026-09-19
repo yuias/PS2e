@@ -275,6 +275,7 @@ ps2ctl cheat apply on         # nothing applies until this is on
 ps2ctl cheat on 0             # toggle one section (in memory only)
 ps2ctl savestate s.st         # snapshot; loadstate restores it
 ps2ctl savestate @3           # in-memory slot; loadstate @3 restores it
+ps2ctl reset                  # power cycle; disc and card stay in
 ps2ctl state                  # pcs, cycle, frame, vblanks, region, held, tray
 ps2ctl quit
 ```
@@ -288,7 +289,7 @@ a debugger is attached. Replies are written whole, however large; a client
 that stops reading is dropped after five seconds. `vblanks=` in `state`
 counts vblank-unit advances made by this session (`run`, `press`, `seq` and
 `until` with `v`), not the machine's field count, and it is not reset by
-`loadstate`.
+`loadstate` or `reset`.
 
 This is a separate mode from the `--cycles` batch run, not a modifier on it:
 a scripted `--press circle@150e9` and a client deciding when to press cannot

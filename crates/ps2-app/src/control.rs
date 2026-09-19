@@ -389,15 +389,18 @@ pub struct Controller {
     tray: Option<std::fs::File>,
     /// Vertical-blank edges this session has run across with the `v` unit
     /// (`run`, `press`, `seq`, `until`). Not machine state: it survives
-    /// `loadstate` and is never saved.
+    /// `loadstate` and `reset` and is never saved.
     vblanks: u64,
     /// Scanner session; survives reconnects (`ps2ctl` reconnects per
-    /// command) and `loadstate`; dropped by `scan clear`.
+    /// command) and `loadstate`; dropped by `reset` and `scan clear`.
     scan: Option<scan::Scan>,
     /// In-memory save-state slots `@0`..`@15`, zstd blobs; kept until
     /// overwritten or the process exits (never cleared on reconnect, since
     /// `ps2ctl` reconnects per command).
     slots: Vec<Option<Vec<u8>>>,
+    /// The console's own video timing for `reset` (the CLI `--region`);
+    /// `sys.region()` is whatever the last program left in SMODE1.
+    region: Region,
 }
 
 impl Default for Controller {
@@ -411,6 +414,7 @@ impl Default for Controller {
             vblanks: 0,
             scan: None,
             slots: vec![None; STATE_SLOTS],
+            region: Region::Ntsc,
         }
     }
 }
@@ -420,6 +424,11 @@ impl Controller {
     pub fn set_cheats(&mut self, path: PathBuf, groups: Vec<Group>) {
         self.cheat_file = Some(path);
         self.cheats = groups;
+    }
+
+    /// Set the region a `reset` power-cycles to.
+    pub fn set_region(&mut self, region: Region) {
+        self.region = region;
     }
 
     /// Install the adopted list, with the master switch in its starting
@@ -520,7 +529,7 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "seq" | "until") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "seq" | "until" | "reset") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         let cpf = sys.region().cycles_per_frame();
@@ -1011,6 +1020,18 @@ impl Controller {
                 },
                 Err(e) => Reply::err(format!("read {path}: {e}")),
             },
+            ("reset", []) => match sys.power_cycle(self.region) {
+                Ok(()) => {
+                    // `held` and `scan` describe the machine that just went
+                    // away; the cheat table needs no reinstall, since
+                    // `power_cycle` carries it in `Ambient` and rearms it.
+                    self.held = 0;
+                    sys.bus.sio2.buttons = 0;
+                    self.scan = None;
+                    Reply::ok(format!("reset, ee_pc={:#010x}", sys.ee.pc))
+                }
+                Err(e) => Reply::err(format!("reset failed: {e}")),
+            },
             ("quit", _) => Reply { ok: true, payload: "bye".into(), quit: true },
             _ => Reply::err(format!("unknown command '{line}' (try 'help')")),
         }
@@ -1040,7 +1061,7 @@ scan filter exact <value>|changed|unchanged|increased|decreased
 scan list [max]        '<addr> <value> <previous>' per hit, hex, default
                        100, capped at 4096; previous = value at the last pass
 scan clear             drop the scan session (it otherwise survives
-                       reconnects and loadstate)
+                       reconnects and loadstate; reset drops it)
 input set <btn[+btn]>  hold buttons until changed (applied during run)
 input clear            release all held buttons
 peek [ee|iop] <hexaddr> <len>    hex dump memory (side-effect-free, MMIO --)
@@ -1063,6 +1084,8 @@ tty                    kernel/IOP TTY accumulated since the last 'tty'
 savestate <path>|@<n>  snapshot the machine (zstd, as --save-state writes);
                        @<n> is an in-memory slot (0-15), kept until exit
 loadstate <path>|@<n>  restore a snapshot; @<n> restores an in-memory slot
+reset                  power-cycle: disc, card and cheats stay,
+                       held buttons and scan cleared
 quit                   shut the emulator down
 ";
 
@@ -1953,6 +1976,47 @@ mod tests {
         // Observation stays available while it is attached.
         assert!(c.execute(&mut sys, "peek 00100000 4", true).ok);
         assert!(c.execute(&mut sys, "state", true).ok);
+    }
+
+    #[test]
+    fn reset_restarts_the_machine_and_clears_held_buttons() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        install_health_cheat(&mut c, &mut sys);
+        assert!(c.execute(&mut sys, "input set up", false).ok);
+        assert!(c.execute(&mut sys, "run 2", false).ok);
+
+        let r = c.execute(&mut sys, "reset", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles, 0);
+        assert_eq!(sys.ee.pc, 0xBFC0_0000);
+        assert_eq!(sys.bus.sio2.buttons, 0);
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("frames=0"), "{}", r.payload);
+        assert!(r.payload.contains("held=none"), "{}", r.payload);
+
+        // The cheat table survived the power cycle and re-armed itself.
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let peek = c.execute(&mut sys, "peek 00100000 4", false);
+        assert!(peek.payload.contains("63 00 00 00"), "{}", peek.payload);
+    }
+
+    #[test]
+    fn reset_drops_the_scan_but_not_the_vblank_count() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "scan start iop 1", false).ok);
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert!(c.execute(&mut sys, "reset", false).ok);
+
+        assert!(!c.execute(&mut sys, "scan list", false).ok);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=1"), "{}", r.payload);
+    }
+
+    #[test]
+    fn reset_is_refused_while_the_debugger_owns_execution() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "reset", true).ok);
     }
 
     #[test]
