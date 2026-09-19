@@ -510,6 +510,19 @@ impl Ps2System {
         self.bus.region.vblank_start()
     }
 
+    /// EE cycles to run so that exactly one vertical-blank start edge fires,
+    /// ending on the cycle after it. Exact with the interpreter; with the
+    /// recompiler a linked chain may retire past the edge by a fraction of a
+    /// vblank, never as far as the next edge.
+    pub fn cycles_to_next_vblank(&self) -> u64 {
+        let vbl = self.vblank_start();
+        if self.frame_pos <= vbl {
+            vbl - self.frame_pos + 1
+        } else {
+            self.frame_cycles() - self.frame_pos + vbl + 1
+        }
+    }
+
     /// Bring `frame_pos` back inside the frame. Software can change the
     /// region mid-frame (see [`bus::Bus::write_gs_priv`]), leaving a
     /// position the new, shorter frame has already passed; one subtraction
@@ -1150,5 +1163,59 @@ mod state_tests {
         let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
         assert!(sys.load_state(b"nope").is_err());
         assert!(sys.load_state(&[0u8; 64]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vblank_tests {
+    use super::*;
+
+    const INTC_VBLANK_START: u32 = 1 << 2;
+
+    #[test]
+    fn distance_lands_one_cycle_past_the_edge() {
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        sys.set_jit(false).unwrap();
+        let d = sys.cycles_to_next_vblank();
+        assert_eq!(d, Region::Ntsc.vblank_start() + 1);
+
+        sys.run(d - 1);
+        assert_eq!(sys.bus.intc_stat & INTC_VBLANK_START, 0);
+        sys.run(1);
+        assert_ne!(sys.bus.intc_stat & INTC_VBLANK_START, 0);
+        sys.bus.intc_stat &= !INTC_VBLANK_START;
+
+        let next = sys.cycles_to_next_vblank();
+        assert_eq!(next, Region::Ntsc.cycles_per_frame());
+        sys.run(next);
+        assert_ne!(sys.bus.intc_stat & INTC_VBLANK_START, 0);
+        assert_eq!(sys.cycles, Region::Ntsc.vblank_start() + 1 + Region::Ntsc.cycles_per_frame());
+    }
+
+    #[test]
+    fn distance_follows_the_region() {
+        let mut sys = Ps2System::new_region(vec![0u8; bus::BIOS_SIZE], Region::Pal).unwrap();
+        sys.set_jit(false).unwrap();
+        let d = sys.cycles_to_next_vblank();
+        sys.run(d);
+        let next = sys.cycles_to_next_vblank();
+        assert_eq!(next, Region::Pal.cycles_per_frame());
+    }
+
+    #[test]
+    fn recompiler_stops_within_the_vblank() {
+        let mut sys = Ps2System::new_with(vec![0u8; bus::BIOS_SIZE], false).unwrap();
+        if !sys.jit_enabled() {
+            return;
+        }
+        let d = sys.cycles_to_next_vblank();
+        sys.run(d);
+        assert_ne!(sys.bus.intc_stat & INTC_VBLANK_START, 0);
+        let vbl = Region::Ntsc.vblank_start();
+        let cpf = Region::Ntsc.cycles_per_frame();
+        assert!(sys.cycles - (vbl + 1) < cpf / 20);
+
+        let next = sys.cycles_to_next_vblank();
+        assert_eq!(sys.cycles + next, vbl + 1 + cpf);
     }
 }
