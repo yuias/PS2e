@@ -33,6 +33,7 @@ use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 
 use crate::cheatfile;
 use crate::pad;
+use crate::scan;
 
 /// Emulation granularity, matching the headless loop's slice. Held buttons
 /// are re-applied and TTY drained on these boundaries, so a `run` behaves
@@ -266,6 +267,63 @@ fn read_range(sys: &mut Ps2System, core: Core, addr: u32, len: u32) -> Result<Ve
     Ok(out)
 }
 
+/// `1`, `2` or `4`: the width `until` (and later the scanner) reads a value
+/// at.
+fn parse_scan_width(s: &str) -> Result<u8, String> {
+    match s {
+        "1" => Ok(1),
+        "2" => Ok(2),
+        "4" => Ok(4),
+        _ => Err(format!("bad width '{s}' (1, 2 or 4)")),
+    }
+}
+
+/// `width` bytes at `addr` on `core`, little-endian, as `until` polls it.
+fn read_value(sys: &mut Ps2System, core: Core, addr: u32, width: u8) -> Result<u64, String> {
+    let bytes = read_range(sys, core, addr, u32::from(width))?;
+    Ok(bytes.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+}
+
+/// The condition `until` polls for at each vblank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UntilCond {
+    Eq(u64),
+    Ne(u64),
+    /// Differs from the value read before the machine started running.
+    Changed,
+}
+
+/// `<eq|ne> <value> max <n>[s|c|v]` or `changed max <n>[s|c|v]`; the value
+/// is masked to `width` bytes, the way a comparison against a narrower
+/// memory read would be.
+fn parse_until(cond: &str, tail: &[&str], width: u8, cpf: u64) -> Result<(UntilCond, RunLength), String> {
+    let needs_max = || "until needs 'max <n>[s|c|v]'".to_string();
+    match cond {
+        "eq" | "ne" => {
+            let [value, rest @ ..] = tail else {
+                return Err("eq/ne need a value".into());
+            };
+            if *value == "max" {
+                return Err("eq/ne need a value".into());
+            }
+            let mask = u64::MAX >> (64 - 8 * u32::from(width));
+            let v = scan::parse_value(value).ok_or_else(|| format!("bad value '{value}'"))? & mask;
+            let [max, n] = rest else { return Err(needs_max()) };
+            if *max != "max" {
+                return Err(needs_max());
+            }
+            let len = parse_duration(n, cpf)?;
+            Ok((if cond == "eq" { UntilCond::Eq(v) } else { UntilCond::Ne(v) }, len))
+        }
+        "changed" => match tail {
+            ["max", n] => Ok((UntilCond::Changed, parse_duration(n, cpf)?)),
+            [] => Err(needs_max()),
+            _ => Err("changed takes no value".into()),
+        },
+        _ => Err(format!("bad condition '{cond}'")),
+    }
+}
+
 pub struct Reply {
     pub ok: bool,
     /// Payload lines, without the status line or the terminator.
@@ -301,8 +359,8 @@ pub struct Controller {
     /// the same one back the way a real tray does.
     tray: Option<std::fs::File>,
     /// Vertical-blank edges this session has run across with the `v` unit
-    /// (`run`, `press`, `seq`). Not machine state: it survives `loadstate`
-    /// and is never saved.
+    /// (`run`, `press`, `seq`, `until`). Not machine state: it survives
+    /// `loadstate` and is never saved.
     vblanks: u64,
 }
 
@@ -381,7 +439,7 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "seq") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "seq" | "until") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         let cpf = sys.region().cycles_per_frame();
@@ -470,6 +528,63 @@ impl Controller {
                     segs.len(),
                     sys.cycles,
                     sys.ee.pc
+                ))
+            }
+            // The baseline is read, and every argument validated, before the
+            // pad or the machine are touched, so a bad address leaves both
+            // untouched rather than mid-run.
+            ("until", rest) => {
+                let (core, rest) = split_core(rest);
+                let [addr, width, cond, tail @ ..] = rest else {
+                    return Reply::err(
+                        "usage: until [ee|iop] <hexaddr> <1|2|4> <eq|ne|changed> [<value>] max <n>[s|c|v]",
+                    );
+                };
+                let addr = match parse_addr(addr) {
+                    Ok(a) => a,
+                    Err(e) => return Reply::err(e),
+                };
+                let width = match parse_scan_width(width) {
+                    Ok(w) => w,
+                    Err(e) => return Reply::err(e),
+                };
+                let (cond, len) = match parse_until(cond, tail, width, cpf) {
+                    Ok(v) => v,
+                    Err(e) => return Reply::err(e),
+                };
+                let baseline = match read_value(sys, core, addr, width) {
+                    Ok(v) => v,
+                    Err(e) => return Reply::err(e),
+                };
+                let mut value = baseline;
+                let mut vblanks = 0u64;
+                let mut cycles = 0u64;
+                let met = loop {
+                    let holds = match cond {
+                        UntilCond::Eq(v) => value == v,
+                        UntilCond::Ne(v) => value != v,
+                        UntilCond::Changed => value != baseline,
+                    };
+                    if holds {
+                        break true;
+                    }
+                    let spent = match len {
+                        RunLength::Vblanks(n) => vblanks >= n,
+                        RunLength::Cycles(budget) => cycles >= budget,
+                    };
+                    if spent {
+                        break false;
+                    }
+                    cycles += self.advance(sys, RunLength::Vblanks(1));
+                    vblanks += 1;
+                    value = match read_value(sys, core, addr, width) {
+                        Ok(v) => v,
+                        Err(e) => return Reply::err(e),
+                    };
+                };
+                Reply::ok(format!(
+                    "{} after {vblanks} vblanks ({cycles} cycles), value={value:#x}",
+                    if met { "met" } else { "timeout" }
                 ))
             }
             ("input", ["set", buttons]) => match parse_buttons(buttons) {
@@ -741,6 +856,9 @@ press <btn[+btn]> <n>[s|c|v]
 seq <btn[+btn]|none>:<n>[s|c|v] ...
                        hold each set for its span in turn (exact set per
                        segment), then restore the held set
+until [ee|iop] <hexaddr> <1|2|4> <eq|ne|changed> [<value>] max <n>[s|c|v]
+                       run until the value matches (checked at each vblank)
+                       or max elapses; reply starts with met/timeout
 input set <btn[+btn]>  hold buttons until changed (applied during run)
 input clear            release all held buttons
 peek [ee|iop] <hexaddr> <len>    hex dump memory (side-effect-free, MMIO --)
@@ -875,6 +993,16 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ps2e-ctl-{}-{tag}", std::process::id()))
+    }
+
+    /// Install a cheat that writes `99` (`0x63`) to `00100000` every vblank,
+    /// so `until` tests have a value that changes on its own without a pad
+    /// program: cheats land at the vblank, exactly where `until` polls.
+    fn install_health_cheat(c: &mut Controller, sys: &mut Ps2System) {
+        let groups = ps2_core::cheats::parse("[Health]\npatch=1,EE,00100000,word,00000063\n");
+        c.set_cheats(temp_path("none.pnach"), groups);
+        c.push_cheats(sys);
+        assert!(c.execute(sys, "cheat apply on", false).ok);
     }
 
     /// A machine with the inline GS renderer (`frameb`'s tests need
@@ -1141,6 +1269,81 @@ mod tests {
             assert_eq!(sys.cycles, cycles, "{bad}");
         }
         assert!(!c.execute(&mut sys, "seq cross:1", true).ok);
+    }
+
+    #[test]
+    fn until_meets_a_condition_written_at_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        install_health_cheat(&mut c, &mut sys);
+
+        let r = c.execute(&mut sys, "until 00100000 1 eq 0x63 max 5v", false);
+        assert!(r.payload.starts_with("met after 1 vblanks"), "{}", r.payload);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=1"), "{}", r.payload);
+
+        // The cheat already wrote 99 (0x63) on the previous poll, so this
+        // one is met without running anything further.
+        let r = c.execute(&mut sys, "until 00100000 1 eq 99 max 5v", false);
+        assert!(r.payload.starts_with("met after 0 vblanks"), "{}", r.payload);
+    }
+
+    #[test]
+    fn until_changed_meets_a_condition_written_at_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        install_health_cheat(&mut c, &mut sys);
+
+        let r = c.execute(&mut sys, "until 00100000 1 changed max 5v", false);
+        assert!(r.payload.starts_with("met after 1 vblanks"), "{}", r.payload);
+    }
+
+    #[test]
+    fn until_times_out() {
+        // Each check needs a cold machine: the distance to the first vblank
+        // edge (about 0.95 of a frame) only holds from `sys.cycles == 0`,
+        // every later edge being a whole frame after the previous.
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            let r = c.execute(&mut sys, "until 00100000 1 changed max 2v", false);
+            assert!(r.payload.starts_with("timeout after 2 vblanks"), "{}", r.payload);
+        }
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            let r = c.execute(&mut sys, "until 00100000 4 ne 0 max 1v", false);
+            assert!(r.payload.starts_with("timeout after 1 vblanks"), "{}", r.payload);
+        }
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            let r = c.execute(&mut sys, "until iop 00010000 1 ne 0 max 1v", false);
+            assert!(r.payload.starts_with("timeout"), "{}", r.payload);
+        }
+        // A frame's worth of cycles is spent only at the second edge: the
+        // first is only 0.95 of a frame from a cold machine.
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            let r = c.execute(&mut sys, "until 00100000 1 changed max 1", false);
+            assert!(r.payload.starts_with("timeout after 2 vblanks"), "{}", r.payload);
+        }
+    }
+
+    #[test]
+    fn until_rejects_bad_input() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        for bad in [
+            "until 00100000 1 changed",
+            "until 00100000 1 eq max 5v",
+            "until 00100000 1 changed 5 max 10",
+            "until 00100000 3 eq 5 max 10",
+        ] {
+            assert!(!c.execute(&mut sys, bad, false).ok, "{bad}");
+        }
+        sys.bus.sio2.buttons = pad::CROSS;
+        let (cycles, buttons) = (sys.cycles, sys.bus.sio2.buttons);
+        let r = c.execute(&mut sys, "until 10004000 1 eq 5 max 10", false);
+        assert!(!r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles, cycles);
+        assert_eq!(sys.bus.sio2.buttons, buttons);
+
+        assert!(!c.execute(&mut sys, "until 00100000 1 eq 1 max 1v", true).ok);
     }
 
     #[test]

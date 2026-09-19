@@ -253,6 +253,7 @@ ps2ctl run 3v                 # three vblanks, stopping just past the edge
 ps2ctl run to 158e9           # advance to an absolute EE cycle
 ps2ctl press circle 30        # hold buttons for 30 frames, then release
 ps2ctl seq cross:2v none:1v cross:2v  # two taps in one round trip
+ps2ctl until 00100000 1 eq 3 max 600v  # run until a byte becomes 3 (checked per vblank)
 ps2ctl input set up           # hold until changed; applied during run
 ps2ctl input clear            # release everything held
 ps2ctl frame shot.png         # dump the display, .png or .bmp
@@ -281,8 +282,9 @@ A typical loop: `press`/`run` → `frame`/`peek`/`tty` → decide → repeat, wi
 debugger can be active simultaneously; execution commands are refused while
 a debugger is attached. Replies are written whole, however large; a client
 that stops reading is dropped after five seconds. `vblanks=` in `state`
-counts vblank-unit advances made by this session (`run`, `press` and `seq`
-with `v`), not the machine's field count, and it is not reset by `loadstate`.
+counts vblank-unit advances made by this session (`run`, `press`, `seq` and
+`until` with `v`), not the machine's field count, and it is not reset by
+`loadstate`.
 
 This is a separate mode from the `--cycles` batch run, not a modifier on it:
 a scripted `--press circle@150e9` and a client deciding when to press cannot
