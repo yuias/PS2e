@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ps2_core::cheats::Group;
-use ps2_core::{EE_CLOCK_HZ, Ps2System};
+use ps2_core::{EE_CLOCK_HZ, Ps2System, Region};
 
 use crate::cheatfile;
 use crate::pad;
@@ -82,8 +82,23 @@ fn parse_buttons(s: &str) -> Result<u16, String> {
     })
 }
 
-/// Parse `10` (frames), `2s` (seconds) or `50000c` (EE cycles) into cycles.
-fn parse_duration(s: &str, cycles_per_frame: u64) -> Result<u64, String> {
+/// How far a `run`-style command advances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLength {
+    Cycles(u64),
+    /// Whole vblanks; the machine stops right after the edge.
+    Vblanks(u64),
+}
+
+/// `10` (frames), `2s` (seconds), `50000c` (EE cycles) or `3v` (vblanks,
+/// an integer >= 1).
+fn parse_duration(s: &str, cycles_per_frame: u64) -> Result<RunLength, String> {
+    if let Some(num) = s.strip_suffix('v') {
+        return match num.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(RunLength::Vblanks(n)),
+            _ => Err(format!("bad duration '{s}'")),
+        };
+    }
     let (num, unit) = match s.chars().last() {
         Some('s') => (&s[..s.len() - 1], EE_CLOCK_HZ),
         Some('c') => (&s[..s.len() - 1], 1),
@@ -93,7 +108,7 @@ fn parse_duration(s: &str, cycles_per_frame: u64) -> Result<u64, String> {
     if !n.is_finite() || n <= 0.0 {
         return Err(format!("bad duration '{s}'"));
     }
-    Ok((n * unit as f64) as u64)
+    Ok(RunLength::Cycles((n * unit as f64) as u64))
 }
 
 fn parse_addr(s: &str) -> Result<u32, String> {
@@ -273,6 +288,10 @@ pub struct Controller {
     /// The disc lifted out by `disc open`, so a bare `disc close` can put
     /// the same one back the way a real tray does.
     tray: Option<std::fs::File>,
+    /// Vertical-blank edges this session has run across with the `v` unit
+    /// (`run`, `press`). Not machine state: it survives `loadstate` and is
+    /// never saved.
+    vblanks: u64,
 }
 
 impl Controller {
@@ -290,15 +309,34 @@ impl Controller {
         sys.set_cheats_enabled(enabled);
     }
 
-    /// Advance emulation, keeping the held buttons applied and draining the
-    /// per-slice outputs the batch loop also drains.
-    fn advance(&mut self, sys: &mut Ps2System, cycles: u64) {
+    /// Advance by a plain cycle count, keeping the held buttons applied and
+    /// draining the per-slice outputs the batch loop also drains.
+    fn advance_cycles(&mut self, sys: &mut Ps2System, cycles: u64) {
         let target = sys.cycles.saturating_add(cycles);
         while sys.cycles < target {
             sys.bus.sio2.buttons = self.held;
             sys.run((target - sys.cycles).min(SLICE));
             self.collect(sys);
         }
+    }
+
+    /// Advance by `len` with the held buttons applied; returns cycles
+    /// elapsed. `Vblanks` recomputes the distance to the next edge one
+    /// vblank at a time, because the region (and so the frame length) can
+    /// change mid-run.
+    fn advance(&mut self, sys: &mut Ps2System, len: RunLength) -> u64 {
+        let start = sys.cycles;
+        match len {
+            RunLength::Cycles(cycles) => self.advance_cycles(sys, cycles),
+            RunLength::Vblanks(n) => {
+                for _ in 0..n {
+                    let d = sys.cycles_to_next_vblank();
+                    self.advance_cycles(sys, d);
+                    self.vblanks += 1;
+                }
+            }
+        }
+        sys.cycles - start
     }
 
     /// Take what the machine produced during a slice. SPU2 output is
@@ -338,11 +376,14 @@ impl Controller {
         match (cmd, args.as_slice()) {
             ("help", _) => Reply::ok(HELP.trim_end()),
             ("state", _) => Reply::ok(format!(
-                "ee_pc={:#010x} iop_pc={:#010x} cycles={} frames={} held={} tray={}",
+                "ee_pc={:#010x} iop_pc={:#010x} cycles={} frames={} vblanks={} region={} field_hz={:.2} held={} tray={}",
                 sys.ee.pc,
                 sys.iop.pc,
                 sys.cycles,
                 sys.cycles / cpf,
+                self.vblanks,
+                match sys.region() { Region::Ntsc => "ntsc", Region::Pal => "pal" },
+                EE_CLOCK_HZ as f64 / cpf as f64,
                 buttons_to_names(self.held),
                 if sys.bus.cdvd.tray_open() { "open" } else { "closed" },
             )),
@@ -353,14 +394,21 @@ impl Controller {
                     Reply::err(format!("already at cycle {} (past {at})", sys.cycles))
                 }
                 Ok(at) => {
-                    self.advance(sys, at - sys.cycles);
+                    self.advance(sys, RunLength::Cycles(at - sys.cycles));
                     Reply::ok(format!("at cycle {}, ee_pc={:#010x}", sys.cycles, sys.ee.pc))
                 }
                 Err(e) => Reply::err(e),
             },
             ("run", [dur]) => match parse_duration(dur, cpf) {
-                Ok(cycles) => {
-                    self.advance(sys, cycles);
+                Ok(RunLength::Vblanks(n)) => {
+                    let cycles = self.advance(sys, RunLength::Vblanks(n));
+                    Reply::ok(format!(
+                        "ran {n} vblanks ({cycles} cycles) to {}, vblanks={}, ee_pc={:#010x}",
+                        sys.cycles, self.vblanks, sys.ee.pc
+                    ))
+                }
+                Ok(len @ RunLength::Cycles(cycles)) => {
+                    self.advance(sys, len);
                     Reply::ok(format!(
                         "ran {cycles} cycles to {}, ee_pc={:#010x}",
                         sys.cycles, sys.ee.pc
@@ -369,11 +417,11 @@ impl Controller {
                 Err(e) => Reply::err(e),
             },
             ("press", [buttons, dur]) => match (parse_buttons(buttons), parse_duration(dur, cpf)) {
-                (Ok(mask), Ok(cycles)) => {
+                (Ok(mask), Ok(len)) => {
                     let from = sys.cycles;
                     let prev = self.held;
                     self.held |= mask;
-                    self.advance(sys, cycles);
+                    self.advance(sys, len);
                     self.held = prev;
                     sys.bus.sio2.buttons = self.held;
                     Reply::ok(format!(
@@ -642,10 +690,14 @@ impl Controller {
 }
 
 const HELP: &str = "\
-state                  ee/iop pc, EE cycle, frame, held buttons, tray
-run <n>[s|c]           advance n frames (s=seconds, c=EE cycles), inputs held
+state                  pcs, EE cycle, nominal frame, vblanks run with 'v',
+                       region, field rate, held, tray
+run <n>[s|c|v]         advance n frames/seconds/EE cycles/vblanks (v: stop
+                       right after the edge), inputs held
 run to <cycle>         advance to an absolute EE cycle (5e9 shorthand ok)
-press <btn[+btn]> <n>  hold buttons for n frames on top of the held set
+press <btn[+btn]> <n>[s|c|v]
+                       hold buttons for n on top of the held set
+                       (v=vblanks: stop right after the edge)
 input set <btn[+btn]>  hold buttons until changed (applied during run)
 input clear            release all held buttons
 peek [ee|iop] <hexaddr> <len>    hex dump memory (side-effect-free, MMIO --)
@@ -829,6 +881,90 @@ mod tests {
         assert_eq!(sys.cycles, 8_000_000);
         // Going backwards is a mistake, not a no-op.
         assert!(!c.execute(&mut sys, "run to 1e6", false).ok);
+    }
+
+    #[test]
+    fn run_v_stops_right_after_the_edge() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        sys.set_jit(false).unwrap();
+        let vbl = Region::Ntsc.vblank_start();
+        let cpf = Region::Ntsc.cycles_per_frame();
+
+        let r = c.execute(&mut sys, "run 1v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles, vbl + 1);
+
+        let before = sys.cycles;
+        let r = c.execute(&mut sys, "run 1v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles - before, cpf);
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=2"), "{}", r.payload);
+        assert!(r.payload.contains("region=ntsc"), "{}", r.payload);
+        assert!(r.payload.contains("field_hz=60.00"), "{}", r.payload);
+    }
+
+    #[test]
+    fn run_v_with_the_recompiler_stays_inside_the_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let vbl = Region::Ntsc.vblank_start();
+        let cpf = Region::Ntsc.cycles_per_frame();
+
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert!(sys.cycles >= vbl + 1);
+        assert!(sys.cycles - (vbl + 1) < cpf / 20);
+
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert!(sys.cycles >= vbl + 1 + cpf);
+        assert!(sys.cycles - (vbl + 1 + cpf) < cpf / 20);
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=2"), "{}", r.payload);
+    }
+
+    #[test]
+    fn run_v_follows_pal_timing() {
+        let mut sys = Ps2System::new_region(vec![0u8; 4 * 1024 * 1024], Region::Pal).unwrap();
+        sys.set_jit(false).unwrap();
+        let mut c = Controller::default();
+        let cpf = Region::Pal.cycles_per_frame();
+
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        let before = sys.cycles;
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert_eq!(sys.cycles - before, cpf);
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("region=pal"), "{}", r.payload);
+        assert!(r.payload.contains("field_hz=50.00"), "{}", r.payload);
+    }
+
+    #[test]
+    fn press_accepts_vblank_lengths() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "input set up", false).ok);
+        let r = c.execute(&mut sys, "press cross 1v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.bus.sio2.buttons, pad::UP);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=1"), "{}", r.payload);
+    }
+
+    #[test]
+    fn vblank_count_survives_loadstate() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let path = temp_path("vblanks.sst");
+        let p = path.to_str().unwrap();
+
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert!(c.execute(&mut sys, &format!("savestate {p}"), false).ok);
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert!(c.execute(&mut sys, &format!("loadstate {p}"), false).ok);
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=2"), "{}", r.payload);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1118,6 +1254,9 @@ mod tests {
         assert!(!c.execute(&mut sys, "dance", false).ok);
         assert!(!c.execute(&mut sys, "run zero", false).ok);
         assert!(!c.execute(&mut sys, "run -5", false).ok);
+        assert!(!c.execute(&mut sys, "run 0v", false).ok);
+        assert!(!c.execute(&mut sys, "run 1.5v", false).ok);
+        assert!(!c.execute(&mut sys, "run v", false).ok);
         assert!(!c.execute(&mut sys, "press nope 1", false).ok);
         assert!(!c.execute(&mut sys, "peek xyz 4", false).ok);
         assert!(!c.execute(&mut sys, "peek 00100000 999999", false).ok);

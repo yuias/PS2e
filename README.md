@@ -249,6 +249,7 @@ over TCP:
 
 ```
 ps2ctl run 20s                # advance (frames by default; s/c suffixes)
+ps2ctl run 3v                 # three vblanks, stopping just past the edge
 ps2ctl run to 158e9           # advance to an absolute EE cycle
 ps2ctl press circle 30        # hold buttons for 30 frames, then release
 ps2ctl input set up           # hold until changed; applied during run
@@ -268,7 +269,7 @@ ps2ctl cheat list             # pnach sections, and the master switch
 ps2ctl cheat apply on         # nothing applies until this is on
 ps2ctl cheat on 0             # toggle one section (in memory only)
 ps2ctl savestate s.st         # snapshot; loadstate restores it
-ps2ctl state                  # pcs, cycle, frame, held buttons, tray
+ps2ctl state                  # pcs, cycle, frame, vblanks, region, held, tray
 ps2ctl quit
 ```
 
@@ -278,7 +279,9 @@ A typical loop: `press`/`run` → `frame`/`peek`/`tty` → decide → repeat, wi
 `savestate`/`loadstate` for branching exploration. The control port and the
 debugger can be active simultaneously; execution commands are refused while
 a debugger is attached. Replies are written whole, however large; a client
-that stops reading is dropped after five seconds.
+that stops reading is dropped after five seconds. `vblanks=` in `state`
+counts vblank-unit advances made by this session (`run` and `press` with
+`v`), not the machine's field count, and it is not reset by `loadstate`.
 
 This is a separate mode from the `--cycles` batch run, not a modifier on it:
 a scripted `--press circle@150e9` and a client deciding when to press cannot
