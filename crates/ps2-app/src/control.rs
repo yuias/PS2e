@@ -44,6 +44,9 @@ const SLICE: u64 = 1_000_000;
 /// must not grow the buffer without bound; the oldest text goes first.
 const TTY_CAP: usize = 1 << 20;
 
+/// In-memory `savestate`/`loadstate` slots, `@0`..`@15`.
+const STATE_SLOTS: usize = 16;
+
 /// Cap on a single `peek`, in bytes. The reply is hex, so this is also
 /// what keeps one command from returning a megabyte of text.
 const PEEK_MAX: u32 = 4096;
@@ -129,6 +132,13 @@ fn parse_segment(s: &str, cpf: u64) -> Result<(u16, RunLength), String> {
 
 fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
+}
+
+/// `@0`..`@15` into a slot index; `None` for anything else, including an
+/// out-of-range number (the caller reports `bad slot`).
+fn parse_slot(s: &str) -> Option<usize> {
+    let n: usize = s.strip_prefix('@')?.parse().ok()?;
+    (n < STATE_SLOTS).then_some(n)
 }
 
 /// Which core's bus view a `peek`/`poke` uses. The EE is the default
@@ -362,7 +372,6 @@ impl Reply {
 
 /// Command executor: protocol state independent of the transport, so the
 /// whole command surface is unit-testable without sockets.
-#[derive(Default)]
 pub struct Controller {
     /// Buttons held across `run` commands (`input set`).
     held: u16,
@@ -385,6 +394,25 @@ pub struct Controller {
     /// Scanner session; survives reconnects (`ps2ctl` reconnects per
     /// command) and `loadstate`; dropped by `scan clear`.
     scan: Option<scan::Scan>,
+    /// In-memory save-state slots `@0`..`@15`, zstd blobs; kept until
+    /// overwritten or the process exits (never cleared on reconnect, since
+    /// `ps2ctl` reconnects per command).
+    slots: Vec<Option<Vec<u8>>>,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self {
+            held: 0,
+            tty: String::new(),
+            cheats: Vec::new(),
+            cheat_file: None,
+            tray: None,
+            vblanks: 0,
+            scan: None,
+            slots: vec![None; STATE_SLOTS],
+        }
+    }
 }
 
 impl Controller {
@@ -927,6 +955,20 @@ impl Controller {
                     Err(e) => Reply::err(format!("write {path}: {e}")),
                 }
             }
+            ("savestate", [path]) if path.starts_with('@') => match parse_slot(path) {
+                Some(n) => match sys.save_state() {
+                    Ok(data) => match crate::state::encode(&data) {
+                        Ok(blob) => {
+                            let len = blob.len();
+                            self.slots[n] = Some(blob);
+                            Reply::ok(format!("cycle {}, {len} bytes -> @{n}", sys.cycles))
+                        }
+                        Err(e) => Reply::err(format!("encode: {e}")),
+                    },
+                    Err(e) => Reply::err(format!("save state failed: {e}")),
+                },
+                None => Reply::err(format!("bad slot '{path}' (0-15)")),
+            },
             ("savestate", [path]) => match sys.save_state() {
                 Ok(data) => match crate::state::write(Path::new(path), &data) {
                     Ok(len) => {
@@ -935,6 +977,27 @@ impl Controller {
                     Err(e) => Reply::err(format!("write {path}: {e}")),
                 },
                 Err(e) => Reply::err(format!("save state failed: {e}")),
+            },
+            ("loadstate", [path]) if path.starts_with('@') => match parse_slot(path) {
+                Some(n) => match &self.slots[n] {
+                    Some(blob) => match crate::state::decode(blob) {
+                        Ok(data) => match sys.load_state(&data) {
+                            Ok(()) => {
+                                // The state carries its own pad state; the
+                                // held set is the operator's and outlives it.
+                                sys.bus.sio2.buttons = self.held;
+                                Reply::ok(format!(
+                                    "cycle {}, ee_pc={:#010x}",
+                                    sys.cycles, sys.ee.pc
+                                ))
+                            }
+                            Err(e) => Reply::err(e),
+                        },
+                        Err(e) => Reply::err(format!("decode: {e}")),
+                    },
+                    None => Reply::err(format!("slot @{n} is empty")),
+                },
+                None => Reply::err(format!("bad slot '{path}' (0-15)")),
             },
             ("loadstate", [path]) => match crate::state::read(Path::new(path)) {
                 Ok(data) => match sys.load_state(&data) {
@@ -997,8 +1060,9 @@ cheat apply on|off     master switch
 cheat on|off <n>       toggle section n (in memory; cheats.toml untouched)
 cheat reload           re-read the pnach
 tty                    kernel/IOP TTY accumulated since the last 'tty'
-savestate <path>       snapshot the machine (zstd, as --save-state writes)
-loadstate <path>       restore a snapshot
+savestate <path>|@<n>  snapshot the machine (zstd, as --save-state writes);
+                       @<n> is an in-memory slot (0-15), kept until exit
+loadstate <path>|@<n>  restore a snapshot; @<n> restores an in-memory slot
 quit                   shut the emulator down
 ";
 
@@ -1814,6 +1878,37 @@ mod tests {
         assert!(c.execute(&mut sys, &format!("savestate {p}"), true).ok);
         assert!(!c.execute(&mut sys, &format!("loadstate {p}"), true).ok);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn slot_savestate_loadstate_round_trip() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let at = sys.cycles;
+        let r = c.execute(&mut sys, "savestate @3", false);
+        assert!(r.ok, "{}", r.payload);
+        assert!(c.slots[3].as_ref().unwrap().len() < 40 << 20);
+
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        assert_ne!(sys.cycles, at);
+
+        let r = c.execute(&mut sys, "loadstate @3", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles, at);
+
+        // Saving is observation; loading rewinds execution, so only the
+        // second is refused while a debugger owns the machine.
+        assert!(c.execute(&mut sys, "savestate @3", true).ok);
+        assert!(!c.execute(&mut sys, "loadstate @3", true).ok);
+    }
+
+    #[test]
+    fn slot_errors() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "loadstate @4", false).ok);
+        assert!(!c.execute(&mut sys, "savestate @16", false).ok);
+        assert!(!c.execute(&mut sys, "savestate @x", false).ok);
     }
 
     #[test]

@@ -23,3 +23,18 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     zstd::stream::copy_decode(file, &mut out)?;
     Ok(out)
 }
+
+/// zstd-compress a raw state for an in-memory slot (same level as files):
+/// 16 slots of ~6-9 MB each beats 16 of the ~40 MiB raw state.
+pub fn encode(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    zstd::stream::copy_encode(data, &mut out, LEVEL)?;
+    Ok(out)
+}
+
+/// Inverse of [`encode`].
+pub fn decode(blob: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    zstd::stream::copy_decode(blob, &mut out)?;
+    Ok(out)
+}

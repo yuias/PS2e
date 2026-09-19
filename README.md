@@ -274,6 +274,7 @@ ps2ctl cheat list             # pnach sections, and the master switch
 ps2ctl cheat apply on         # nothing applies until this is on
 ps2ctl cheat on 0             # toggle one section (in memory only)
 ps2ctl savestate s.st         # snapshot; loadstate restores it
+ps2ctl savestate @3           # in-memory slot; loadstate @3 restores it
 ps2ctl state                  # pcs, cycle, frame, vblanks, region, held, tray
 ps2ctl quit
 ```
