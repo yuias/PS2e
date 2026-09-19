@@ -47,6 +47,9 @@ const TTY_CAP: usize = 1 << 20;
 /// what keeps one command from returning a megabyte of text.
 const PEEK_MAX: u32 = 4096;
 
+/// Largest `peekb` reply / `peekm` total, in bytes: the whole EE RAM.
+const PEEK_BYTES_MAX: u32 = 32 * 1024 * 1024;
+
 const BUTTON_NAMES: [(&str, u16); 16] = [
     ("select", pad::SELECT),
     ("l3", pad::L3),
@@ -126,6 +129,114 @@ fn poke8(sys: &mut Ps2System, core: Core, addr: u32, v: u8) -> bool {
         Core::Ee => sys.bus.poke8(addr, v),
         Core::Iop => sys.bus.iop_poke8(addr, v),
     }
+}
+
+/// Standard base64 with `=` padding (no dependency for one function).
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 { TABLE[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Decode a `base64_encode` payload, for the tests only. A 256-entry lookup
+/// built once: a per-character `position()` scan is too slow for a 43 MiB
+/// test payload in debug.
+#[cfg(test)]
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static LOOKUP: std::sync::OnceLock<[i8; 256]> = std::sync::OnceLock::new();
+    let lookup = LOOKUP.get_or_init(|| {
+        let mut l = [-1i8; 256];
+        for (i, &b) in TABLE.iter().enumerate() {
+            l[b as usize] = i as i8;
+        }
+        l
+    });
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut bits = 0u32;
+    let mut nbits = 0u32;
+    for c in s.trim_end_matches('=').bytes() {
+        let v = lookup[c as usize];
+        if v < 0 {
+            return None;
+        }
+        bits = (bits << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Backing slice and offset for the directly addressable region containing
+/// `addr`, already truncated to the end of the run reachable from there (a
+/// TLB page for EE RAM, a mirror period for IOP RAM): `slice.len() - offset`
+/// is therefore always a safe chunk length. `None` where there is none
+/// (`read_range` falls back to `peek8`).
+fn ram_window(sys: &mut Ps2System, core: Core, addr: u32) -> Option<(&[u8], usize)> {
+    match core {
+        Core::Ee => match addr {
+            0x7000_0000..=0x7000_3FFF => Some((&sys.bus.spad, (addr & 0x3FFF) as usize)),
+            _ => {
+                let phys = sys.bus.ram_phys_of(addr)? as usize;
+                // TLB pages need not be physically contiguous, so the chunk
+                // stops at the page end even though the RAM array continues.
+                let page_end = (phys | 0xFFF) + 1;
+                Some((&sys.bus.ram[..page_end], phys))
+            }
+        },
+        Core::Iop => {
+            if addr >= 0xFFFE_0000 {
+                return None; // KSEG2 cache control
+            }
+            match addr & 0x1FFF_FFFF {
+                a @ 0x0000_0000..=0x007F_FFFF => Some((&sys.bus.iop_ram, (a & 0x1F_FFFF) as usize)),
+                a @ 0x1F80_0000..=0x1F80_03FF => Some((&sys.bus.iop_spad, (a & 0x3FF) as usize)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `len` bytes from `addr` on `core`. RAM, scratchpad and IOP RAM are
+/// copied as slices (a per-byte loop over 32 MiB would dominate the read);
+/// anything else goes through `peek8` a byte at a time, and the first
+/// unreadable byte fails the whole read (base64 has no room for a per-byte
+/// marker). The readability rule is therefore exactly `peek`'s: whatever
+/// `peek` shows as `--` makes this fail too.
+fn read_range(sys: &mut Ps2System, core: Core, addr: u32, len: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut a = addr;
+    let mut remaining = len;
+    while remaining > 0 {
+        if let Some((slice, offset)) = ram_window(sys, core, a) {
+            let n = remaining.min((slice.len() - offset) as u32);
+            out.extend_from_slice(&slice[offset..offset + n as usize]);
+            a = a.wrapping_add(n);
+            remaining -= n;
+        } else {
+            let b = peek8(sys, core, a).ok_or_else(|| format!("address {a:#010x} not readable"))?;
+            out.push(b);
+            a = a.wrapping_add(1);
+            remaining -= 1;
+        }
+    }
+    Ok(out)
 }
 
 pub struct Reply {
@@ -308,6 +419,57 @@ impl Controller {
                 }
                 Reply::ok(out.trim_end().to_string())
             }
+            ("peekb", rest) => {
+                let (core, rest) = split_core(rest);
+                let [addr, len] = rest else {
+                    return Reply::err("usage: peekb [ee|iop] <hexaddr> <len>");
+                };
+                let (addr, len) = match (parse_addr(addr), len.parse::<u32>()) {
+                    (Ok(a), Ok(l)) if l >= 1 && l <= PEEK_BYTES_MAX => (a, l),
+                    (Err(e), _) => return Reply::err(e),
+                    _ => return Reply::err(format!("bad length (1-{PEEK_BYTES_MAX})")),
+                };
+                match read_range(sys, core, addr, len) {
+                    Ok(bytes) => Reply::ok(base64_encode(&bytes)),
+                    Err(e) => Reply::err(e),
+                }
+            }
+            ("peekm", rest) => {
+                let (core, rest) = split_core(rest);
+                if rest.is_empty() {
+                    return Reply::err("peekm needs at least one <hexaddr>:<len>");
+                }
+                // Every range is parsed and sized before any is read, so a
+                // bad range later in the list does not read the earlier ones.
+                let mut ranges = Vec::with_capacity(rest.len());
+                let mut total: u64 = 0;
+                for r in rest {
+                    let bad = || format!("bad range '{r}' (want <hexaddr>:<len>)");
+                    let Some((a, l)) = r.split_once(':') else {
+                        return Reply::err(bad());
+                    };
+                    let (addr, len) = match (parse_addr(a), l.parse::<u32>()) {
+                        (Ok(addr), Ok(len)) if len >= 1 => (addr, len),
+                        _ => return Reply::err(bad()),
+                    };
+                    total += u64::from(len);
+                    if total > u64::from(PEEK_BYTES_MAX) {
+                        return Reply::err(format!("bad length (1-{PEEK_BYTES_MAX})"));
+                    }
+                    ranges.push((addr, len));
+                }
+                let mut out = String::new();
+                for (addr, len) in ranges {
+                    match read_range(sys, core, addr, len) {
+                        Ok(bytes) => {
+                            out.push_str(&base64_encode(&bytes));
+                            out.push('\n');
+                        }
+                        Err(e) => return Reply::err(e),
+                    }
+                }
+                Reply::ok(out.trim_end().to_string())
+            }
             ("poke", rest) => {
                 let (core, rest) = split_core(rest);
                 let [addr, hex] = rest else {
@@ -465,6 +627,10 @@ press <btn[+btn]> <n>  hold buttons for n frames on top of the held set
 input set <btn[+btn]>  hold buttons until changed (applied during run)
 input clear            release all held buttons
 peek [ee|iop] <hexaddr> <len>    hex dump memory (side-effect-free, MMIO --)
+peekb [ee|iop] <hexaddr> <len>   memory as one base64 line (up to 32 MiB;
+                       err if any byte is one peek would show as --)
+peekm [ee|iop] <hexaddr>:<len> ...
+                       one base64 line per range, 32 MiB in total
 poke [ee|iop] <hexaddr> <hex>    write bytes to RAM/scratchpad
 frame <path>           write the display as .png or .bmp
 vram <path>            write the raw 4 MiB GS VRAM (no image: mixed formats)
@@ -643,6 +809,126 @@ mod tests {
         // as -- rather than being dispatched.
         let r = c.execute(&mut sys, "peek 10004000 4", false);
         assert!(r.payload.contains("--"), "{}", r.payload);
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        let cases: [(&[u8], &str); 7] = [
+            (b"", ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ];
+        for (data, want) in cases {
+            assert_eq!(base64_encode(data), want, "encoding {data:?}");
+            assert_eq!(base64_decode(want).unwrap(), data, "decoding {want:?}");
+        }
+    }
+
+    #[test]
+    fn peekb_matches_peek_and_covers_all_of_ram() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke 00100000 deadbeef", false).ok);
+        let want = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let r = c.execute(&mut sys, "peekb 00100000 4", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(base64_decode(&r.payload).unwrap(), want);
+
+        // The kseg0 mirror is the same memory, on either core spelling.
+        let r = c.execute(&mut sys, "peekb 80100000 4", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), want);
+        let r = c.execute(&mut sys, "peekb ee 00100000 4", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), want);
+
+        let r = c.execute(&mut sys, "peekb 00000000 33554432", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(base64_decode(&r.payload).unwrap(), sys.bus.ram.to_vec());
+
+        assert!(!c.execute(&mut sys, "peekb 00000000 33554433", false).ok);
+        // The VIF0 FIFO has no side-effect-free read, same as `peek`'s `--`.
+        assert!(!c.execute(&mut sys, "peekb 10004000 4", false).ok);
+        assert!(!c.execute(&mut sys, "peekb 00100000 0", false).ok);
+    }
+
+    #[test]
+    fn peekb_reads_scratchpad_and_the_iop() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke ee 70000000 aa", false).ok);
+        let r = c.execute(&mut sys, "peekb 70000000 1", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), vec![0xaa]);
+
+        assert!(c.execute(&mut sys, "poke iop 00010000 55", false).ok);
+        let r = c.execute(&mut sys, "peekb iop 00010000 1", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), vec![0x55]);
+        // The 2 MiB mirror is the same underlying IOP RAM.
+        let r = c.execute(&mut sys, "peekb iop 00210000 1", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), vec![0x55]);
+
+        assert!(c.execute(&mut sys, "poke iop 001ffffe 1122", false).ok);
+        assert!(c.execute(&mut sys, "poke iop 00000000 3344", false).ok);
+        // Crosses the mirror end, so the read spans two window calls.
+        let r = c.execute(&mut sys, "peekb iop 001ffffe 4", false);
+        assert_eq!(base64_decode(&r.payload).unwrap(), vec![0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn peekb_stops_a_chunk_at_the_tlb_page_boundary() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        // Two adjacent virtual 4 KiB pages mapped to non-adjacent physical
+        // pages: a chunk that ran past the page end instead of
+        // re-translating would read the wrong bytes here.
+        let phys0 = 0x0010_0000u32;
+        let phys1 = 0x0030_0000u32;
+        let lo0 = ((phys0 >> 12) << 6) | 2; // valid
+        let lo1 = ((phys1 >> 12) << 6) | 2;
+        sys.bus.ee_tlb_write(0, 0, 0x2000_0000, lo0, lo1);
+
+        sys.bus.ram[(phys0 + 0xFFE) as usize] = 0x11;
+        sys.bus.ram[(phys0 + 0xFFF) as usize] = 0x22;
+        sys.bus.ram[phys1 as usize] = 0x33;
+        sys.bus.ram[(phys1 + 1) as usize] = 0x44;
+
+        let want: Vec<u8> =
+            (0..4).map(|i| peek8(&mut sys, Core::Ee, 0x2000_0FFE + i).unwrap()).collect();
+        assert_eq!(want, vec![0x11, 0x22, 0x33, 0x44]);
+
+        let r = c.execute(&mut sys, "peekb 20000ffe 4", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(base64_decode(&r.payload).unwrap(), want);
+    }
+
+    #[test]
+    fn peekm_returns_one_line_per_range() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke 00100000 deadbeef", false).ok);
+        assert!(c.execute(&mut sys, "poke ee 70000000 cc", false).ok);
+        // Distinct known bytes at each address, so a wrong order or a bug
+        // that reads every range from the first address cannot pass by
+        // accident (lengths alone would not catch either).
+        let r = c.execute(&mut sys, "peekm 00100000:4 bfc00000:2 70000000:1", false);
+        assert!(r.ok, "{}", r.payload);
+        let lines: Vec<&str> = r.payload.lines().collect();
+        assert_eq!(lines.len(), 3, "{:?}", lines);
+        assert_eq!(base64_decode(lines[0]).unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(base64_decode(lines[1]).unwrap(), sys.bus.bios[..2].to_vec());
+        assert_eq!(base64_decode(lines[2]).unwrap(), vec![0xcc]);
+
+        assert!(c.execute(&mut sys, "poke iop 00010000 11223344", false).ok);
+        let r = c.execute(&mut sys, "peekm iop 00010000:2 00010002:2", false);
+        assert!(r.ok, "{}", r.payload);
+        let lines: Vec<&str> = r.payload.lines().collect();
+        assert_eq!(lines.len(), 2, "{:?}", lines);
+        assert_eq!(base64_decode(lines[0]).unwrap(), vec![0x11, 0x22]);
+        assert_eq!(base64_decode(lines[1]).unwrap(), vec![0x33, 0x44]);
+
+        assert!(!c.execute(&mut sys, "peekm", false).ok);
+        assert!(!c.execute(&mut sys, "peekm 10004000:4", false).ok);
+        assert!(!c.execute(&mut sys, "peekm 00100000:0", false).ok);
+        assert!(!c.execute(&mut sys, "peekm 00100000:4 bfc00000:0", false).ok);
     }
 
     #[test]

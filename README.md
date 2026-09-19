@@ -257,6 +257,8 @@ ps2ctl frame shot.png         # dump the display, .png or .bmp
 ps2ctl vram v.bin             # dump the raw 4 MiB of GS VRAM
 ps2ctl peek 00100000 64       # hex dump EE memory (side-effect-free)
 ps2ctl peek iop 00010000 16   # the IOP's bus view instead
+ps2ctl peekb 00100000 65536   # base64, up to the full 32 MiB EE RAM
+ps2ctl peekm 00100000:64 00200000:16  # one base64 line per range
 ps2ctl poke 00100000 deadbeef # write RAM
 ps2ctl disc open              # open the tray, keeping the disc in it
 ps2ctl disc close game.iso    # close it on a new image (or bare: the old one)
