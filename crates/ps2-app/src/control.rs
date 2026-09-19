@@ -26,6 +26,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ps2_core::cheats::Group;
 use ps2_core::{EE_CLOCK_HZ, Ps2System};
@@ -479,6 +480,11 @@ loadstate <path>       restore a snapshot
 quit                   shut the emulator down
 ";
 
+/// Ceiling on the blocking reply write in [`ControlServer::pump`], so a
+/// client that never drains its socket gets dropped instead of wedging the
+/// emulator forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// TCP transport: accepts one client at a time, reads newline-terminated
 /// commands, writes dot-terminated replies.
 pub struct ControlServer {
@@ -552,10 +558,21 @@ impl ControlServer {
             out.push('\n');
         }
         out.push_str(".\n");
-        if let Some(stream) = &mut self.client
-            && stream.write_all(out.as_bytes()).is_err()
-        {
-            self.client = None;
+        // Blocking write: under lockstep the client is always reading, so
+        // this costs nothing, and it is the only way a multi-megabyte reply
+        // survives instead of hitting WouldBlock mid-write and dropping the
+        // client. The write timeout bounds the remaining risk: a client
+        // that connects and never reads gets dropped instead of wedging
+        // the emulator.
+        if let Some(stream) = &mut self.client {
+            stream.set_nonblocking(false).ok();
+            stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+            let sent = stream.write_all(out.as_bytes());
+            stream.set_write_timeout(None).ok();
+            stream.set_nonblocking(true).ok();
+            if sent.is_err() {
+                self.client = None;
+            }
         }
         !reply.quit
     }
@@ -724,5 +741,53 @@ mod tests {
     fn quit_flag_propagates() {
         let (mut sys, mut c) = (sys(), Controller::default());
         assert!(c.execute(&mut sys, "quit", false).quit);
+    }
+
+    /// Regression for the nonblocking `write_all` this replaced: it dropped
+    /// the client mid-reply once a large payload filled the socket send
+    /// buffer, because the client sees the connection close before the
+    /// reply completes.
+    #[test]
+    fn a_large_reply_reaches_the_client() {
+        use std::io::{BufRead, BufReader};
+        use std::thread;
+        use std::time::Instant;
+
+        let mut server = ControlServer::bind(0).unwrap();
+        let port = server.port();
+        let text = "x".repeat(1 << 20) + "\n";
+        server.controller.tty = text.clone();
+        let mut sys = sys();
+
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(b"tty\n").unwrap();
+            // Give the server a chance to start writing before anyone
+            // drains the socket, so the send buffer fills mid-reply.
+            thread::sleep(Duration::from_millis(200));
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut payload_len = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).unwrap();
+                if n == 0 || line.trim_end() == "." {
+                    break;
+                }
+                if line.trim_end() != "ok" {
+                    payload_len += line.len();
+                }
+            }
+            payload_len
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "client did not finish reading in time");
+            server.pump(&mut sys, false);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(handle.join().unwrap(), text.len());
     }
 }

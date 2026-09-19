@@ -274,7 +274,8 @@ ps2ctl quit
 A typical loop: `press`/`run` → `frame`/`peek`/`tty` → decide → repeat, with
 `savestate`/`loadstate` for branching exploration. The control port and the
 debugger can be active simultaneously; execution commands are refused while
-a debugger is attached.
+a debugger is attached. Replies are written whole, however large; a client
+that stops reading is dropped after five seconds.
 
 This is a separate mode from the `--cycles` batch run, not a modifier on it:
 a scripted `--press circle@150e9` and a client deciding when to press cannot
