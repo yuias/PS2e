@@ -582,6 +582,28 @@ impl Controller {
                     Err(e) => Reply::err(format!("write {path}: {e}")),
                 }
             }
+            ("frameb", rest) => {
+                if rest.len() > 1 {
+                    return Reply::err("usage: frameb [rgb24|png]");
+                }
+                let fmt = rest.first().copied().unwrap_or("rgb24");
+                if fmt != "rgb24" && fmt != "png" {
+                    return Reply::err(format!("bad format '{fmt}' (rgb24 or png)"));
+                }
+                let (w, h, rgba) = sys.framebuffer();
+                if w == 0 || h == 0 {
+                    return Reply::err("no display yet (run at least one frame)");
+                }
+                let base64 = if fmt == "rgb24" {
+                    base64_encode(&crate::rgb24(&rgba))
+                } else {
+                    match crate::png_bytes(w, h, &rgba) {
+                        Ok(bytes) => base64_encode(&bytes),
+                        Err(e) => return Reply::err(format!("encode: {e}")),
+                    }
+                };
+                Reply::ok(format!("{w} {h} {fmt}\n{base64}"))
+            }
             // Raw rather than an image: PS2 VRAM is one 4 MiB pool holding
             // buffers of several pixel formats at once, so there is no one
             // picture of it. This is the same blob `--dump` writes.
@@ -633,6 +655,8 @@ peekm [ee|iop] <hexaddr>:<len> ...
                        one base64 line per range, 32 MiB in total
 poke [ee|iop] <hexaddr> <hex>    write bytes to RAM/scratchpad
 frame <path>           write the display as .png or .bmp
+frameb [rgb24|png]     display over the socket: <w> <h> <fmt>, then one
+                       base64 line (top-down RGB24, or a PNG file)
 vram <path>            write the raw 4 MiB GS VRAM (no image: mixed formats)
 disc open              open the tray, keeping the disc that was in it
 disc close [path]      close it on a new image, else on the one lifted out
@@ -756,6 +780,32 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ps2e-ctl-{}-{tag}", std::process::id()))
+    }
+
+    /// A machine with the inline GS renderer (`frameb`'s tests need
+    /// synchronous privileged writes; the threaded front only publishes at
+    /// vblank).
+    fn inline_sys() -> Ps2System {
+        Ps2System::new_with(vec![0u8; 4 << 20], false).unwrap()
+    }
+
+    /// Program a 64x8 progressive PSMCT32 display and paint one red pixel at
+    /// (5, 2). Inline `push` applies privileged writes immediately, so no
+    /// `run` is needed before reading the frame back.
+    fn display_64x8(sys: &mut Ps2System) {
+        sys.bus.gs.priv_write(0x1200_0000, 1); // PMODE EN1
+        sys.bus.gs.priv_write(0x1200_0020, 0); // SMODE2 progressive
+        sys.bus.gs.priv_write(0x1200_0070, 1 << 9); // DISPFB1: FBP 0, FBW 1 = 64px, PSMCT32
+        sys.bus.gs.priv_write(0x1200_0080, (63u64 << 32) | (7u64 << 44)); // DISPLAY1 64x8
+        sys.bus.gs.inline_gs().unwrap().write_psmct32(0, 1, 5, 2, 0x0000_00FF);
+    }
+
+    /// Decode a PNG (file or in-memory) to its raw RGB8 pixel bytes.
+    fn decode_png(r: impl std::io::Read + std::io::Seek) -> Vec<u8> {
+        let mut reader = png::Decoder::new(std::io::BufReader::new(r)).read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        buf[..info.buffer_size()].to_vec()
     }
 
     #[test]
@@ -929,6 +979,59 @@ mod tests {
         assert!(!c.execute(&mut sys, "peekm 10004000:4", false).ok);
         assert!(!c.execute(&mut sys, "peekm 00100000:0", false).ok);
         assert!(!c.execute(&mut sys, "peekm 00100000:4 bfc00000:0", false).ok);
+    }
+
+    #[test]
+    fn frameb_matches_the_png_written_by_frame() {
+        let mut sys = inline_sys();
+        let mut c = Controller::default();
+        display_64x8(&mut sys);
+
+        let r = c.execute(&mut sys, "frameb", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(lines.next(), Some("64 8 rgb24"));
+        let rgb = base64_decode(lines.next().unwrap()).unwrap();
+        assert_eq!(rgb.len(), 64 * 8 * 3);
+        let px = |x: usize, y: usize| rgb[(y * 64 + x) * 3..(y * 64 + x) * 3 + 3].to_vec();
+        assert_eq!(px(5, 2), vec![0xff, 0, 0]);
+        assert_eq!(px(0, 0), vec![0, 0, 0]);
+
+        let path = temp_path("frameb.png");
+        let p = path.to_str().unwrap();
+        assert!(c.execute(&mut sys, &format!("frame {p}"), false).ok);
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(decode_png(file), rgb);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn frameb_png_decodes_to_the_same_pixels() {
+        let mut sys = inline_sys();
+        let mut c = Controller::default();
+        display_64x8(&mut sys);
+
+        let rgb = base64_decode(c.execute(&mut sys, "frameb", false).payload.lines().nth(1).unwrap())
+            .unwrap();
+
+        let r = c.execute(&mut sys, "frameb png", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(lines.next(), Some("64 8 png"));
+        let png_bytes = base64_decode(lines.next().unwrap()).unwrap();
+        assert_eq!(decode_png(std::io::Cursor::new(png_bytes)), rgb);
+    }
+
+    #[test]
+    fn frameb_rejects_unknown_formats_and_a_blank_display() {
+        let mut sys = inline_sys();
+        let mut c = Controller::default();
+        // DISPLAY unprogrammed gives height 0, same failure `frame` reports.
+        assert!(!c.execute(&mut sys, "frameb", false).ok);
+
+        display_64x8(&mut sys);
+        assert!(!c.execute(&mut sys, "frameb bmp", false).ok);
+        assert!(c.execute(&mut sys, "frameb", false).ok);
     }
 
     #[test]

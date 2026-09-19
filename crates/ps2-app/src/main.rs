@@ -873,16 +873,28 @@ fn write_image(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// 8-bit RGB PNG (the alpha plane carries nothing a viewer wants).
-fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
-    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, w, h);
+/// RGBA8 to packed top-down RGB24 (the alpha plane carries nothing a viewer
+/// or `frameb` client wants).
+pub(crate) fn rgb24(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+}
+
+/// 8-bit RGB PNG of an RGBA8 frame, in memory (shared by `write_png` and the
+/// control port's `frameb png`).
+pub(crate) fn png_bytes(w: u32, h: u32, rgba: &[u8]) -> std::io::Result<Vec<u8>> {
+    let rgb = rgb24(rgba);
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, w, h);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     let mut writer = enc.write_header().map_err(std::io::Error::other)?;
     writer.write_image_data(&rgb).map_err(std::io::Error::other)?;
-    writer.finish().map_err(std::io::Error::other)
+    writer.finish().map_err(std::io::Error::other)?;
+    Ok(out)
+}
+
+fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, png_bytes(w, h, rgba)?)
 }
 
 /// Minimal 24-bit bottom-up BMP writer.

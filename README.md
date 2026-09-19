@@ -254,6 +254,7 @@ ps2ctl press circle 30        # hold buttons for 30 frames, then release
 ps2ctl input set up           # hold until changed; applied during run
 ps2ctl input clear            # release everything held
 ps2ctl frame shot.png         # dump the display, .png or .bmp
+ps2ctl frameb png             # the same frame over the socket, base64
 ps2ctl vram v.bin             # dump the raw 4 MiB of GS VRAM
 ps2ctl peek 00100000 64       # hex dump EE memory (side-effect-free)
 ps2ctl peek iop 00010000 16   # the IOP's bus view instead
