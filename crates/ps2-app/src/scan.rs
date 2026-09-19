@@ -26,6 +26,16 @@ impl From<Target> for ps2_core::cheats::Target {
     }
 }
 
+/// A value as typed into the scanner: hex with a `0x` prefix, otherwise
+/// decimal, the way a score or a hit-point count is read off the screen.
+pub fn parse_value(text: &str) -> Option<u64> {
+    let t = text.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => t.parse().ok(),
+    }
+}
+
 /// What a pass keeps. `Exact` is the only one that can start a scan
 /// without a snapshot; the others need a previous value to compare to,
 /// and a first pass with them keeps everything (`Unknown`).

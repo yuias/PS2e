@@ -54,20 +54,10 @@ fn parse_addr(text: &str) -> Option<u32> {
     u32::from_str_radix(t, 16).ok()
 }
 
-/// A value as typed into the scanner: hex with a `0x` prefix, otherwise
-/// decimal, which is how a score or a hit-point count is read off the
-/// screen.
-fn parse_value(text: &str) -> Option<u64> {
-    let t = text.trim();
-    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        Some(h) => u64::from_str_radix(h, 16).ok(),
-        None => t.parse().ok(),
-    }
-}
-
 #[cfg(test)]
 mod number_tests {
     use super::*;
+    use crate::scan::parse_value;
 
     #[test]
     fn addresses_are_hex_and_values_are_decimal_unless_prefixed() {
@@ -558,7 +548,7 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.scan_value).desired_width(110.0).font(egui::TextStyle::Monospace))
                 .on_hover_text("decimal, or hex with a 0x prefix");
         });
-        let value = parse_value(&self.scan_value);
+        let value = scan::parse_value(&self.scan_value);
         let mut request = None;
         ui.horizontal(|ui| {
             ui.label("new scan");
