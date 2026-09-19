@@ -111,6 +111,18 @@ fn parse_duration(s: &str, cycles_per_frame: u64) -> Result<RunLength, String> {
     Ok(RunLength::Cycles((n * unit as f64) as u64))
 }
 
+/// `BTN+BTN:<n>[s|c|v]` or `none:<n>[s|c|v]` (button names never contain
+/// `:`, so splitting at the last one is unambiguous). Any failure collapses
+/// to one message: a segment is atomic, so there is no use distinguishing a
+/// bad button from a bad duration.
+fn parse_segment(s: &str, cpf: u64) -> Result<(u16, RunLength), String> {
+    let bad = || format!("bad segment '{s}' (want BTN+BTN:<n>[s|c|v] or none:<n>[s|c|v])");
+    let (buttons, dur) = s.rsplit_once(':').ok_or_else(bad)?;
+    let mask = if buttons == "none" { 0 } else { parse_buttons(buttons).map_err(|_| bad())? };
+    let len = parse_duration(dur, cpf).map_err(|_| bad())?;
+    Ok((mask, len))
+}
+
 fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
 }
@@ -289,8 +301,8 @@ pub struct Controller {
     /// the same one back the way a real tray does.
     tray: Option<std::fs::File>,
     /// Vertical-blank edges this session has run across with the `v` unit
-    /// (`run`, `press`). Not machine state: it survives `loadstate` and is
-    /// never saved.
+    /// (`run`, `press`, `seq`). Not machine state: it survives `loadstate`
+    /// and is never saved.
     vblanks: u64,
 }
 
@@ -369,7 +381,7 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "seq") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         let cpf = sys.region().cycles_per_frame();
@@ -432,6 +444,34 @@ impl Controller {
                 }
                 (Err(e), _) | (_, Err(e)) => Reply::err(e),
             },
+            // Every segment is parsed before any is run, so a bad one later
+            // in the list leaves the machine untouched rather than half-run.
+            ("seq", segs) => {
+                if segs.is_empty() {
+                    return Reply::err("seq needs at least one segment");
+                }
+                let mut parsed = Vec::with_capacity(segs.len());
+                for s in segs {
+                    match parse_segment(s, cpf) {
+                        Ok(p) => parsed.push(p),
+                        Err(e) => return Reply::err(e),
+                    }
+                }
+                let prev = self.held;
+                let mut cycles = 0u64;
+                for (mask, len) in parsed {
+                    self.held = mask;
+                    cycles += self.advance(sys, len);
+                }
+                self.held = prev;
+                sys.bus.sio2.buttons = self.held;
+                Reply::ok(format!(
+                    "ran {} segments in {cycles} cycles to {}, ee_pc={:#010x}",
+                    segs.len(),
+                    sys.cycles,
+                    sys.ee.pc
+                ))
+            }
             ("input", ["set", buttons]) => match parse_buttons(buttons) {
                 Ok(mask) => {
                     self.held = mask;
@@ -698,6 +738,9 @@ run to <cycle>         advance to an absolute EE cycle (5e9 shorthand ok)
 press <btn[+btn]> <n>[s|c|v]
                        hold buttons for n on top of the held set
                        (v=vblanks: stop right after the edge)
+seq <btn[+btn]|none>:<n>[s|c|v] ...
+                       hold each set for its span in turn (exact set per
+                       segment), then restore the held set
 input set <btn[+btn]>  hold buttons until changed (applied during run)
 input clear            release all held buttons
 peek [ee|iop] <hexaddr> <len>    hex dump memory (side-effect-free, MMIO --)
@@ -860,6 +903,55 @@ mod tests {
         buf[..info.buffer_size()].to_vec()
     }
 
+    /// An IOP program that polls the pad through SIO2 every loop and, when
+    /// the 16-bit wire word changes (active-low, little-endian: cross held
+    /// = 0xbfff, nothing = 0xffff), appends it at IOP RAM 0x00010000. A
+    /// ground truth for `seq`'s button edges independent of `sio2.buttons`.
+    const IOP_PAD_LOGGER: [u32; 32] = [
+        0x3C08_BF80, //  0 lui   $t0, 0xbf80
+        0x3508_8200, //  1 ori   $t0, $t0, 0x8200   SIO2 base
+        0x3C0A_0001, //  2 lui   $t2, 0x0001        record pointer 0x00010000
+        0x240B_FFFF, //  3 addiu $t3, $zero, -1     prev = nothing held
+        0x2409_000C, //  4 loop: addiu $t1, $zero, 0x0c
+        0xAD09_0068, //  5 sw    $t1, 0x68($t0)     CTRL: reset both FIFOs
+        0x2409_0500, //  6 addiu $t1, $zero, 0x0500 5 bytes, port 0
+        0xAD09_0000, //  7 sw    $t1, 0x00($t0)     SEND3[0]
+        0x2409_0001, //  8 addiu $t1, $zero, 0x01
+        0xA109_0060, //  9 sb    $t1, 0x60($t0)     01: pad
+        0x2409_0042, // 10 addiu $t1, $zero, 0x42
+        0xA109_0060, // 11 sb    $t1, 0x60($t0)     42: poll
+        0xA100_0060, // 12 sb    $zero, 0x60($t0)
+        0xA100_0060, // 13 sb    $zero, 0x60($t0)
+        0xA100_0060, // 14 sb    $zero, 0x60($t0)
+        0x2409_0001, // 15 addiu $t1, $zero, 0x01
+        0xAD09_0068, // 16 sw    $t1, 0x68($t0)     CTRL start: runs the transfer
+        0x910C_0064, // 17 lbu   $t4, 0x64($t0)     ff
+        0x910C_0064, // 18 lbu   $t4, 0x64($t0)     pad id
+        0x910C_0064, // 19 lbu   $t4, 0x64($t0)     5a
+        0x910C_0064, // 20 lbu   $t4, 0x64($t0)     buttons lo
+        0x910D_0064, // 21 lbu   $t5, 0x64($t0)     buttons hi
+        0x0000_0000, // 22 nop                      load delay slot
+        0x000D_6A00, // 23 sll   $t5, $t5, 8
+        0x018D_6025, // 24 or    $t4, $t4, $t5
+        0x118B_FFEA, // 25 beq   $t4, $t3, loop     unchanged: poll again
+        0x0000_0000, // 26 nop
+        0xA54C_0000, // 27 sh    $t4, 0($t2)        record the new word
+        0x254A_0002, // 28 addiu $t2, $t2, 2
+        0x0180_5821, // 29 addu  $t3, $t4, $zero
+        0x0800_4404, // 30 j     loop               (0x00011010)
+        0x0000_0000, // 31 nop
+    ];
+
+    /// Load [`IOP_PAD_LOGGER`] at `0x00011000` (via `poke`, which has no
+    /// length cap) and point the IOP at it.
+    fn load_pad_logger(c: &mut Controller, sys: &mut Ps2System) {
+        let hex: String =
+            IOP_PAD_LOGGER.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("{b:02x}")).collect();
+        assert!(c.execute(sys, &format!("poke iop 00011000 {hex}"), false).ok);
+        sys.iop.pc = 0x0001_1000;
+        sys.iop.next_pc = 0x0001_1004;
+    }
+
     #[test]
     fn run_advances_by_frames() {
         let (mut sys, mut c) = (sys(), Controller::default());
@@ -976,6 +1068,79 @@ mod tests {
         assert_eq!(sys.bus.sio2.buttons, pad::UP);
         assert!(c.execute(&mut sys, "input clear", false).ok);
         assert_eq!(sys.bus.sio2.buttons, 0);
+    }
+
+    /// Runs first, so a fault in the logger itself is diagnosed separately
+    /// from a `seq` fault.
+    #[test]
+    fn pad_logger_sees_a_held_button() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_pad_logger(&mut c, &mut sys);
+
+        assert!(c.execute(&mut sys, "input set cross", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek iop 00010000 4", false);
+        assert!(
+            r.payload.contains("ff bf 00 00"),
+            "pad logger recorded nothing; iop pc={:#010x}, peek: {}",
+            sys.iop.pc,
+            r.payload
+        );
+
+        assert!(c.execute(&mut sys, "input clear", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek iop 00010000 4", false);
+        assert!(r.payload.contains("ff bf ff ff"), "{}", r.payload);
+    }
+
+    #[test]
+    fn seq_produces_distinct_button_edges() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_pad_logger(&mut c, &mut sys);
+
+        let r = c.execute(&mut sys, "seq cross:2v none:1v cross:2v", false);
+        assert!(r.ok, "{}", r.payload);
+        let r = c.execute(&mut sys, "peek iop 00010000 8", false);
+        assert!(r.payload.contains("ff bf ff ff ff bf 00 00"), "{}", r.payload);
+        assert_eq!(sys.bus.sio2.buttons, 0);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=5"), "{}", r.payload);
+    }
+
+    #[test]
+    fn seq_restores_the_held_set() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "input set up", false).ok);
+        let r = c.execute(&mut sys, "seq cross:1 none:1", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.bus.sio2.buttons, pad::UP);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("held=up"), "{}", r.payload);
+    }
+
+    #[test]
+    fn seq_segments_replace_rather_than_or_the_held_set() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_pad_logger(&mut c, &mut sys);
+
+        assert!(c.execute(&mut sys, "input set cross", false).ok);
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        let r = c.execute(&mut sys, "seq none:1v cross:1v", false);
+        assert!(r.ok, "{}", r.payload);
+        let log = c.execute(&mut sys, "peek iop 00010000 6", false);
+        assert!(log.payload.contains("ff bf ff ff ff bf"), "{}", log.payload);
+        assert_eq!(sys.bus.sio2.buttons, pad::CROSS);
+    }
+
+    #[test]
+    fn seq_rejects_bad_segments() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        for bad in ["seq", "seq cross", "seq nope:1", "seq cross:0v"] {
+            let cycles = sys.cycles;
+            assert!(!c.execute(&mut sys, bad, false).ok, "{bad}");
+            assert_eq!(sys.cycles, cycles, "{bad}");
+        }
+        assert!(!c.execute(&mut sys, "seq cross:1", true).ok);
     }
 
     #[test]
