@@ -1,7 +1,7 @@
 """Compare the emulator's SPU2 output against a reference decode of the
 ADX track the game streams through AutoDMA.
 
-    python tools/adxcmp.py shots/x.wav [--track N] [--iso assets/SLPS-25918.iso]
+    python tools/adxcmp.py /path/to/capture.wav [--track N] [--iso assets/SLPS-25918.iso]
 
 Decodes the first seconds of every MUSIC.AFS track (or just --track),
 finds the one the WAV contains by cross-correlation, aligns it and prints

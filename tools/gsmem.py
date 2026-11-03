@@ -2,7 +2,7 @@
 hardware stores them (see crates/ps2-core/src/gs/layout.rs).
 
     from gsmem import Vram
-    v = Vram('dumps/run/gs_vram.bin')
+    v = Vram('/path/to/dump/gs_vram.bin')
     v.image32(bp=0, bw=10, w=640, h=448).save('fb.png')       # PSMCT32 buffer
     v.image_indexed(bp=4480, bw=8, w=512, h=512, bits=8, cbp=10108).save('tex.png')
     print([hex(c) for c in v.clut32(10108)[:16]])

@@ -31,6 +31,4 @@ assets/
 CLAUDE.local.md
 
 # Local bring-up artifacts
-dumps/
-shots/
 __pycache__/
