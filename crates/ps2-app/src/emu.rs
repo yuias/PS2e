@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Emulation slice: 5ms of machine time per pacer iteration.
-const SLICE: u64 = EE_CLOCK_HZ / 1000;
+const SLICE: u64 = EE_CLOCK_HZ / 200;
 /// Audio cushion the pacer keeps buffered (frames; ~80ms at 48kHz). Doubles
 /// as the output latency, and absorbs host-side load spikes of the same
 /// length.
@@ -590,17 +590,23 @@ impl Worker {
             if panels & PANEL_MEMORY != 0 {
                 self.publish_memory();
             }
+            let mut new_frame = false;
             if let Some((w, h, rgba)) = self.sys.latest_frame_shared()
                 && w > 0
                 && h > 0
             {
                 let mut f = self.shared.frame.lock().unwrap();
-                f.width = w;
-                f.height = h;
-                f.rgba = rgba;
-                f.seq = f.seq.wrapping_add(1);
+                if f.width != w || f.height != h || !Arc::ptr_eq(&f.rgba, &rgba) {
+                    f.width = w;
+                    f.height = h;
+                    f.rgba = rgba;
+                    f.seq = f.seq.wrapping_add(1);
+                    new_frame = true;
+                }
             }
-            self.ctx.request_repaint();
+            if new_frame || panels != 0 {
+                self.ctx.request_repaint();
+            }
         }
 
         let elapsed = now.duration_since(self.speed_window_start);

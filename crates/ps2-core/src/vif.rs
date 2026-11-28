@@ -8,6 +8,7 @@
 use crate::gif::Gif;
 use crate::gs::GsFront;
 use crate::vu1::Vu1;
+use std::collections::VecDeque;
 use tracing::{trace, warn};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,23 @@ pub struct Vif {
     /// Ring of the last command words, dumped when the stream desyncs.
     history: [u32; 8],
     hist_pos: usize,
+    /// VIF_ERR.MII: masks VIFcode bit 31 (`I`) interrupts when set.
+    #[serde(default)]
+    mii: bool,
+    /// Latched when a VIFcode with bit 31 (`I=1`) is decoded; stalls the VIF
+    /// and fires the EE INTC interrupt once that command completes.
+    #[serde(default)]
+    irq_pending: bool,
+    /// True while stalled on a VIF interrupt waiting for `VIFn_FBRST.STC`.
+    #[serde(default)]
+    stalled_int: bool,
+    /// One-shot interrupt edge consumed by `Bus` to raise EE INTC (VIF0/VIF1).
+    #[serde(default)]
+    irq_edge: bool,
+    /// Words arriving in the same DMA qword/tag after a stall are queued
+    /// here and drained once `VIFn_FBRST.STC` clears the stall.
+    #[serde(default)]
+    pending: VecDeque<u32>,
 }
 
 impl Default for Vif {
@@ -96,6 +114,48 @@ impl Vif {
             warned_cmds: 0,
             history: [0; 8],
             hist_pos: 0,
+            mii: false,
+            irq_pending: false,
+            stalled_int: false,
+            irq_edge: false,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Update the `VIF_ERR.MII` (Mask Interrupt) flag.
+    pub fn set_mii(&mut self, mii: bool) {
+        self.mii = mii;
+    }
+
+    /// True while VIF is stalled on an `I`-bit interrupt (`VIFn_STAT.INT`).
+    pub fn stalled(&self) -> bool {
+        self.stalled_int
+    }
+
+    /// Consume a pending interrupt edge to raise EE INTC (bit 4/5).
+    pub fn take_irq(&mut self) -> bool {
+        std::mem::take(&mut self.irq_edge)
+    }
+
+    /// Handle `VIFn_FBRST.RST` (bit 0): reset parser state, FIFO, and stalls.
+    pub fn reset(&mut self) {
+        self.state = State::Cmd;
+        self.buf_len = 0;
+        self.irq_pending = false;
+        self.stalled_int = false;
+        self.irq_edge = false;
+        self.pending.clear();
+    }
+
+    /// Handle `VIFn_FBRST.STC` (bit 3): clear stall and drain queued words
+    /// until the queue empties or another `I`-bit interrupt stalls again.
+    pub fn clear_stall(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1) {
+        self.stalled_int = false;
+        while !self.stalled_int {
+            let Some(w) = self.pending.pop_front() else {
+                break;
+            };
+            self.process_word(gs, gif, vu1, w);
         }
     }
 
@@ -108,7 +168,7 @@ impl Vif {
     /// padding bytes are dropped when the last write lands (the stream is
     /// word-aligned per unpack).
     fn unpack_drain(&mut self, vu1: &mut Vu1) {
-        let (mask, row, col) = (self.mask, self.row, self.col);
+        let (mask, mut row, col, stmod) = (self.mask, self.row, self.col, self.stmod);
         let cl = if self.cl == 0 { 256 } else { self.cl };
         let wl = if self.wl == 0 { 256 } else { self.wl };
         let State::Unpack {
@@ -194,7 +254,15 @@ impl Vif {
                     };
                     match code {
                         0 => {
-                            if let Some(v) = elem {
+                            if let Some(mut v) = elem {
+                                match stmod {
+                                    1 => v = v.wrapping_add(row[f]),
+                                    2 => {
+                                        v = v.wrapping_add(row[f]);
+                                        row[f] = v;
+                                    }
+                                    _ => {}
+                                }
                                 write_field(&mut vu1.data, f, v);
                             }
                         }
@@ -218,10 +286,20 @@ impl Vif {
         if *writes_left == 0 {
             self.state = State::Cmd;
         }
+        self.row = row;
     }
 
-    /// Feed one 32-bit word of the VIF1 stream.
+    /// Feed one 32-bit word of the VIF stream. If currently stalled on an
+    /// `I`-bit interrupt, the word is queued until `VIFn_FBRST.STC` runs.
     pub fn push_word(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
+        if self.stalled_int {
+            self.pending.push_back(w);
+            return;
+        }
+        self.process_word(gs, gif, vu1, w);
+    }
+
+    fn process_word(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
         match &mut self.state {
             State::Cmd => self.command(gs, gif, vu1, w),
             State::Stmask => {
@@ -270,9 +348,20 @@ impl Vif {
                 }
             }
         }
+        // An `I`-bit interrupt triggers once the tagged VIFcode finishes
+        // (immediately for single-word commands like NOP/FLUSHA, or after the
+        // final data word for multi-word commands like DIRECT/UNPACK/MPG).
+        if matches!(self.state, State::Cmd) && self.irq_pending {
+            self.irq_pending = false;
+            self.stalled_int = true;
+            self.irq_edge = true;
+        }
     }
 
     fn command(&mut self, gs: &mut GsFront, gif: &mut Gif, vu1: &mut Vu1, w: u32) {
+        if w & 0x8000_0000 != 0 && !self.mii {
+            self.irq_pending = true;
+        }
         let cmd = (w >> 24) & 0x7F;
         let imm = w & 0xFFFF;
         let num = (w >> 16) & 0xFF;
@@ -294,11 +383,11 @@ impl Vif {
             0x03 => self.base = imm & 0x3FF,
             0x04 => self.itops = imm & 0x3FF,
             0x05 => {
-                // STMOD: row-addition modes are not implemented yet.
+                // STMOD: 0 = normal, 1 = offset (+ROW), 2 = difference (+ROW, ROW = result).
                 self.stmod = imm & 3;
-                if self.stmod != 0 && !self.warned_stmod {
+                if self.stmod == 3 && !self.warned_stmod {
                     self.warned_stmod = true;
-                    warn!(target: "ps2_core::vif", mode = self.stmod, "STMOD addition mode ignored (reported once)");
+                    warn!(target: "ps2_core::vif", mode = self.stmod, "reserved STMOD mode 3 treated as normal (reported once)");
                 }
             }
             // MSKPATH3/MARK: accepted so the stream stays in sync.
@@ -523,5 +612,50 @@ mod tests {
         r.feed(&[0x4A01_0001, 0xDEAD, 0xBEEF]);
         assert!(r.in_cmd_state());
         assert_eq!(&r.vu1.micro[8..12], &[0xAD, 0xDE, 0, 0]);
+    }
+
+    #[test]
+    fn vif_interrupt_stalls_queues_and_resumes_on_stc() {
+        let mut r = Rig::new();
+        // NOP with I=1 (0x8000_0000) followed by an UNPACK V4-32 in the same
+        // DMA qword: VIF must stall + raise an IRQ edge, queue the trailing
+        // words, and process them once clear_stall (VIFn_FBRST.STC) runs.
+        r.feed(&[0x8000_0000, 0x6C01_0000, 0x11, 0x22, 0x33, 0x44]);
+        assert!(r.vif.stalled());
+        assert!(r.vif.take_irq());
+        assert!(!r.vif.take_irq());
+        // Queued UNPACK hasn't written VU1 memory yet while stalled.
+        assert_eq!(&r.vu1.data[0..4], &[0, 0, 0, 0]);
+
+        r.vif.clear_stall(&mut r.gs, &mut r.gif, &mut r.vu1);
+        assert!(!r.vif.stalled());
+        assert!(r.in_cmd_state());
+        assert_eq!(&r.vu1.data[0..4], &0x11u32.to_le_bytes());
+        assert_eq!(&r.vu1.data[12..16], &0x44u32.to_le_bytes());
+    }
+
+    #[test]
+    fn vif_mii_masks_interrupt_bit() {
+        let mut r = Rig::new();
+        r.vif.set_mii(true);
+        r.feed(&[0x8000_0000, 0x0000_0000]);
+        assert!(!r.vif.stalled());
+        assert!(!r.vif.take_irq());
+    }
+
+    #[test]
+    fn stmod_offset_and_difference_add_row() {
+        let mut r = Rig::new();
+        // STROW = [10, 20, 30, 40]
+        r.feed(&[0x3000_0000, 10, 20, 30, 40]);
+        // STMOD = 1 (Offset): UNPACK V4-32, 1 write of [1, 2, 3, 4] -> [11, 22, 33, 44]
+        r.feed(&[0x0500_0001, 0x6C01_0000, 1, 2, 3, 4]);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[0..4].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[12..16].try_into().unwrap()), 44);
+        // STMOD = 2 (Difference): 2 writes of [1, 1, 1, 1] -> [11, 21, 31, 41], then [12, 22, 32, 42]
+        r.feed(&[0x0500_0002, 0x6C02_0001, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[16..20].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[32..36].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[44..48].try_into().unwrap()), 42);
     }
 }

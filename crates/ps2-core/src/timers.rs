@@ -1,11 +1,10 @@
 //! EE timers (T0-T3): 16-bit counters on BUSCLK (EE clock / 2).
 //!
 //! Counts are computed lazily from the cycle counter instead of ticking —
-//! reads reconstruct the value from (now - base). Compare interrupts are
-//! wired to INTC (cause 9+t, see [`Timers::check_irqs`]); hardware gating
-//! (MODE's GATE/GATS/GATM) and the overflow interrupt are not modeled, so
-//! the overflow flag never sets. MODE's interrupt flags are
-//! write-1-to-clear.
+//! reads reconstruct the value from (now - base). Compare (CMPE/EQUF) and
+//! overflow (OVFE/OVFF) interrupts are wired to INTC (cause 9+t, see
+//! [`Timers::check_irqs`]); hardware gating (MODE's GATE/GATS/GATM) is not
+//! modeled. MODE's interrupt flags are write-1-to-clear.
 
 use crate::Region;
 use tracing::trace;
@@ -129,40 +128,68 @@ impl Timers {
     pub fn next_event(&self, now: u64, region: Region) -> u64 {
         let mut due = u64::MAX;
         for timer in &self.timers {
-            if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
+            if timer.mode & (1 << 7) == 0 {
                 continue;
             }
             let p = timer.cycles_per_tick(region);
-            let ticks = u64::from(timer.comp.wrapping_sub(timer.count(now, region)));
-            // Equal right now: the crossing (if any) is found by this
-            // check; the next one is a full wrap away.
-            let ticks = if ticks == 0 { 0x1_0000 } else { ticks };
+            let cnt = timer.count(now, region);
             let phase = now.saturating_sub(timer.base_cycle) % p;
-            due = due.min(now + ticks * p - phase);
+            if timer.mode & (1 << 8) != 0 || timer.mode & (1 << 10) == 0 {
+                let ticks = u64::from(timer.comp.wrapping_sub(cnt));
+                // Equal right now: the crossing (if any) is found by this
+                // check; the next one is a full wrap away.
+                let ticks = if ticks == 0 { 0x1_0000 } else { ticks };
+                due = due.min(now + ticks * p - phase);
+            }
+            if timer.mode & (1 << 9) != 0 {
+                let ovf_ticks = 0x1_0000 - u64::from(cnt);
+                due = due.min(now + ovf_ticks * p - phase);
+            }
         }
         due
     }
 
-    /// Edge-detect compare matches since the last call; returns an INTC bit
-    /// mask (bit 9+t per timer). Sets the mode equal-flag as on hardware.
+    /// Edge-detect compare and overflow events since the last call; returns
+    /// an INTC bit mask (bit 9+t per timer). Sets EQUF/OVFF as on hardware.
     pub fn check_irqs(&mut self, now: u64, region: Region) -> u32 {
         let mut intc = 0;
         for (t, timer) in self.timers.iter_mut().enumerate() {
-            // CUE (bit 7) gates counting. The equal-flag (EQUF, bit 10)
-            // latches: no new compare event until a MODE write with bit 10
-            // rearms it.
-            if timer.mode & (1 << 7) == 0 || timer.mode & (1 << 10) != 0 {
+            // CUE (bit 7) gates counting.
+            if timer.mode & (1 << 7) == 0 {
                 continue;
             }
-            let before = timer.count(timer.last_check, region);
-            let after = timer.count(now, region);
+            let last = timer.last_check;
             timer.last_check = now;
-            let crossed = if before <= after {
-                before < timer.comp && timer.comp <= after
-            } else {
-                // 16-bit wraparound between checks.
-                timer.comp > before || timer.comp <= after
-            };
+            let p = timer.cycles_per_tick(region);
+            let prev_ticks = last.saturating_sub(timer.base_cycle) / p;
+            let curr_ticks = now.saturating_sub(timer.base_cycle) / p;
+            let delta = curr_ticks.saturating_sub(prev_ticks);
+            if delta == 0 {
+                continue;
+            }
+            let before = timer.base.wrapping_add(prev_ticks as u16);
+            let after = timer.base.wrapping_add(curr_ticks as u16);
+
+            // Overflow (0xFFFF -> 0x0000): sets OVFF (bit 11) and raises INTC
+            // whenever OVFE (bit 9) is set (edge-triggered on each wrap).
+            if delta >= 0x1_0000 || u64::from(before) + delta >= 0x1_0000 {
+                timer.mode |= 1 << 11;
+                if timer.mode & (1 << 9) != 0 {
+                    intc |= 1 << (9 + t);
+                }
+            }
+
+            // Compare crossing: sets EQUF (bit 10), resets COUNT if ZRET (bit 6),
+            // and raises INTC whenever CMPE (bit 8) is set. A stale EQUF left
+            // over from a previous ELF (e.g. across LoadExecPS2) must not mask
+            // future compare interrupts.
+            let crossed = delta >= 0x1_0000
+                || if before <= after {
+                    before < timer.comp && timer.comp <= after
+                } else {
+                    // 16-bit wraparound between checks.
+                    timer.comp > before || timer.comp <= after
+                };
             if crossed {
                 timer.mode |= 1 << 10; // equal flag
                 if timer.mode & (1 << 6) != 0 {
@@ -170,12 +197,6 @@ impl Timers {
                     timer.base = 0;
                     timer.base_cycle = now;
                 }
-                // CMPE (bit 8) gates the INTC line, not the flag. The kernel
-                // free-runs T3 with MODE 0xC83 (CMPE clear) and only enables
-                // the interrupt (0x583) while its callback queue is loaded;
-                // raising INTC on a disabled compare invokes the callback
-                // dispatcher with an empty queue, which jumps through a NULL
-                // handler on the 16-bit wrap ~4.2 s after kernel init.
                 if timer.mode & (1 << 8) != 0 {
                     intc |= 1 << (9 + t);
                 }
@@ -238,5 +259,20 @@ mod tests {
         assert_eq!(t.check_irqs(past * 2, R), 0);
         t.write(0x1000_1810, 0x583, past * 2);
         assert_eq!(t.check_irqs(past * 3, R), 1 << 12);
+    }
+
+    #[test]
+    fn overflow_with_ovfe_fires_on_each_wrap() {
+        let mut t = Timers::new();
+        // T1 with CUE (bit 7) + OVFE (bit 9) + /1 clock (mode 0x280).
+        t.write(0x1000_0810, 0x280, 0);
+        let wrap = 0x1_0000 * 2;
+        assert_eq!(t.next_event(0, R), wrap);
+        assert_eq!(t.check_irqs(wrap, R), 1 << 10);
+        assert_ne!(t.read(0x1000_0810, wrap, R) & (1 << 11), 0);
+        // No wrap between wrap and wrap + 1000 -> no IRQ.
+        assert_eq!(t.check_irqs(wrap + 1000, R), 0);
+        // Next wrap fires even if OVFF was not cleared.
+        assert_eq!(t.check_irqs(wrap * 2, R), 1 << 10);
     }
 }

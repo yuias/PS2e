@@ -24,3 +24,8 @@ strip = true
 # emulation speed lives in our own code.
 [profile.release.package."*"]
 opt-level = "s"
+
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4

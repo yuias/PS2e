@@ -2444,6 +2444,32 @@ impl Painter<'_> {
                 }
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            let (wxl, wxr) = (256 - wx, wx);
+            let (wyl, wyr) = (256 - a.wy, a.wy);
+            // SAFETY: NEON is aarch64 baseline; all loads stay in bounds
+            // (pixel k+1 reads texels up to i0+k+2 <= last0+1).
+            unsafe {
+                let (wxl, wxr) = (vdupq_n_u16(wxl as u16), vdupq_n_u16(wxr as u16));
+                let (wyl, wyr) = (vdupq_n_u16(wyl as u16), vdupq_n_u16(wyr as u16));
+                let lerp = |l: uint16x8_t, r: uint16x8_t, wl: uint16x8_t, wr: uint16x8_t| {
+                    vshrq_n_u16::<8>(vmlaq_u16(vmulq_u16(l, wl), r, wr))
+                };
+                while k + 1 < k_hi {
+                    let i = (i0 + k as i64) as usize;
+                    let two = |r: &[u32], at: usize| vmovl_u8(vld1_u8(r.as_ptr().add(at) as *const u8));
+                    let top = lerp(two(a.row0, i), two(a.row0, i + 1), wxl, wxr);
+                    let bot = lerp(two(a.row1, i), two(a.row1, i + 1), wxl, wxr);
+                    let out = vqmovn_u16(lerp(top, bot, wyl, wyr));
+                    let mut pair = [0u32; 2];
+                    vst1_u8(pair.as_mut_ptr() as *mut u8, out);
+                    dst.extend_from_slice(&pair);
+                    k += 2;
+                }
+            }
+        }
         for k in k..k_hi {
             let i = (i0 + k as i64) as usize;
             dst.push(bilerp_rgba(a.row0[i], a.row0[i + 1], a.row1[i], a.row1[i + 1], wx, a.wy));
@@ -2771,7 +2797,12 @@ impl Painter<'_> {
                     // SAFETY: SSE2 baseline.
                     return unsafe { bilerp16_sse2(p, ti.texa, fx, fy) };
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY: NEON baseline.
+                    return unsafe { bilerp16_neon(p, ti.texa, fx, fy) };
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 {
                     [expand16(p[0], ti.texa), expand16(p[1], ti.texa), expand16(p[2], ti.texa), expand16(p[3], ti.texa)]
                 }
@@ -2999,7 +3030,24 @@ impl Blend {
                 (_mm_cvtsi128_si32(packed) as u32 & 0xFF_FFFF) | (src & 0xFF00_0000)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            // SAFETY: NEON baseline; pure register arithmetic.
+            unsafe {
+                let a8 = vreinterpret_u8_u32(vdup_n_u32(a));
+                let b8 = vreinterpret_u8_u32(vdup_n_u32(b));
+                let d8 = vreinterpret_u8_u32(vdup_n_u32(d));
+                let diff = vget_low_s16(vreinterpretq_s16_u16(vsubl_u8(a8, b8)));
+                let prod = vmull_s16(diff, vdup_n_s16(alpha as i16));
+                let d16 = vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(d8)));
+                let acc = vaddw_s16(vshrq_n_s32::<7>(prod), d16);
+                let s16 = vqmovn_s32(acc);
+                let packed = vqmovun_s16(vcombine_s16(s16, s16));
+                (vget_lane_u32::<0>(vreinterpret_u32_u8(packed)) & 0xFF_FFFF) | (src & 0xFF00_0000)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let lane = |sh: u32| -> u32 {
                 let (av, bv, dv) = (((a >> sh) & 0xFF) as i32, ((b >> sh) & 0xFF) as i32, ((d >> sh) & 0xFF) as i32);
@@ -3065,7 +3113,9 @@ impl ZTest {
 struct Modulate {
     #[cfg(target_arch = "x86_64")]
     lanes: core::arch::x86_64::__m128i,
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    lanes: core::arch::aarch64::uint16x4_t,
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     c: [u32; 4],
     /// Texel alpha stands in for 128 when TCC is off, so one multiply
     /// yields the vertex alpha.
@@ -3084,7 +3134,13 @@ impl Modulate {
             #[cfg(target_arch = "x86_64")]
             // SAFETY: SSE2 is x86-64 baseline.
             lanes: unsafe { core::arch::x86_64::_mm_set_epi16(0, 0, 0, 0, ca as i16, cb as i16, cg as i16, cr as i16) },
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is aarch64 baseline.
+            lanes: unsafe {
+                let arr = [cr as u16, cg as u16, cb as u16, ca as u16];
+                core::arch::aarch64::vld1_u16(arr.as_ptr())
+            },
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             c: [cr, cg, cb, ca],
             tex_mask,
             tex_or,
@@ -3112,7 +3168,20 @@ impl Modulate {
                 _mm_cvtsi128_si32(_mm_packus_epi16(m, m)) as u32
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            // SAFETY: NEON baseline; 255 * 255 fits in u16 and vqmovn_u16
+            // saturates to 255 like `.min(255)`.
+            unsafe {
+                let t8 = vreinterpret_u8_u32(vdup_n_u32(t));
+                let t16 = vget_low_u16(vmovl_u8(t8));
+                let m = vshr_n_u16::<7>(vmul_u16(t16, self.lanes));
+                let packed = vqmovn_u16(vcombine_u16(m, m));
+                vget_lane_u32::<0>(vreinterpret_u32_u8(packed))
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let ch = |sh: u32, c: u32| ((((t >> sh) & 0xFF) * c) >> 7).min(255) << sh;
             ch(0, self.c[0]) | ch(8, self.c[1]) | ch(16, self.c[2]) | ch(24, self.c[3])
@@ -3324,7 +3393,12 @@ fn bilerp_rgba(t00: u32, t10: u32, t01: u32, t11: u32, wx: u32, wy: u32) -> u32 
         // SAFETY: SSE2 is part of the x86-64 baseline.
         unsafe { bilerp_sse2(t00, t10, t01, t11, wx, wy) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { bilerp_neon(t00, t10, t01, t11, wx, wy) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         lerp_rgba(lerp_rgba(t00, t10, wx), lerp_rgba(t01, t11, wx), wy)
     }
@@ -3411,9 +3485,75 @@ unsafe fn bilerp16_sse2(p: [u16; 4], texa: u64, wx: u32, wy: u32) -> u32 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bilerp_neon(t00: u32, t10: u32, t01: u32, t11: u32, wx: u32, wy: u32) -> u32 {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON baseline; pure register arithmetic.
+    unsafe {
+        let left8 = vreinterpret_u8_u64(vdup_n_u64((t00 as u64) | ((t01 as u64) << 32)));
+        let right8 = vreinterpret_u8_u64(vdup_n_u64((t10 as u64) | ((t11 as u64) << 32)));
+        let left = vmovl_u8(left8);
+        let right = vmovl_u8(right8);
+        let x = vshrq_n_u16::<8>(vmlaq_u16(
+            vmulq_u16(left, vdupq_n_u16((256 - wx) as u16)),
+            right,
+            vdupq_n_u16(wx as u16),
+        ));
+        let y = vshr_n_u16::<8>(vmla_u16(
+            vmul_u16(vget_low_u16(x), vdup_n_u16((256 - wy) as u16)),
+            vget_high_u16(x),
+            vdup_n_u16(wy as u16),
+        ));
+        let packed = vqmovn_u16(vcombine_u16(y, y));
+        vget_lane_u32::<0>(vreinterpret_u32_u8(packed))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bilerp16_neon(p: [u16; 4], texa: u64, wx: u32, wy: u32) -> u32 {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON baseline; pure register arithmetic.
+    unsafe {
+        let t = vld1_u16(p.as_ptr());
+        let m5 = vdup_n_u16(0x1F);
+        let r = vshl_n_u16::<3>(vand_u16(t, m5));
+        let g = vshl_n_u16::<3>(vand_u16(vshr_n_u16::<5>(t), m5));
+        let b = vshl_n_u16::<3>(vand_u16(vshr_n_u16::<10>(t), m5));
+        let ta0 = vdup_n_u16((texa & 0xFF) as u16);
+        let ta1 = vdup_n_u16(((texa >> 32) & 0xFF) as u16);
+        let msb = vtst_u16(t, vdup_n_u16(0x8000));
+        let mut a = vbsl_u16(msb, ta1, ta0);
+        if texa & (1 << 15) != 0 {
+            let zero = vceq_u16(t, vdup_n_u16(0));
+            a = vbic_u16(a, zero);
+        }
+        // Channel-major [c0 c1 c2 c3] -> pixel-major [r g b a] per texel.
+        let rg = vzip_u16(r, g);
+        let ba = vzip_u16(b, a);
+        let top = vzip_u32(vreinterpret_u32_u16(rg.0), vreinterpret_u32_u16(ba.0));
+        let bot = vzip_u32(vreinterpret_u32_u16(rg.1), vreinterpret_u32_u16(ba.1));
+        let left = vcombine_u16(vreinterpret_u16_u32(top.0), vreinterpret_u16_u32(bot.0));
+        let right = vcombine_u16(vreinterpret_u16_u32(top.1), vreinterpret_u16_u32(bot.1));
+        let x = vshrq_n_u16::<8>(vmlaq_u16(
+            vmulq_u16(left, vdupq_n_u16((256 - wx) as u16)),
+            right,
+            vdupq_n_u16(wx as u16),
+        ));
+        let y = vshr_n_u16::<8>(vmla_u16(
+            vmul_u16(vget_low_u16(x), vdup_n_u16((256 - wy) as u16)),
+            vget_high_u16(x),
+            vdup_n_u16(wy as u16),
+        ));
+        let packed = vqmovn_u16(vcombine_u16(y, y));
+        vget_lane_u32::<0>(vreinterpret_u32_u8(packed))
+    }
+}
+
 /// Blend two RGBA8 pixels with weight `w` (0..=256) for `b`, all four
 /// channels at once: the R/B and G/A pairs each get 16 bits of headroom.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 fn lerp_rgba(a: u32, b: u32, w: u32) -> u32 {
     let inv = 256 - w;
@@ -3549,7 +3689,7 @@ mod tests {
     /// Every 16-bit texel, under AEM off and on, next to neighbours that
     /// exercise both alpha levels: the SIMD blend has to stay equal to the
     /// scalar expansion it replaces.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn bilerp16_matches_expand16() {
         let texa = 0x40_0000_0000 | 0x20;
@@ -3559,10 +3699,11 @@ mod tests {
                 let p = [px, 0x8000, 0x7FFF, 0x0000];
                 for (wx, wy) in [(0, 0), (256, 0), (0, 256), (97, 181)] {
                     let e = p.map(|t| expand16(t, texa));
-                    // SAFETY: SSE2 is baseline on x86_64.
-                    let (want, got) = unsafe {
-                        (bilerp_sse2(e[0], e[1], e[2], e[3], wx, wy), bilerp16_sse2(p, texa, wx, wy))
-                    };
+                    let want = bilerp_rgba(e[0], e[1], e[2], e[3], wx, wy);
+                    #[cfg(target_arch = "x86_64")]
+                    let got = unsafe { bilerp16_sse2(p, texa, wx, wy) };
+                    #[cfg(target_arch = "aarch64")]
+                    let got = unsafe { bilerp16_neon(p, texa, wx, wy) };
                     assert_eq!(got, want, "texel {px:#06x} aem {aem:#x} w ({wx},{wy})");
                 }
             }

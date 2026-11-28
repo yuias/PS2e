@@ -314,6 +314,133 @@ fn scan_ram(sys: &Ps2System, target: scan::Target) -> &[u8] {
     }
 }
 
+const GPR_NAMES: [&str; 32] = [
+    "zr", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+    "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+];
+
+fn frame_fingerprint(sys: &mut Ps2System) -> (u32, u32, u64, f64) {
+    let (w, h, rgba) = sys.framebuffer();
+    if w == 0 || h == 0 || rgba.is_empty() {
+        return (0, 0, 0, 0.0);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut luma_sum: u64 = 0;
+    let mut px_count: u64 = 0;
+    for chunk in rgba.chunks_exact(4) {
+        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        hash ^= u64::from(word);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        luma_sum += (u64::from(chunk[0]) * 77 + u64::from(chunk[1]) * 150 + u64::from(chunk[2]) * 29) >> 8;
+        px_count += 1;
+    }
+    let mean_luma = if px_count > 0 { luma_sum as f64 / px_count as f64 } else { 0.0 };
+    (w, h, hash, mean_luma)
+}
+
+fn format_regs(sys: &Ps2System, which: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    match which {
+        "ee" => {
+            let _ = writeln!(
+                out,
+                "pc={:#010x} status={:#010x} cause={:#010x} epc={:#010x} hi={:#018x} lo={:#018x}",
+                sys.ee.pc,
+                sys.ee.cop0.regs[12],
+                sys.ee.cop0.regs[13],
+                sys.ee.cop0.regs[14],
+                sys.ee.hi[0],
+                sys.ee.lo[0],
+            );
+            for row in 0..8 {
+                for col in 0..4 {
+                    let i = row * 4 + col;
+                    if col > 0 {
+                        out.push(' ');
+                    }
+                    let _ = write!(out, "{}={:016x}", GPR_NAMES[i], sys.ee.gpr[i][0]);
+                }
+                if row < 7 {
+                    out.push('\n');
+                }
+            }
+            Ok(out)
+        }
+        "iop" => {
+            let _ = writeln!(
+                out,
+                "pc={:#010x} status={:#010x} cause={:#010x} epc={:#010x} hi={:#010x} lo={:#010x}",
+                sys.iop.pc,
+                sys.iop.cop0[12],
+                sys.iop.cop0[13],
+                sys.iop.cop0[14],
+                sys.iop.hi,
+                sys.iop.lo,
+            );
+            for row in 0..8 {
+                for col in 0..4 {
+                    let i = row * 4 + col;
+                    if col > 0 {
+                        out.push(' ');
+                    }
+                    let _ = write!(out, "{}={:08x}", GPR_NAMES[i], sys.iop.gpr[i]);
+                }
+                if row < 7 {
+                    out.push('\n');
+                }
+            }
+            Ok(out)
+        }
+        "hw" => {
+            let b = &sys.bus;
+            let _ = writeln!(
+                out,
+                "intc_stat={:#010x} intc_mask={:#010x} d_stat={:#010x} d_mask={:#010x}",
+                b.intc_stat, b.intc_mask, b.d_stat, b.d_mask
+            );
+            let _ = writeln!(
+                out,
+                "vif0_stalled={} vif1_stalled={} vif1_chcr={:#010x} vif1_madr={:#010x} vif1_qwc={} vif1_tadr={:#010x}",
+                b.vif0.stalled(),
+                b.vif1.stalled(),
+                b.dma_vif1.chcr,
+                b.dma_vif1.madr,
+                b.dma_vif1.qwc,
+                b.dma_vif1.tadr
+            );
+            let _ = writeln!(
+                out,
+                "gif_chcr={:#010x} sif0_chcr={:#010x} sif1_chcr={:#010x} sif_mscom={:#010x} sif_smcom={:#010x} sif_msflag={:#010x} sif_smflag={:#010x} sif_ctrl={:#010x} fifo0={} fifo1={}",
+                b.dma_gif.chcr,
+                b.dma_sif0.chcr,
+                b.dma_sif1.chcr,
+                b.sif.mscom,
+                b.sif.smcom,
+                b.sif.msflag,
+                b.sif.smflag,
+                b.sif.control,
+                b.sif.fifo0.len(),
+                b.sif.fifo1.len(),
+            );
+            for t in 0..4u32 {
+                let base = 0x1000_0000 + (t << 11);
+                let cnt = b.timers.read(base, b.now, b.region);
+                let mode = b.timers.read(base + 0x10, b.now, b.region);
+                let comp = b.timers.read(base + 0x20, b.now, b.region);
+                let _ = write!(out, "t{t}(cnt={cnt:#06x},mode={mode:#06x},comp={comp:#06x})");
+                if t < 3 {
+                    out.push(' ');
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(format!("bad regs target '{which}' (want ee, iop, or hw)")),
+    }
+}
+
 /// The condition `until` polls for at each vblank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UntilCond {
@@ -535,6 +662,18 @@ impl Controller {
         let cpf = sys.region().cycles_per_frame();
         match (cmd, args.as_slice()) {
             ("help", _) => Reply::ok(HELP.trim_end()),
+            ("state", ["json"]) => Reply::ok(format!(
+                "{{\"ee_pc\":\"{:#010x}\",\"iop_pc\":\"{:#010x}\",\"cycles\":{},\"frames\":{},\"vblanks\":{},\"region\":\"{}\",\"field_hz\":{:.2},\"held\":\"{}\",\"tray\":\"{}\"}}",
+                sys.ee.pc,
+                sys.iop.pc,
+                sys.cycles,
+                sys.cycles / cpf,
+                self.vblanks,
+                match sys.region() { Region::Ntsc => "ntsc", Region::Pal => "pal" },
+                EE_CLOCK_HZ as f64 / cpf as f64,
+                buttons_to_names(self.held),
+                if sys.bus.cdvd.tray_open() { "open" } else { "closed" },
+            )),
             ("state", _) => Reply::ok(format!(
                 "ee_pc={:#010x} iop_pc={:#010x} cycles={} frames={} vblanks={} region={} field_hz={:.2} held={} tray={}",
                 sys.ee.pc,
@@ -547,6 +686,17 @@ impl Controller {
                 buttons_to_names(self.held),
                 if sys.bus.cdvd.tray_open() { "open" } else { "closed" },
             )),
+            ("regs", rest) => {
+                let which = match rest {
+                    [] => "ee",
+                    [w] => *w,
+                    _ => return Reply::err("usage: regs [ee|iop|hw]"),
+                };
+                match format_regs(sys, which) {
+                    Ok(s) => Reply::ok(s),
+                    Err(e) => Reply::err(e),
+                }
+            }
             // Absolute form, so a cycle read off `state` (or out of a gate
             // recipe) can be arrived at exactly rather than by arithmetic.
             ("run", ["to", at]) => match crate::parse_cycle(at) {
@@ -618,6 +768,39 @@ impl Controller {
                     segs.len(),
                     sys.cycles,
                     sys.ee.pc
+                ))
+            }
+            ("until", ["frame", "changed", "max", dur]) => {
+                let len = match parse_duration(dur, cpf) {
+                    Ok(l) => l,
+                    Err(e) => return Reply::err(e),
+                };
+                let (bw, bh, bhash, _) = frame_fingerprint(sys);
+                let mut cur = (bw, bh, bhash, 0.0);
+                let mut vblanks = 0u64;
+                let mut cycles = 0u64;
+                let met = loop {
+                    let spent = match len {
+                        RunLength::Vblanks(n) => vblanks >= n,
+                        RunLength::Cycles(budget) => cycles >= budget,
+                    };
+                    if spent {
+                        break false;
+                    }
+                    cycles += self.advance(sys, RunLength::Vblanks(1));
+                    vblanks += 1;
+                    cur = frame_fingerprint(sys);
+                    if (cur.0, cur.1, cur.2) != (bw, bh, bhash) {
+                        break true;
+                    }
+                };
+                Reply::ok(format!(
+                    "{} after {vblanks} vblanks ({cycles} cycles), frame={}x{} hash={:016x} luma={:.1}",
+                    if met { "met" } else { "timeout" },
+                    cur.0,
+                    cur.1,
+                    cur.2,
+                    cur.3
                 ))
             }
             // The baseline is read, and every argument validated, before the
@@ -922,6 +1105,10 @@ impl Controller {
                 Reply::ok(format!("{n} cheats from {}", path.display()))
             }
             ("tty", _) => Reply::ok(std::mem::take(&mut self.tty)),
+            ("framehash", _) => {
+                let (w, h, hash, luma) = frame_fingerprint(sys);
+                Reply::ok(format!("{w} {h} {hash:016x} luma={luma:.1}"))
+            }
             ("frame", [path]) => {
                 let (w, h, rgba) = sys.framebuffer();
                 if w == 0 || h == 0 {
@@ -1039,8 +1226,9 @@ impl Controller {
 }
 
 const HELP: &str = "\
-state                  pcs, EE cycle, nominal frame, vblanks run with 'v',
-                       region, field rate, held, tray
+state [json]           pcs, EE cycle, nominal frame, vblanks run with 'v',
+                       region, field rate, held, tray (optional 'json')
+regs [ee|iop|hw]       dump EE/IOP GPRs + COP0, or INTC/DMAC/VIF/SIF state
 run <n>[s|c|v]         advance n frames/seconds/EE cycles/vblanks (v: stop
                        right after the edge), inputs held
 run to <cycle>         advance to an absolute EE cycle (5e9 shorthand ok)
@@ -1053,6 +1241,8 @@ seq <btn[+btn]|none>:<n>[s|c|v] ...
 until [ee|iop] <hexaddr> <1|2|4> <eq|ne|changed> [<value>] max <n>[s|c|v]
                        run until the value matches (checked at each vblank)
                        or max elapses; reply starts with met/timeout
+until frame changed max <n>[s|c|v]
+                       run until the framebuffer hash changes or max elapses
 scan start [ee|iop] <1|2|4> [exact <value>|unknown]
                        new RAM scan (value: decimal or 0x hex, unsigned);
                        reports the hit count
@@ -1071,6 +1261,7 @@ peekm [ee|iop] <hexaddr>:<len> ...
                        one base64 line per range, 32 MiB in total
 poke [ee|iop] <hexaddr> <hex>    write bytes to RAM/scratchpad
 frame <path>           write the display as .png or .bmp
+framehash              <w> <h> <fnv1a64_hex> luma=<mean> of current display
 frameb [rgb24|png]     display over the socket: <w> <h> <fmt>, then one
                        base64 line (top-down RGB24, or a PNG file)
 vram <path>            write the raw 4 MiB GS VRAM (no image: mixed formats)
@@ -2097,5 +2288,29 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(handle.join().unwrap(), text.len());
+    }
+
+    #[test]
+    fn state_json_regs_and_framehash_work() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let j = c.execute(&mut sys, "state json", false);
+        assert!(j.ok, "{}", j.payload);
+        assert!(j.payload.starts_with('{') && j.payload.ends_with('}'));
+        assert!(j.payload.contains("\"ee_pc\":\"0x"));
+        assert!(j.payload.contains("\"region\":\"ntsc\""));
+
+        let ee = c.execute(&mut sys, "regs ee", false);
+        assert!(ee.ok && ee.payload.contains("pc=0x") && ee.payload.contains("sp="));
+        let iop = c.execute(&mut sys, "regs iop", false);
+        assert!(iop.ok && iop.payload.contains("pc=0x") && iop.payload.contains("ra="));
+        let hw = c.execute(&mut sys, "regs hw", false);
+        assert!(hw.ok && hw.payload.contains("intc_stat=") && hw.payload.contains("vif1_stalled="));
+        assert!(!c.execute(&mut sys, "regs bogus", false).ok);
+
+        let fh = c.execute(&mut sys, "framehash", false);
+        assert!(fh.ok && fh.payload.contains("luma="));
+
+        let uf = c.execute(&mut sys, "until frame changed max 1v", false);
+        assert!(uf.ok && (uf.payload.starts_with("met ") || uf.payload.starts_with("timeout ")));
     }
 }
